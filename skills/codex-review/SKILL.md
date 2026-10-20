@@ -311,17 +311,17 @@ Write each assembled prompt to a file, and capture the reviewer's final message 
 **Code review** (one run per pass; the two passes are independent and can run in parallel):
 
 ```bash
-codex "$CODEX_SANDBOX" exec -o "$TMP/arch-r1.verdict" "$(cat "$TMP/arch-r1.prompt.md")" < /dev/null > "$TMP/arch-r1.log" 2>&1
+codex "$CODEX_SANDBOX" -c model_reasoning_effort=high exec -o "$TMP/arch-r1.verdict" "$(cat "$TMP/arch-r1.prompt.md")" < /dev/null > "$TMP/arch-r1.log" 2>&1
 ```
 
 **Plan review** — add `--skip-git-repo-check`, since plans can live outside a git repo, where `codex exec` refuses to start:
 
 ```bash
-codex "$CODEX_SANDBOX" exec --skip-git-repo-check -o "$TMP/plan-r1.verdict" "$(cat "$TMP/plan-r1.prompt.md")" < /dev/null > "$TMP/plan-r1.log" 2>&1
+codex "$CODEX_SANDBOX" -c model_reasoning_effort=high exec --skip-git-repo-check -o "$TMP/plan-r1.verdict" "$(cat "$TMP/plan-r1.prompt.md")" < /dev/null > "$TMP/plan-r1.log" 2>&1
 ```
 
 
-**Model and context.** The model and reasoning effort come from `~/.codex/config.toml`; pass `-m <model>` only when overriding. A review reads the diff *plus* every file it spot-checks, so a small-context model aborts mid-run on large phases (`remote compaction failed`, stream disconnect). For anything past a few thousand lines, use the largest-context model your account has, and **chunk standing-code review to ≤~4K LOC per run** — one run per subsystem, then synthesise the verdicts yourself. A run that dies mid-way is almost always context pressure: check model and chunk size before blaming anything else. Check `codex --version` and update the CLI before blaming a model error.
+**Model and effort.** The model comes from `~/.codex/config.toml`; pass `-m <model>` only when overriding. Reasoning effort is pinned to `high` on every call rather than inherited: higher settings burn the usage quota fast for a gate that runs every phase, and a fixed effort keeps verdicts comparable across runs. A review reads the diff *plus* every file it spot-checks, so a small-context model aborts mid-run on large phases (`remote compaction failed`, stream disconnect). For anything past a few thousand lines, use the largest-context model your account has, and **chunk standing-code review to ≤~4K LOC per run** — one run per subsystem, then synthesise the verdicts yourself. A run that dies mid-way is almost always context pressure: check model and chunk size before blaming anything else. Check `codex --version` and update the CLI before blaming a model error.
 
 **Authentication.** Codex uses its own auth (`codex login`). On an auth error, surface the exact error text to the user and stop.
 
