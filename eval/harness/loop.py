@@ -45,15 +45,6 @@ class Arm:
     passes: tuple[str, ...] = REVIEW_PASSES
 
 
-_HAIKU = agents.Agent("claude", agents.WRITER_MODEL)
-_LUNA = agents.Agent("codex", agents.CROSS_REVIEWER_MODEL)
-ARMS = {
-    "A1": Arm("A1", _HAIKU),
-    "A1r": Arm("A1r", _HAIKU),
-    "A2": Arm("A2", _HAIKU, _HAIKU),
-    "A3": Arm("A3", _HAIKU, _LUNA),
-}
-
 
 @dataclass(frozen=True)
 class Issue:

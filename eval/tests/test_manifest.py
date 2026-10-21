@@ -4,7 +4,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from eval.harness import loop, manifest, pilot
+from eval.harness import experiments, loop, manifest, pilot
+
+PILOT = experiments.PILOT
 
 
 class ManifestTest(unittest.TestCase):
@@ -17,32 +19,32 @@ class ManifestTest(unittest.TestCase):
             path.parent.mkdir(parents=True)
             path.write_text("original\n")
         for target, value in (("MANIFEST", self.tmp / "MANIFEST.json"), ("REPO_ROOT", self.tmp),
-                              ("frozen_files", lambda: [self.task_file, self.harness_file])):
+                              ("frozen_files", lambda experiment: [self.task_file, self.harness_file])):
             patcher = mock.patch.object(manifest, target, value)
             patcher.start()
             self.addCleanup(patcher.stop)
-        self.digest = manifest.freeze()
+        self.digest = manifest.freeze(PILOT)
 
     def test_unchanged_inputs_verify(self):
-        self.assertEqual(manifest.verify(), self.digest)
+        self.assertEqual(manifest.verify(PILOT), self.digest)
 
     def test_changed_task_byte_refuses_run(self):
         self.task_file.write_text("originaL\n")
         with mock.patch.object(loop, "execute_run", side_effect=AssertionError("must not run")):
             with self.assertRaisesRegex(manifest.ManifestMismatch, "TASK.md"):
-                pilot.run_builds(self.tmp / "data")
+                pilot.run_builds(self.tmp / "data", PILOT)
 
     def test_changed_harness_byte_refuses_judging(self):
         self.harness_file.write_text("original \n")
         with self.assertRaisesRegex(manifest.ManifestMismatch, "loop.py"):
-            pilot.run_judging(self.tmp / "data")
+            pilot.run_judging(self.tmp / "data", PILOT)
 
     def test_added_file_refuses(self):
         extra = self.tmp / "eval" / "tasks" / "t" / "new.py"
         extra.write_text("x\n")
-        with mock.patch.object(manifest, "frozen_files", lambda: [self.task_file, self.harness_file, extra]):
+        with mock.patch.object(manifest, "frozen_files", lambda experiment: [self.task_file, self.harness_file, extra]):
             with self.assertRaisesRegex(manifest.ManifestMismatch, "new.py"):
-                manifest.verify()
+                manifest.verify(PILOT)
 
 
 if __name__ == "__main__":
