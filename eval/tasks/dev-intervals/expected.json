@@ -1,0 +1,18 @@
+{
+  "hidden": [
+    "test_merge.MergeTest.test_adjacent_merge",
+    "test_merge.MergeTest.test_disjoint_stay_apart",
+    "test_merge.MergeTest.test_empty",
+    "test_merge.MergeTest.test_input_not_mutated",
+    "test_merge.MergeTest.test_nested",
+    "test_merge.MergeTest.test_overlap",
+    "test_merge.MergeTest.test_reversed_span_raises",
+    "test_merge.MergeTest.test_unsorted_input"
+  ],
+  "hidden_followup": [
+    "test_total_covered.TotalCoveredTest.test_empty",
+    "test_total_covered.TotalCoveredTest.test_overlap_counted_once",
+    "test_total_covered.TotalCoveredTest.test_reversed_span_raises",
+    "test_total_covered.TotalCoveredTest.test_single_point_counts_one"
+  ]
+}
