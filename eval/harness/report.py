@@ -4,12 +4,11 @@
 pre-registered rule; `render` is the only place numbers become text.
 """
 
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from statistics import mean
 
-from . import loop, manifest, pilot
+from . import loop, manifest, pilot, records
 
 PRIMARY_THRESHOLD = 10.0
 PRIMARY_LOSS_LIMIT = 5.0
@@ -18,7 +17,6 @@ CALIBRATION_NEEDED = 4
 # Pass fractions over different denominators make exact thresholds land a few ulps short.
 TOLERANCE = 1e-9
 TREATMENTS = tuple(name for name, arm in loop.ARMS.items() if arm.reviewer)
-_STATIC_KEYS = ("ruff_violations", "source_loc", "test_loc", "max_function_branches")
 
 
 @dataclass
@@ -45,25 +43,22 @@ def collect(data_root: Path) -> Results:
             if exec_dir is None:
                 results.missing.append(f"build {task_id}--{arm}")
                 continue
-            record = _read(exec_dir / "record.json")
-            if not _valid_build(record):
-                results.missing.append(f"malformed build record {task_id}--{arm}")
-                continue
+            record = records.build(exec_dir / "record.json", digest)
             results.primary.setdefault(arm, {})[task_id] = 100 * record["scores"]["primary"]
             results.static.setdefault(arm, {})[task_id] = record["scores"]["static"]
             results.diagnostics.setdefault(arm, {})[task_id] = _diagnostics(record)
             if arm in pilot.FOLLOWUP_ARMS:
-                followup = _read(exec_dir / "followup" / "record.json")
-                if followup.get("status") == "complete" and followup.get("manifest") == digest \
-                        and _valid_followup(followup):
+                followup = records.followup(exec_dir / "followup" / "record.json", digest)
+                if followup is not None:
                     results.followup.setdefault(arm, {})[task_id] = followup["scores"]
                 else:
                     results.missing.append(f"followup {task_id}--{arm}")
     for name in pilot.judge.JUDGES:
         for task_id in results.tasks:
             for pair in (None, *pilot.PAIRS):
-                judgement = _read(pilot.judging_dir(data_root, name, task_id, pair) / "judgement.json")
-                if judgement.get("manifest") != digest or not _valid_judgement(judgement):
+                judgement = records.judgement(pilot.judging_dir(data_root, name, task_id, pair) / "judgement.json",
+                                              digest)
+                if judgement is None:
                     results.missing.append(f"judge {name} {task_id} {pair or 'calibration'}")
                     continue
                 if pair is None:
@@ -186,27 +181,6 @@ def render(results: Results, decision: Decision) -> str:
     return "\n".join(lines)
 
 
-def _valid_build(record: dict) -> bool:
-    scores = record.get("scores")
-    return (isinstance(scores, dict) and isinstance(scores.get("primary"), (int, float))
-            and 0 <= scores["primary"] <= 1 and isinstance(scores.get("static"), dict)
-            and all(isinstance(scores["static"].get(key), int) for key in _STATIC_KEYS)
-            and isinstance(record.get("steps"), list) and isinstance(record.get("flags"), list)
-            and isinstance(record.get("rounds"), dict))
-
-
-def _valid_followup(record: dict) -> bool:
-    scores = record.get("scores")
-    return (isinstance(scores, dict) and isinstance(scores.get("new_fraction"), (int, float))
-            and all(isinstance(scores.get(key), list) for key in ("regressions", "persistent_failures", "repaired")))
-
-
-def _valid_judgement(judgement: dict) -> bool:
-    leaks = judgement.get("leak_words")
-    return (judgement.get("result") in ("a", "b", "tie") and isinstance(leaks, dict)
-            and all(isinstance(leaks.get(side), int) for side in ("a", "b")))
-
-
 def _diagnostics(record: dict) -> dict:
     attempts = [attempt for step in record["steps"] for attempt in step["attempts"]]
     return {
@@ -260,10 +234,3 @@ def _verdict_text(decision: Decision) -> str:
     return {"GO": "GO — met the continuation threshold",
             "NO-GO": "did not meet the continuation threshold",
             "INCOMPLETE": "INCOMPLETE — no verdict"}[decision.verdict]
-
-
-def _read(path: Path) -> dict:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}

@@ -87,6 +87,10 @@ class ScoreTest(unittest.TestCase):
                   "        if y:\n            return 1\n        if not y:\n            return 2\n\n    return inner\n")
         self.assertEqual(score.static_metrics(self.candidate(source)).max_function_branches, 2)
 
+    def test_lambda_branches_measured(self):
+        source = "def factory():\n    return lambda x: 1 if x > 0 else (2 if x < 0 else 0)\n"
+        self.assertEqual(score.static_metrics(self.candidate(source)).max_function_branches, 2)
+
     def test_static_metrics(self):
         code = self.candidate("def f(x):\n    if x and x > 1:\n        return [i for i in x if i]\n    return None\n")
         (code / "test_f.py").write_text("import f\n\n\nx = 1\n")

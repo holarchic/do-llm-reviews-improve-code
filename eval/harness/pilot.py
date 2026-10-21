@@ -7,14 +7,13 @@ re-running resumes; failed attempts stay on disk beside the new ones.
 """
 
 import itertools
-import json
 import random
 import sys
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import judge, loop, manifest, tasks
+from . import judge, loop, manifest, records, tasks
 
 SEED = 20261021
 PARALLEL = 3
@@ -45,15 +44,13 @@ def complete_build(runs_root: Path, task_id: str, arm: str, digest: str) -> Path
     """The newest complete exec of task × arm under this manifest, if any."""
     run_root = runs_root / f"{task_id}--{arm}"
     for exec_dir in sorted(run_root.glob("exec-*"), key=lambda p: int(p.name.split("-")[1]), reverse=True):
-        record = _read(exec_dir / "record.json")
-        if record and record.get("status") == "complete" and record.get("manifest") == digest:
+        if records.build(exec_dir / "record.json", digest) is not None:
             return exec_dir
     return None
 
 
 def complete_followup(exec_dir: Path, digest: str) -> bool:
-    record = _read(exec_dir / "followup" / "record.json")
-    return bool(record and record.get("status") == "complete" and record.get("manifest") == digest)
+    return records.followup(exec_dir / "followup" / "record.json", digest) is not None
 
 
 def run_builds(data_root: Path) -> int:
@@ -100,7 +97,7 @@ def run_judging(data_root: Path) -> int:
     def job(item):
         name, task_id, pair = item
         out_dir = judging_dir(data_root, name, task_id, pair)
-        if _read(out_dir / "judgement.json").get("manifest") == digest:
+        if records.judgement(out_dir / "judgement.json", digest) is not None:
             return True
         _set_aside(out_dir)
         task = by_id[task_id]
@@ -146,13 +143,6 @@ def _set_aside(path: Path) -> None:
     while path.with_name(f"{path.name}.attempt-{n}").exists():
         n += 1
     path.rename(path.with_name(f"{path.name}.attempt-{n}"))
-
-
-def _read(path: Path) -> dict:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
 
 
 def _log(line: str) -> None:

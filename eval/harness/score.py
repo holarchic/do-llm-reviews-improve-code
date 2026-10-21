@@ -133,7 +133,7 @@ def _max_function_branches(text: str) -> int:
         return 0
     best = 0
     for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
             best = max(best, _branches(node))
     return best
 

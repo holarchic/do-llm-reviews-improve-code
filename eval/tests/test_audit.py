@@ -17,7 +17,7 @@ class AuditTest(unittest.TestCase):
 
     def transcript(self, *events: dict) -> Path:
         path = self.run_dir.parent / f"{self.run_dir.name}.jsonl"
-        self.addCleanup(path.unlink)
+        self.addCleanup(path.unlink, missing_ok=True)
         path.write_text("".join(json.dumps(e) + "\n" for e in events))
         return path
 
@@ -54,6 +54,31 @@ class AuditTest(unittest.TestCase):
 
     def test_eval_tree_is_private(self):
         self.assertTrue(self.hits(self.codex_call(f"cat {audit.EVAL_ROOT / 'tasks' / 'x' / 'hidden' / 't.py'}")))
+
+    def test_instruction_file_alias_flagged(self):
+        alias = audit.HOME / ".claude" / "CLAUDE.md"
+        self.assertTrue(self.hits(self.codex_call(f"cat {alias}")))
+        self.assertTrue(self.hits(self.codex_call("cat ~/.codex/AGENTS.md")))
+        self.assertTrue(self.hits(self.codex_call("cat ~/.agents/AGENTS.md")))
+
+    def test_link_inside_private_root_flagged_as_written(self):
+        root = Path(tempfile.mkdtemp(prefix="audit-root-"))
+        outside = Path(tempfile.mkdtemp(prefix="audit-outside-"))
+        self.addCleanup(shutil.rmtree, root)
+        self.addCleanup(shutil.rmtree, outside)
+        (outside / "secret.txt").write_text("x")
+        (root / "link").symlink_to(outside / "secret.txt")
+        transcript = self.transcript(self.codex_call(f"cat {root / 'link'}"))
+        self.assertTrue(audit.audit_transcript(transcript, self.run_dir, extra_roots=(root,)))
+
+    def test_parent_navigation_flagged(self):
+        for command in ("find .. -name '*.py' -exec cat {} +", "ls ./..", "cat ../"):
+            with self.subTest(command=command):
+                self.assertTrue(self.hits(self.codex_call(command)))
+
+    def test_grep_search_text_is_not_an_access(self):
+        self.assertEqual(self.hits(self.claude_call("Grep", {"pattern": str(PRIVATE), "path": "."})), [])
+        self.assertTrue(self.hits(self.claude_call("Grep", {"pattern": "x", "path": str(PRIVATE.parent)})))
 
     def test_legitimate_session_not_flagged(self):
         events = [

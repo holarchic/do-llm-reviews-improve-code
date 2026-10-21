@@ -253,3 +253,51 @@ class HardeningTest(unittest.TestCase):
         self.run_with(writer)
         self.assertNotIn("dev-intervals", str(seen[0]))
         self.assertNotIn("A1", seen[0].parent.name)
+
+
+class TimeoutAndPreservationTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="eval-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp)
+
+    def run_arm(self, arm, fake):
+        with mock.patch.object(agents, "run_claude", fake.run_claude), \
+             mock.patch.object(agents, "run_codex", fake.run_codex):
+            return loop.execute_run(DEV, arm, self.tmp, manifest_hash=None)
+
+    def test_build_timeout_stops_reviews_and_scores_head(self):
+        fake = FakeAgents(review_text="VERDICT: GREEN\n")
+        original = fake.run_claude
+
+        def run_claude(model, prompt, *, role, cwd, out_dir):
+            result = original(model, prompt, role=role, cwd=cwd, out_dir=out_dir)
+            if "Build the plan" in prompt:
+                return agents.Session(agents.TIMEOUT, "wall clock", "", result.transcript, 1.0)
+            return result
+
+        fake.run_claude = run_claude
+        record = self.run_arm("A3", fake)
+        self.assertEqual(record["status"], "complete")
+        self.assertIn("timeout:build", record["flags"])
+        self.assertEqual([s["name"] for s in record["steps"]][-1], "build")
+        self.assertEqual(record["scores"]["primary"], 1.0)
+
+    def test_reviewer_timeout_stops_the_run(self):
+        fake = FakeAgents()
+        fake.run_codex = lambda model, prompt, *, role, cwd, out_dir: agents.Session(
+            agents.TIMEOUT, "wall clock", "", session(out_dir).transcript, 1.0)
+        record = self.run_arm("A3", fake)
+        self.assertEqual(record["status"], "complete")
+        self.assertEqual([s["name"] for s in record["steps"]], ["plan", "plan-review-1"])
+        self.assertEqual(record["scores"]["primary"], 0.0)
+
+    def test_preservation_failure_is_recorded_invalid(self):
+        def writer(model, prompt, *, role, cwd, out_dir):
+            return session(out_dir)
+
+        with mock.patch.object(agents, "run_claude", writer), \
+             mock.patch.object(loop.shutil, "copytree", side_effect=OSError("disk full")):
+            record = loop.execute_run(DEV, "A1", self.tmp, manifest_hash=None)
+        self.assertEqual(record["status"], "invalid")
+        self.assertIn("preserving the repo failed", record["invalid_reason"])
+        self.assertTrue((self.tmp / "dev-intervals--A1" / "exec-1" / "record.json").exists())

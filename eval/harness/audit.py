@@ -20,9 +20,20 @@ PRIVATE_ROOTS = (
     HOME / "pg",
     HOME / ".claude",
     HOME / ".codex",
+    # The operator's global instructions: ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md link here.
+    HOME / ".agents",
     RUNS_ROOT,
 )
-_ACCESS_FIELDS = ("command", "file_path", "path", "pattern", "notebook_path")
+# Per tool, the input fields that name what it touches. Grep's pattern is search text, not a path.
+_ACCESS_FIELDS = {
+    "Bash": ("command",),
+    "Read": ("file_path",),
+    "Edit": ("file_path",),
+    "Write": ("file_path",),
+    "NotebookEdit": ("notebook_path",),
+    "Glob": ("path", "pattern"),
+    "Grep": ("path",),
+}
 _STOP = r"[^\s'\"`;|&<>(),=]"
 # Any token starting with ~ or .., or containing a slash: relative tokens matter
 # because a symlink planted in the run dir can point into a private root.
@@ -46,16 +57,18 @@ def _with_resolved(roots: tuple[Path, ...]) -> list[Path]:
 
 def audit_transcript(transcript: Path, run_dir: Path, *, extra_roots: tuple[Path, ...] = ()) -> list[str]:
     """Return one line per tool-call path under a private root; the run dir itself is exempt."""
-    roots = private_roots() + [Path(os.path.realpath(r)) for r in extra_roots]
+    roots = private_roots() + _with_resolved(tuple(extra_roots))
     own = Path(os.path.realpath(run_dir))
     hits = []
     for text in _tool_call_texts(transcript):
         for token in _PATH_TOKEN.findall(text):
-            resolved = _resolve(token, run_dir)
-            if _is_within(resolved, own):
-                continue
-            if any(_is_within(resolved, root) for root in roots):
-                hits.append(f"{resolved} (from: {text[:200]})")
+            # Check the path as written and where it leads: a link can hide either side.
+            for path in _candidates(token, run_dir):
+                if _is_within(path, own):
+                    continue
+                if any(_is_within(path, root) for root in roots):
+                    hits.append(f"{path} (from: {text[:200]})")
+                    break
     return hits
 
 
@@ -78,8 +91,10 @@ def _claude_tool_inputs(event: dict):
         if isinstance(block, dict) and block.get("type") == "tool_use":
             tool_input = block.get("input")
             if isinstance(tool_input, dict):
-                # Only fields that name what the tool touches; file content written is not an access.
-                yield from _strings({key: value for key, value in tool_input.items() if key in _ACCESS_FIELDS})
+                # File content written is not an access; an unknown tool is scanned whole.
+                fields = _ACCESS_FIELDS.get(block.get("name"))
+                yield from _strings(tool_input if fields is None else
+                                    {key: value for key, value in tool_input.items() if key in fields})
 
 
 def _strings(value):
@@ -100,15 +115,17 @@ def _codex_commands(event: dict):
         yield str(item.get("command", ""))
 
 
-def _resolve(token: str, run_dir: Path) -> Path:
-    token = token.rstrip(".:")
+def _candidates(token: str, run_dir: Path) -> tuple[Path, Path]:
+    """The token's lexical absolute path and its resolved target. Only a trailing colon is
+    trimmed: dots are path components (`..`)."""
+    token = token.rstrip(":")
     if token.startswith("~"):
         path = Path(os.path.expanduser(token))
     elif token.startswith("/"):
         path = Path(token)
     else:
-        path = run_dir / token
-    return Path(os.path.realpath(path))
+        path = Path(os.path.realpath(run_dir)) / token
+    return Path(os.path.normpath(path)), Path(os.path.realpath(path))
 
 
 def _is_within(path: Path, root: Path) -> bool:

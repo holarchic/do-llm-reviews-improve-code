@@ -58,6 +58,10 @@ class InfraExhausted(Exception):
     pass
 
 
+class ModelTimeout(Exception):
+    """A writer or reviewer ran out of wall clock; the run stops and HEAD is scored."""
+
+
 @dataclass
 class _Run:
     repo: Path
@@ -141,13 +145,19 @@ def _execute(run: "_Run", record: dict, work, scores) -> None:
     try:
         work()
         record["status"] = "complete"
+    except ModelTimeout:
+        # Pre-registered: a writer or reviewer timeout ends the run and HEAD is scored.
+        record["status"] = "complete"
     except InfraExhausted as exc:
         record.update(status="invalid", invalid_reason=str(exc))
     except Exception:
         record.update(status="invalid", invalid_reason="harness error:\n" + traceback.format_exc())
-    finally:
+    try:
         if run.repo.exists():
             shutil.copytree(run.repo, run.exec_dir / "repo", symlinks=True)
+    except Exception:
+        record.update(status="invalid", invalid_reason="preserving the repo failed:\n" + traceback.format_exc())
+    finally:
         shutil.rmtree(run.repo.parent, ignore_errors=True)
     if record["status"] == "complete":
         try:
@@ -239,9 +249,10 @@ def _loop(run: _Run) -> None:
 def _writer(run: _Run, name: str, prompt: str) -> None:
     session = _step(run, name, lambda out: agents.run_claude(
         agents.WRITER_MODEL, prompt, role=agents.WRITER, cwd=run.repo, out_dir=out))
+    run.last_commit = _commit(run.repo, name)
     if session.terminal == agents.TIMEOUT:
         run.flags.append(f"timeout:{name}")
-    run.last_commit = _commit(run.repo, name)
+        raise ModelTimeout(name)
 
 
 def _review(run: _Run, name: str, prompt: str) -> Verdict:
@@ -254,11 +265,12 @@ def _review(run: _Run, name: str, prompt: str) -> Verdict:
             return agents.run_codex(agents.CROSS_REVIEWER_MODEL, prompt, role=agents.REVIEWER,
                                     cwd=run.repo, out_dir=out)
     session = _step(run, name, call)
-    if session.terminal == agents.TIMEOUT:
-        run.flags.append(f"timeout:{name}")
     if _git(run.repo, "status", "--porcelain"):
         run.flags.append(f"reviewer_wrote:{name}")
         _reset(run.repo, run.last_commit)
+    if session.terminal == agents.TIMEOUT:
+        run.flags.append(f"timeout:{name}")
+        raise ModelTimeout(name)
     verdict = parse_verdict(session.final_text)
     if verdict.malformed:
         run.flags.append(f"malformed_verdict:{name}")

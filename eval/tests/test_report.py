@@ -32,7 +32,7 @@ class ReportTest(unittest.TestCase):
                 self.write(exec_dir / "record.json", {
                     "status": "complete", "manifest": "d", "steps": [], "rounds": {}, "flags": [],
                     "scores": {"primary": primary[arm][task] if isinstance(primary[arm], dict) else primary[arm],
-                               "static": STATIC}})
+                               "static": STATIC, "hidden_outcomes": {}}})
                 if arm in pilot.FOLLOWUP_ARMS:
                     self.write(exec_dir / "followup" / "record.json", {
                         "status": "complete", "manifest": "d",
@@ -112,6 +112,17 @@ class ReportTest(unittest.TestCase):
     def test_sensitivity_compares_the_whole_trigger(self):
         self.populate({"A1": 0.6, "A1r": 0.65, "A2": 0.7, "A3": 0.8}, {})
         self.assertEqual(self.decide().primary_sensitivity, "unchanged with A1r in place of A1")
+
+    def test_malformed_nested_fields_are_incomplete(self):
+        self.populate({"A1": 0.7, "A1r": 0.7, "A2": 0.9, "A3": 0.7}, {})
+        for patch in ({"steps": [{}]}, {"flags": [None]}, {"rounds": {"plan": "x"}}):
+            with self.subTest(patch=patch):
+                record = self.root / "runs" / f"{TASKS[0]}--A3" / "exec-1" / "record.json"
+                data = json.loads(record.read_text())
+                self.write(record, {**data, **patch})
+                self.assertEqual(self.decide().verdict, "INCOMPLETE")
+                self.assertIsNone(pilot.complete_build(self.root / "runs", TASKS[0], "A3", "d"))
+                self.write(record, data)
 
     def test_malformed_record_is_incomplete(self):
         self.populate({"A1": 0.7, "A1r": 0.7, "A2": 0.9, "A3": 0.7}, {})
