@@ -27,11 +27,7 @@ def main(argv: list[str]) -> int:
     parsers["judge"].add_argument("--judge", choices=["fable", "astra"], required=False)
     parsers["judge"].add_argument("--pair", nargs=2, metavar="ARM", help="with --task: judge two arms' builds")
     args = parser.parse_args(argv)
-    handler = HANDLERS.get(args.command)
-    if handler is None:
-        # TODO(build): each command is wired as its chunk lands.
-        print(f"{args.command}: not built yet", file=sys.stderr)
-        return 2
+    handler = HANDLERS[args.command]
     return handler(args)
 
 
@@ -61,11 +57,12 @@ def _probe(args) -> int:
 def _run(args) -> int:
     import json
 
-    from .harness import loop, tasks
+    from .harness import loop, pilot, tasks
 
-    if not (args.task and args.arm):
-        # TODO(build): the pilot schedule lands with the freeze.
-        print("run: pass --task and --arm", file=sys.stderr)
+    if not args.task:
+        return _guarded(lambda: pilot.run_builds(DATA_ROOT))
+    if not args.arm:
+        print("run: --task needs --arm", file=sys.stderr)
         return 2
     task = tasks.Task(tasks.TASKS_ROOT / args.task)
     if not task.is_dev:
@@ -86,11 +83,12 @@ def _run(args) -> int:
 def _judge(args) -> int:
     import json
 
-    from .harness import judge, loop, tasks
+    from .harness import judge, loop, pilot, tasks
 
-    if not (args.task and args.judge):
-        # TODO(build): the pilot's full judging lands with the freeze.
-        print("judge: pass --task and --judge", file=sys.stderr)
+    if not args.task:
+        return _guarded(lambda: pilot.run_judging(DATA_ROOT))
+    if not args.judge:
+        print("judge: --task needs --judge", file=sys.stderr)
         return 2
     task = tasks.Task(tasks.TASKS_ROOT / args.task)
     if not task.is_dev:
@@ -107,7 +105,40 @@ def _judge(args) -> int:
     return 0
 
 
-HANDLERS = {"validate": _validate, "probe": _probe, "run": _run, "judge": _judge}
+def _freeze(args) -> int:
+    from .harness import manifest
+
+    print(manifest.freeze())
+    return 0
+
+
+def _report(args) -> int:
+    from .harness import report
+
+    def write() -> int:
+        results = report.collect(DATA_ROOT)
+        decision = report.decide(results)
+        text = report.render(results, decision)
+        (DATA_ROOT / "report.md").write_text(text, encoding="utf-8")
+        print(text)
+        return 0 if decision.verdict != "INCOMPLETE" else 1
+
+    return _guarded(write)
+
+
+def _guarded(action) -> int:
+    """Pilot commands refuse to start on changed frozen inputs."""
+    from .harness import manifest
+
+    try:
+        return action()
+    except manifest.ManifestMismatch as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 3
+
+
+HANDLERS = {"validate": _validate, "probe": _probe, "freeze": _freeze, "run": _run, "judge": _judge,
+            "report": _report}
 
 
 if __name__ == "__main__":

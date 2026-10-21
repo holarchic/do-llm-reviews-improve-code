@@ -81,7 +81,8 @@ def parse_judgement(text: str) -> str | None:
     return None
 
 
-def judge_pair(judge: str, task: Task, a_repo: Path, b_repo: Path, out_dir: Path) -> dict:
+def judge_pair(judge: str, task: Task, a_repo: Path, b_repo: Path, out_dir: Path, *,
+               manifest_hash: str | None = None) -> dict:
     """Judge builds a and b in both orders. Returns per-order picks and the combined result."""
     out_dir.mkdir(parents=True, exist_ok=False)
     exports = {"a": out_dir / "export-a", "b": out_dir / "export-b"}
@@ -100,6 +101,7 @@ def judge_pair(judge: str, task: Task, a_repo: Path, b_repo: Path, out_dir: Path
     winners = {o["winner"] for o in orders}
     result = {
         "judge": judge,
+        "manifest": manifest_hash,
         "orders": orders,
         "result": winners.pop() if len(winners) == 1 else "tie",
         "leak_words": {name: leak_count(path) for name, path in exports.items()},
@@ -108,9 +110,10 @@ def judge_pair(judge: str, task: Task, a_repo: Path, b_repo: Path, out_dir: Path
     return result
 
 
-def calibrate(judge: str, task: Task, out_dir: Path) -> dict:
+def calibrate(judge: str, task: Task, out_dir: Path, *, manifest_hash: str | None = None) -> dict:
     """Reference (a) vs degraded reference (b): the judge passes the task if it picks a in both orders."""
-    result = judge_pair(judge, task, task.path("reference"), task.path("degraded"), out_dir)
+    result = judge_pair(judge, task, task.path("reference"), task.path("degraded"), out_dir,
+                        manifest_hash=manifest_hash)
     return {**result, "prefers_reference": result["result"] == "a"}
 
 
