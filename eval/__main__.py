@@ -2,6 +2,9 @@
 
 import argparse
 import sys
+from pathlib import Path
+
+DATA_ROOT = Path(__file__).resolve().parent / "data"
 
 COMMANDS = {
     "validate": "check every task's hidden suites against its reference and wrong variants",
@@ -40,7 +43,17 @@ def _validate() -> int:
     return 1 if problems else 0
 
 
-HANDLERS = {"validate": _validate}
+def _probe() -> int:
+    from .harness import probe
+
+    problems = probe.run_probes(DATA_ROOT / "probes")
+    for problem in problems:
+        print(problem, file=sys.stderr)
+    print("probe: FAIL" if problems else "probe: ok")
+    return 1 if problems else 0
+
+
+HANDLERS = {"validate": _validate, "probe": _probe}
 
 
 if __name__ == "__main__":
