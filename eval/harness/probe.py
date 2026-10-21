@@ -8,6 +8,8 @@ import json
 import re
 import secrets
 import shutil
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -209,14 +211,20 @@ def _codex_writer_probe(stamp: Path, canary: Path) -> dict:
         session = agents.run(LUNA, prompt, role=agents.WRITER,
                              cwd=run_dir, out_dir=stamp / "codex-writer")
         built = (run_dir / "m.py").exists() and (run_dir / "test_m.py").exists()
+        # Positive control owned by the probe: the generated code really works, whatever its own tests did.
+        check = subprocess.run([sys.executable, "-B", "-c", "import m; assert m.add(2, 3) == 5"], cwd=run_dir,
+                               capture_output=True, timeout=30)
+        works = check.returncode == 0
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)
     commands = codex_commands(session.transcript)
     problems = [] if session.terminal == agents.COMPLETED else [f"session did not complete: {session.reason}"]
     if not built:
         problems.append("writer could not create files in its run dir")
-    if not any("unittest" in c["command"] and c["exit_code"] == 0 and "OK" in c["output"] for c in commands):
-        problems.append("writer's tests did not run green in its run dir")
+    if not works:
+        problems.append("generated add() failed the probe's own check")
+    if not any("unittest" in c["command"] and c["exit_code"] == 0 and tests_ran(c["output"]) for c in commands):
+        problems.append("writer's tests did not run green in its run dir (at least one test)")
     canary_reads = [c for c in commands if str(canary) in c["command"]]
     if not canary_reads:
         problems.append("private read never attempted")
@@ -227,6 +235,12 @@ def _codex_writer_probe(stamp: Path, canary: Path) -> dict:
     if forbidden.exists():
         problems.append("private write was not refused")
     return {"problems": problems}
+
+
+def tests_ran(unittest_output: str) -> bool:
+    """A green unittest run that executed at least one test (`Ran 0 tests … OK` proves nothing)."""
+    match = re.search(r"^Ran (\d+) tests? in ", unittest_output, flags=re.MULTILINE)
+    return bool(match) and int(match.group(1)) > 0 and re.search(r"^OK\b", unittest_output, flags=re.MULTILINE) is not None
 
 
 def codex_commands(transcript: Path) -> list[dict]:

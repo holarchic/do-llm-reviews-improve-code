@@ -19,6 +19,17 @@ FULL = [
 ]
 
 
+class TestsRanTest(unittest.TestCase):
+    def test_zero_tests_is_not_green(self):
+        self.assertFalse(probe.tests_ran("----------------------------------------------------------------------\nRan 0 tests in 0.000s\n\nOK\n"))
+
+    def test_one_passing_test_is_green(self):
+        self.assertTrue(probe.tests_ran("test_add (test_m.T.test_add) ... ok\n\nRan 1 test in 0.001s\n\nOK\n"))
+
+    def test_failure_is_not_green(self):
+        self.assertFalse(probe.tests_ran("Ran 2 tests in 0.001s\n\nFAILED (failures=1)\n"))
+
+
 class CodexCanaryProblemsTest(unittest.TestCase):
     def problems(self, commands):
         return probe.codex_canary_problems(commands, permitted=PERMITTED, denied=DENIED, listing="5e1b0a9c4d2f7e36")

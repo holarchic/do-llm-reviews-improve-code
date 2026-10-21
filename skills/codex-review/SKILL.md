@@ -139,7 +139,7 @@ ISSUES:
 <GREEN: "None" or LOW observations only. YELLOW/RED: numbered.>
 
 1. [<HIGH | MEDIUM | LOW>] <file>:<line> — <issue>
-   Basis: <requirement broken (SPEC § or criterion, plan step, the user's task) or rubric rule by name> — <how this code breaks it>
+   Basis: <requirement broken (SPEC § or criterion, plan step, a hard constraint in this prompt, the user's task) or rubric rule by name> — <how this code breaks it>
    Fix: <concrete code or design change>
 
 Every HIGH or MEDIUM issue needs a `Basis:` naming the requirement it breaks (SPEC section or acceptance criterion, plan step, the user's task) or the rubric rule it violates (by name), and how. A HIGH or MEDIUM without one is read as LOW.

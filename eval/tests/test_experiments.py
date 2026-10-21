@@ -128,6 +128,13 @@ class ExperimentFreezeTest(unittest.TestCase):
         manifest.freeze(self.sonnet)
         self.assertEqual(manifest.verify(PILOT), pilot_digest)
 
+    def test_deleted_prereg_refuses_cleanly(self):
+        self.prereg(self.sonnet)
+        manifest.freeze(self.sonnet)
+        (self.eval_root / self.sonnet.prereg).unlink()
+        with self.assertRaisesRegex(manifest.ManifestMismatch, "frozen input missing: eval/prereg/sonnet.md"):
+            manifest.verify(self.sonnet)
+
     def test_changed_experiment_table_refuses(self):
         self.prereg(self.sonnet)
         manifest.freeze(self.sonnet)

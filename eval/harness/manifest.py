@@ -44,8 +44,13 @@ def frozen_files(experiment) -> list[Path]:
 
 
 def compute(experiment) -> dict[str, str]:
-    return {str(path.relative_to(REPO_ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
-            for path in frozen_files(experiment)}
+    hashes = {}
+    for path in frozen_files(experiment):
+        try:
+            hashes[str(path.relative_to(REPO_ROOT))] = hashlib.sha256(path.read_bytes()).hexdigest()
+        except FileNotFoundError:
+            raise ManifestMismatch(f"frozen input missing: {path.relative_to(REPO_ROOT)}") from None
+    return hashes
 
 
 def digest(files: dict[str, str]) -> str:
