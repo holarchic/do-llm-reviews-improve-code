@@ -39,7 +39,7 @@ def collect(data_root: Path, experiment: Experiment) -> Results:
     """data_root is the experiment's own data dir."""
     digest = manifest.verify(experiment)
     runs_root = data_root / "runs"
-    results = Results(digest=digest, tasks=[task.id for task in pilot.scored_tasks()])
+    results = Results(digest=digest, tasks=[task.id for task in pilot.scored_tasks(experiment)])
     for arm in experiment.arm_names:
         for task_id in results.tasks:
             exec_dir = pilot.complete_build(runs_root, task_id, arm, digest)
@@ -93,7 +93,7 @@ def decide(results: Results, experiment: Experiment) -> Decision:
         return Decision("INCOMPLETE", [f"{len(results.missing)} records missing"], [], "n/a")
     calibrated = [name for name, by_task in results.calibration.items()
                   if sum(by_task.values()) >= CALIBRATION_NEEDED]
-    if not experiment.decision_rule:
+    if experiment.decision_rule != "pilot":
         return Decision("DESCRIPTIVE", [], calibrated, "n/a")
     reasons = []
     base = experiment.baseline
@@ -222,7 +222,7 @@ def _arm_mean(results: Results, arm: str) -> float | None:
 
 
 def _treatment_limits(experiment: Experiment) -> list[str]:
-    if experiment.decision_rule:
+    if experiment.decision_rule == "pilot":
         return ["- The treatment bundles rules, rubric, review and extra compute; A2 vs A3 compares reviewer"
                 " configurations (model, CLI and tool policy together)."]
     lines = ["- Reviewed arms bundle rules, rubric, review and extra compute unless an ablation removes one;"

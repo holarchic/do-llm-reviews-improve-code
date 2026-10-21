@@ -19,7 +19,7 @@ import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import agents, audit, procs, prompts, records, score
+from . import agents, audit, openrouter, procs, prompts, records, score
 from .tasks import Task
 
 MAX_ATTEMPTS = 3
@@ -136,12 +136,17 @@ def severity_note(verdicts: dict[str, Verdict]) -> str:
     return "\n".join(lines)
 
 
-def execute_run(task: Task, arm: Arm, runs_root: Path, *, manifest_hash: str | None) -> dict:
-    run_id = f"{task.id}--{arm.name}"
-    exec_dir = _next_exec_dir(runs_root.resolve() / run_id)
+def run_id(task_id: str, arm: str, rep: int | None = None) -> str:
+    return f"{task_id}--{arm}" if rep is None else f"{task_id}--{arm}--r{rep}"
+
+
+def execute_run(task: Task, arm: Arm, runs_root: Path, *, rep: int | None = None,
+                manifest_hash: str | None) -> dict:
+    run_id_ = run_id(task.id, arm.name, rep)
+    exec_dir = _next_exec_dir(runs_root.resolve() / run_id_)
     run = _Run(repo=audit.anonymous_workdir() / "repo", exec_dir=exec_dir, arm=arm,
                basis_rule=prompts.basis_required())
-    record = {"run_id": run_id, "task": task.id, "arm": arm.name, "exec": exec_dir.name,
+    record = {"run_id": run_id_, "task": task.id, "arm": arm.name, "rep": rep, "exec": exec_dir.name,
               "manifest": manifest_hash, "cli_versions": _cli_versions(), "started": _now()}
 
     def work():
@@ -153,7 +158,7 @@ def execute_run(task: Task, arm: Arm, runs_root: Path, *, manifest_hash: str | N
 
     _execute(run, record, work, scores)
     record.update(rounds=run.rounds)
-    (exec_dir / "record.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    _write_record(exec_dir, record, arm)
     return record
 
 
@@ -187,8 +192,21 @@ def execute_followup(task: Task, build_exec_dir: Path, arm: Arm, *, manifest_has
         return _followup_scores(task, build["scores"]["hidden_outcomes"], artifact, out_dir)
 
     _execute(run, record, work, scores)
-    (out_dir / "record.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    _write_record(out_dir, record, arm)
     return record
+
+
+def _write_record(exec_dir: Path, record: dict, arm: Arm) -> None:
+    """Write the record; for a routed arm, then scrub the key from everything the run saved and
+    flag each hit (the scrub cannot run earlier: the record itself is a saved file)."""
+    path = exec_dir / "record.json"
+    path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    if not any(agent is not None and agent.provider == agents.OPENROUTER for agent in (arm.writer, arm.reviewer)):
+        return
+    hits = openrouter.scrub(exec_dir)
+    if hits:
+        record["flags"] = record.get("flags", []) + [f"key_exposed:{hit}" for hit in hits]
+        path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
 
 
 def _execute(run: "_Run", record: dict, work, scores) -> None:
@@ -309,6 +327,7 @@ def _loop(run: _Run) -> None:
 def _writer(run: _Run, name: str, prompt: str) -> None:
     session = _step(run, name, lambda out: agents.run(
         run.arm.writer, prompt, role=agents.WRITER, cwd=run.repo, out_dir=out))
+    _check_routing(run, run.arm.writer, session, name)
     run.last_commit = _commit(run.repo, name)
     if session.terminal == agents.TIMEOUT:
         run.flags.append(f"timeout:{name}")
@@ -318,6 +337,7 @@ def _writer(run: _Run, name: str, prompt: str) -> None:
 def _review(run: _Run, name: str, prompt: str) -> Verdict:
     session = _step(run, name, lambda out: agents.run(
         run.arm.reviewer, prompt, role=agents.REVIEWER, cwd=run.repo, out_dir=out))
+    _check_routing(run, run.arm.reviewer, session, name)
     if _git(run.repo, "status", "--porcelain"):
         run.flags.append(f"reviewer_wrote:{name}")
         _reset(run.repo, run.last_commit)
@@ -329,6 +349,16 @@ def _review(run: _Run, name: str, prompt: str) -> Verdict:
         run.flags.append(f"malformed_verdict:{name}")
     run.steps[-1]["verdict"] = {"label": verdict.label, "blocking": verdict.blocking, "malformed": verdict.malformed}
     return verdict
+
+
+def _check_routing(run: _Run, agent: agents.Agent, session: agents.Session, name: str) -> None:
+    """A routed session that reports any model but its own ran something it shouldn't (e.g. a
+    background call to an Anthropic model): flagged, and the report withholds its verdict."""
+    if agent.provider != agents.OPENROUTER:
+        return
+    for model in session.reported_models:
+        if model != agent.model:
+            run.flags.append(f"unrouted_model:{name}:{model}")
 
 
 def _step(run: _Run, name: str, call) -> agents.Session:

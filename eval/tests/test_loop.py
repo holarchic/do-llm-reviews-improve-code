@@ -27,7 +27,7 @@ class FakeAgents:
         self.prompts: list[tuple[str, str]] = []
         self.writer_infra_left = 0
 
-    def run_claude(self, model, prompt, *, role, cwd, out_dir):
+    def run_claude(self, model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE):
         self.prompts.append((role, prompt))
         if role == agents.REVIEWER:
             return session(out_dir, text=self.review_text)
@@ -42,7 +42,7 @@ class FakeAgents:
             (cwd / "plans" / "plan.md").write_text("# plan\n")
         return session(out_dir)
 
-    def run_codex(self, model, prompt, *, role, cwd, out_dir):
+    def run_codex(self, model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE):
         self.prompts.append((role, prompt))
         return session(out_dir, text=self.review_text)
 
@@ -243,11 +243,11 @@ class FollowupTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp)
 
     def followup(self, base_source: str, followup_source: str) -> dict:
-        def build_writer(model, prompt, *, role, cwd, out_dir):
+        def build_writer(model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE):
             (cwd / "intervals.py").write_text(base_source)
             return session(out_dir)
 
-        def followup_writer(model, prompt, *, role, cwd, out_dir):
+        def followup_writer(model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE):
             assert (cwd / "FOLLOWUP.md").exists()
             (cwd / "intervals.py").write_text(followup_source)
             return session(out_dir)
@@ -288,7 +288,7 @@ class HardeningTest(unittest.TestCase):
     def test_session_exception_is_a_retried_infra_attempt(self):
         calls = []
 
-        def writer(model, prompt, *, role, cwd, out_dir):
+        def writer(model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE):
             calls.append(cwd)
             if len(calls) == 1:
                 raise OSError("spawn failed")
@@ -302,7 +302,7 @@ class HardeningTest(unittest.TestCase):
         self.assertIn("harness exception", attempts[0]["reason"])
 
     def test_score_uses_committed_files_only(self):
-        def writer(model, prompt, *, role, cwd, out_dir):
+        def writer(model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE):
             (cwd / "intervals.py").write_text(REFERENCE)
             with open(cwd / ".gitignore", "a") as handle:
                 handle.write("intervals.py\n")
@@ -313,7 +313,7 @@ class HardeningTest(unittest.TestCase):
         self.assertFalse((self.tmp / "dev-intervals--A1" / "exec-1" / "artifact" / "intervals.py").exists())
 
     def test_scoring_crash_makes_run_invalid(self):
-        def writer(model, prompt, *, role, cwd, out_dir):
+        def writer(model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE):
             return session(out_dir)
 
         with mock.patch.object(loop.score, "score_build", side_effect=RuntimeError("boom")):
@@ -324,7 +324,7 @@ class HardeningTest(unittest.TestCase):
     def test_session_cwd_is_neutral(self):
         seen = []
 
-        def writer(model, prompt, *, role, cwd, out_dir):
+        def writer(model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE):
             seen.append(cwd)
             return session(out_dir)
 
@@ -347,7 +347,7 @@ class TimeoutAndPreservationTest(unittest.TestCase):
         fake = FakeAgents(review_text="VERDICT: GREEN\n")
         original = fake.run_claude
 
-        def run_claude(model, prompt, *, role, cwd, out_dir):
+        def run_claude(model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE):
             result = original(model, prompt, role=role, cwd=cwd, out_dir=out_dir)
             if "Build the plan" in prompt:
                 return agents.Session(agents.TIMEOUT, "wall clock", "", result.transcript, 1.0)
@@ -362,7 +362,7 @@ class TimeoutAndPreservationTest(unittest.TestCase):
 
     def test_reviewer_timeout_stops_the_run(self):
         fake = FakeAgents()
-        fake.run_codex = lambda model, prompt, *, role, cwd, out_dir: agents.Session(
+        fake.run_codex = lambda model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE: agents.Session(
             agents.TIMEOUT, "wall clock", "", session(out_dir).transcript, 1.0)
         record = self.run_arm("A3", fake)
         self.assertEqual(record["status"], "complete")
@@ -370,7 +370,7 @@ class TimeoutAndPreservationTest(unittest.TestCase):
         self.assertEqual(record["scores"]["primary"], 0.0)
 
     def test_preservation_failure_is_recorded_invalid(self):
-        def writer(model, prompt, *, role, cwd, out_dir):
+        def writer(model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE):
             return session(out_dir)
 
         with mock.patch.object(agents, "run_claude", writer), \
@@ -392,11 +392,11 @@ class AblationTest(unittest.TestCase):
     def fakes(self, review_text):
         fake = FakeAgents(review_text=review_text)
 
-        def claude(model, prompt, *, role, cwd, out_dir):
+        def claude(model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE):
             self.calls.append(("claude", role, prompt))
             return fake.run_claude(model, prompt, role=role, cwd=cwd, out_dir=out_dir)
 
-        def codex(model, prompt, *, role, cwd, out_dir):
+        def codex(model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE):
             self.calls.append(("codex", role, prompt))
             if role == agents.WRITER:
                 return fake.run_claude(model, prompt, role=role, cwd=cwd, out_dir=out_dir)

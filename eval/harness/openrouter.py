@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -136,3 +137,45 @@ def _git_objects(git_dir: Path) -> bytes:
                                capture_output=True, env={"PATH": "/usr/bin:/bin:/opt/homebrew/bin",
                                                          "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"})
     return completed.stdout
+
+
+class SpendCap:
+    """Admits jobs while the key's spend since a phase first began stays under the phase's cap.
+
+    The ledger file keeps each phase's baseline (usage when it first began) across resumes and
+    retries, plus every admission reading for the report. The cap is checked at admission only:
+    jobs already running finish, so final spend can exceed it by what they cost.
+    """
+
+    def __init__(self, ledger: Path, phase: str, cap_usd: float):
+        self.ledger, self.phase, self.cap_usd = ledger, phase, cap_usd
+        self._lock = threading.Lock()
+
+    def admit(self) -> bool:
+        """True if a job may start; False past the cap or when usage can't be read."""
+        with self._lock:
+            try:
+                used = credit_used()
+            except CreditUnavailable:
+                return False
+            entries = self._read()
+            entry = entries.setdefault(self.phase, {"baseline": used, "readings": []})
+            entry["readings"].append(used)
+            self.ledger.parent.mkdir(parents=True, exist_ok=True)
+            self.ledger.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
+            return used - entry["baseline"] < self.cap_usd
+
+    def _read(self) -> dict:
+        try:
+            return json.loads(self.ledger.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+
+
+def spent(ledger: Path, phase: str) -> float | None:
+    """Spend recorded for a phase: its last reading minus its baseline."""
+    try:
+        entry = json.loads(ledger.read_text(encoding="utf-8"))[phase]
+        return entry["readings"][-1] - entry["baseline"]
+    except (FileNotFoundError, KeyError, IndexError, json.JSONDecodeError):
+        return None

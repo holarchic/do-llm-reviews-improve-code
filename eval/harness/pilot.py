@@ -3,7 +3,9 @@
 Jobs run in a shuffled, interleaved order (the experiment's seed), a few at a time, so
 provider conditions and quota pressure don't line up with one arm. Each job is
 skipped when a complete record under the current manifest already exists, so
-re-running resumes; failed attempts stay on disk beside the new ones.
+re-running resumes; failed attempts stay on disk beside the new ones. A routed
+experiment admits each job only under its spend cap, and scrubs the key from its
+data on every start.
 """
 
 import itertools
@@ -14,33 +16,36 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import judge, loop, manifest, records, tasks
+from . import judge, loop, manifest, openrouter, records, tasks
 from .experiments import Experiment
 
-PARALLEL = 3
+SPEND_LEDGER = "spend.json"
 
 
-def scored_tasks() -> list[tasks.Task]:
-    return [task for task in tasks.load_tasks() if not task.is_dev]
+def scored_tasks(experiment: Experiment) -> list[tasks.Task]:
+    return [tasks.Task(tasks.TASKS_ROOT / task_id) for task_id in experiment.tasks]
 
 
-def build_schedule(experiment: Experiment) -> list[tuple[str, str]]:
-    jobs = [(task.id, arm) for task, arm in itertools.product(scored_tasks(), experiment.arm_names)]
+def build_schedule(experiment: Experiment) -> list[tuple[str, str, int | None]]:
+    """(task, arm, rep). Shuffling depends only on the list's length and the seed, so an
+    experiment without replicates keeps the order it had before replicates existed."""
+    jobs = [(task.id, arm, rep) for task, arm, rep in
+            itertools.product(scored_tasks(experiment), experiment.arm_names, experiment.rep_ids)]
     random.Random(experiment.seed).shuffle(jobs)
     return jobs
 
 
 def judge_schedule(experiment: Experiment) -> list[tuple[str, str, tuple[str, str] | None]]:
     """(judge, task, pair); a None pair is that task's calibration."""
-    jobs = [(name, task.id, pair) for name in judge.JUDGES for task in scored_tasks()
+    jobs = [(name, task.id, pair) for name in judge.JUDGES for task in scored_tasks(experiment)
             for pair in (None, *experiment.pairs)]
     random.Random(experiment.seed + 1).shuffle(jobs)
     return jobs
 
 
-def complete_build(runs_root: Path, task_id: str, arm: str, digest: str) -> Path | None:
-    """The newest complete exec of task × arm under this manifest, if any."""
-    run_root = runs_root / f"{task_id}--{arm}"
+def complete_build(runs_root: Path, task_id: str, arm: str, digest: str, rep: int | None = None) -> Path | None:
+    """The newest complete exec of task × arm (× rep) under this manifest, if any."""
+    run_root = runs_root / loop.run_id(task_id, arm, rep)
     for exec_dir in sorted(run_root.glob("exec-*"), key=lambda p: int(p.name.split("-")[1]), reverse=True):
         if records.build(exec_dir / "record.json", digest) is not None:
             return exec_dir
@@ -55,8 +60,14 @@ def run_builds(data_root: Path, experiment: Experiment) -> int:
     """data_root is the experiment's own data dir."""
     digest = manifest.verify(experiment)
     runs_root = data_root / "runs"
-    by_id = {task.id: task for task in scored_tasks()}
-    jobs = [(by_id[task_id], arm) for task_id, arm in build_schedule(experiment)]
+    by_id = {task.id: task for task in scored_tasks(experiment)}
+    jobs = [(by_id[task_id], arm, rep) for task_id, arm, rep in build_schedule(experiment)]
+    cap = None
+    if experiment.routed:
+        # A run killed mid-way leaves files the end-of-run scrub never reached.
+        if runs_root.exists():
+            openrouter.scrub(runs_root)
+        cap = openrouter.SpendCap(data_root / SPEND_LEDGER, "scored", experiment.budget_usd)
 
     task_locks = {task_id: threading.Lock() for task_id in by_id}
 
@@ -68,10 +79,13 @@ def run_builds(data_root: Path, experiment: Experiment) -> int:
             return build_job(item)
 
     def build_job(item):
-        task, arm = item
-        exec_dir = complete_build(runs_root, task.id, arm, digest)
+        task, arm, rep = item
+        exec_dir = complete_build(runs_root, task.id, arm, digest, rep)
         if exec_dir is None:
-            record = loop.execute_run(task, experiment.arm(arm), runs_root, manifest_hash=digest)
+            if cap is not None and not cap.admit():
+                _log(f"build {loop.run_id(task.id, arm, rep)}: not admitted (spend cap or unreadable usage)")
+                return False
+            record = loop.execute_run(task, experiment.arm(arm), runs_root, rep=rep, manifest_hash=digest)
             _log(f"build {record['run_id']} {record['exec']}: {record['status']} {record.get('flags')}")
             if record["status"] != "complete":
                 return False
@@ -83,7 +97,7 @@ def run_builds(data_root: Path, experiment: Experiment) -> int:
         _log(f"followup {task.id}--{arm}: {followup['status']}")
         return followup["status"] == "complete"
 
-    with ThreadPoolExecutor(PARALLEL) as pool:
+    with ThreadPoolExecutor(experiment.parallel) as pool:
         results = list(pool.map(job, jobs))
     _log(f"builds: {sum(results)}/{len(results)} complete")
     return 0 if all(results) else 1
@@ -92,7 +106,7 @@ def run_builds(data_root: Path, experiment: Experiment) -> int:
 def run_judging(data_root: Path, experiment: Experiment) -> int:
     digest = manifest.verify(experiment)
     runs_root = data_root / "runs"
-    by_id = {task.id: task for task in scored_tasks()}
+    by_id = {task.id: task for task in scored_tasks(experiment)}
     judged_arms = sorted({arm for pair in experiment.pairs for arm in pair})
     builds = {(task_id, arm): complete_build(runs_root, task_id, arm, digest)
               for task_id in by_id for arm in judged_arms}
@@ -124,7 +138,7 @@ def run_judging(data_root: Path, experiment: Experiment) -> int:
         _log(f"judge {name} {task_id} {pair or 'calibration'}: {result['result']}")
         return True
 
-    with ThreadPoolExecutor(PARALLEL) as pool:
+    with ThreadPoolExecutor(experiment.parallel) as pool:
         results = list(pool.map(job, judge_schedule(experiment)))
     _log(f"judgements: {sum(results)}/{len(results)} complete")
     return 0 if all(results) else 1

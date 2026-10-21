@@ -7,8 +7,8 @@ from unittest import mock
 
 from eval.harness import experiments, judge, manifest, pilot, report
 
-TASKS = [task.id for task in pilot.scored_tasks()]
 PILOT = experiments.PILOT
+TASKS = [task.id for task in pilot.scored_tasks(PILOT)]
 STATIC = {"ruff_violations": 1, "source_loc": 50, "test_loc": 40, "max_function_branches": 4}
 
 
@@ -109,7 +109,7 @@ class ReportTest(unittest.TestCase):
     def test_exact_threshold_with_real_denominators_is_go(self):
         # +7/14 on bill-split is exactly +10 arm-mean points; with these real denominators
         # the float difference of means is 9.999999999999998.
-        sizes = {task.id: len(task.expected()["hidden"]) for task in pilot.scored_tasks()}
+        sizes = {task.id: len(task.expected()["hidden"]) for task in pilot.scored_tasks(PILOT)}
         a1 = {task: 0.0 for task in sizes}
         a1["token-bucket"] = 9 / sizes["token-bucket"]
         a2 = {**a1, "bill-split": 7 / sizes["bill-split"]}
@@ -157,7 +157,7 @@ class TaskExclusionTest(unittest.TestCase):
 
         active, overlaps, lock = {}, [], threading.Lock()
 
-        def fake_execute(task, arm, runs_root, *, manifest_hash):
+        def fake_execute(task, arm, runs_root, *, rep=None, manifest_hash):
             with lock:
                 if active.get(task.id):
                     overlaps.append(task.id)

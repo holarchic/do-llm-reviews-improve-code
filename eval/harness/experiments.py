@@ -7,13 +7,17 @@ with one switch off at a time. Only the pilot carries a pre-registered decision
 rule; every other experiment needs its own `eval/prereg/<name>.md`, frozen,
 before it can run.
 
+pilot2 is judge-free: open-weight models through OpenRouter, three replicates per
+cell, scored by hidden tests and planted bugs (`report="replicated"`), under its
+own pre-registered rule.
+
 Model pairs follow the operator's tier map: Fable↔Astra, Opus↔Sol,
 Sonnet↔Terra, Haiku↔Luna.
 """
 
 from dataclasses import dataclass
 
-from .agents import Agent
+from .agents import OPENROUTER, Agent
 from .loop import Arm
 
 HAIKU = Agent("claude", "claude-haiku-5-5")
@@ -22,6 +26,12 @@ OPUS = Agent("claude", "claude-opus-5-5")
 LUNA = Agent("codex", "gpt-6-luna")
 TERRA = Agent("codex", "gpt-5.6-terra")
 SOL = Agent("codex", "gpt-6.1-sol")
+DEEPSEEK_WRITER = Agent("claude", "deepseek/deepseek-v4.1-flash", OPENROUTER)
+DEEPSEEK_REVIEWER = Agent("codex", "deepseek/deepseek-v4.1-flash", OPENROUTER)
+GLM_REVIEWER = Agent("codex", "z-ai/glm-5.3-flash", OPENROUTER)
+
+PILOT_TASKS = ("bill-split", "config-includes", "dep-resolver", "log-windows", "token-bucket")
+PILOT2_TASKS = ("calc-expr", "cron-next", "ignore-match", "json-patch", "semver-range")
 
 
 @dataclass(frozen=True)
@@ -36,7 +46,12 @@ class Experiment:
     seed: int
     data_dir: str  # under eval/data; the pilot's data sits at the root
     prereg: str  # relative to eval/
-    decision_rule: bool  # the pilot's pre-registered GO/NO-GO rule applies
+    decision_rule: str | None  # whose pre-registered rule applies: "pilot", "pilot2" or none (descriptive)
+    tasks: tuple[str, ...] = PILOT_TASKS
+    reps: int = 1  # replicates per task × arm; above 1, run ids end in --r<n>
+    parallel: int = 3
+    budget_usd: float | None = None  # OpenRouter spend cap for the scored runs
+    report: str = "judged"  # "judged" (report.py) | "replicated" (replicated.py)
 
     def arm(self, name: str) -> Arm:
         return next(arm for arm in self.arms if arm.name == name)
@@ -49,9 +64,18 @@ class Experiment:
     def treatments(self) -> tuple[str, ...]:
         return tuple(arm.name for arm in self.arms if arm.reviewer is not None)
 
+    @property
+    def rep_ids(self) -> tuple[int | None, ...]:
+        return (None,) if self.reps == 1 else tuple(range(1, self.reps + 1))
+
+    @property
+    def routed(self) -> bool:
+        return any(agent is not None and agent.provider == OPENROUTER
+                   for arm in self.arms for agent in (arm.writer, arm.reviewer))
+
 
 def _families(name: str, title: str, writer: Agent, same: Agent, cross: Agent, seed: int, prereg: str,
-              data_dir: str, decision_rule: bool = False) -> Experiment:
+              data_dir: str, decision_rule: str | None = None) -> Experiment:
     return Experiment(
         name=name,
         title=title,
@@ -98,14 +122,35 @@ def ablation(name: str, writer: Agent, reviewer: Agent, seed: int) -> Experiment
         seed=seed,
         data_dir=name,
         prereg=f"prereg/{name}.md",
-        decision_rule=False,
+        decision_rule=None,
     )
 
 
-PILOT = _families("pilot", "Eval pilot report", HAIKU, HAIKU, LUNA, 20261021, "PREREG.md", "", decision_rule=True)
+PILOT = _families("pilot", "Eval pilot report", HAIKU, HAIKU, LUNA, 20261021, "PREREG.md", "", decision_rule="pilot")
+
+PILOT2 = Experiment(
+    name="pilot2",
+    title="Eval pilot 2 report",
+    arms=(Arm("A1", DEEPSEEK_WRITER), Arm("A2", DEEPSEEK_WRITER, DEEPSEEK_REVIEWER),
+          Arm("A3", DEEPSEEK_WRITER, GLM_REVIEWER)),
+    baseline="A1",
+    replicate=None,
+    followup_arms=(),
+    pairs=(),
+    seed=20261201,
+    data_dir="pilot2",
+    prereg="prereg/pilot2.md",
+    decision_rule="pilot2",
+    tasks=PILOT2_TASKS,
+    reps=3,
+    parallel=5,
+    budget_usd=10.0,
+    report="replicated",
+)
 
 EXPERIMENTS = {experiment.name: experiment for experiment in (
     PILOT,
+    PILOT2,
     tier("sonnet", SONNET, TERRA, seed=20261101),
     tier("opus", OPUS, SOL, seed=20261102),
     reverse("reverse-sonnet", TERRA, SONNET, seed=20261103),

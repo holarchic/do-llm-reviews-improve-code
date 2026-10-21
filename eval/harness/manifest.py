@@ -1,6 +1,6 @@
 """The frozen inputs of an experiment and the check that they are unchanged.
 
-Frozen: the experiment's pre-registration, every scored task file, the harness
+Frozen: the experiment's pre-registration, its scored tasks' files, the harness
 code (prompt assembly, loop, scoring, judging, report, the experiment table) and
 the shipped skill files the prompts are built from. Model ids, arms, timeouts,
 the judge prompt and the schedule seed live in that code, so they are frozen with
@@ -36,10 +36,10 @@ def frozen_files(experiment) -> list[Path]:
     files = [EVAL_ROOT / experiment.prereg, EVAL_ROOT / "__init__.py", EVAL_ROOT / "__main__.py",
              CODEX_REVIEW_SKILL, BUILD_LOOP_SKILL, RUBRIC]
     files += sorted((EVAL_ROOT / "harness").glob("*.py"))
-    for task_dir in sorted((EVAL_ROOT / "tasks").iterdir()):
-        if task_dir.is_dir() and not task_dir.name.startswith(("dev-", ".")):
-            files += sorted(p for p in task_dir.rglob("*")
-                            if p.is_file() and "__pycache__" not in p.parts and p.name != ".DS_Store")
+    for task_id in experiment.tasks:
+        task_dir = EVAL_ROOT / "tasks" / task_id
+        files += sorted(p for p in task_dir.rglob("*")
+                        if p.is_file() and "__pycache__" not in p.parts and p.name != ".DS_Store")
     return files
 
 

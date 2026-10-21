@@ -28,13 +28,15 @@ class PilotUnchangedTest(unittest.TestCase):
 
     def test_schedules_match_the_frozen_pilot(self):
         golden = json.loads((FIXTURES / "pilot_schedules_golden.json").read_text())
-        self.assertEqual([list(job) for job in pilot.build_schedule(PILOT)], golden["builds"])
+        builds = pilot.build_schedule(PILOT)
+        self.assertTrue(all(rep is None for _, _, rep in builds))
+        self.assertEqual([[task, arm] for task, arm, _ in builds], golden["builds"])
         self.assertEqual([[n, t, list(p) if p else None] for n, t, p in pilot.judge_schedule(PILOT)], golden["judging"])
 
     def test_report_matches_the_frozen_pilot(self):
         root = Path(tempfile.mkdtemp(prefix="eval-test-"))
         self.addCleanup(shutil.rmtree, root)
-        pilot_fixture.populate(root, [t.id for t in pilot.scored_tasks()], pilot.judging_dir, pilot.build_identity)
+        pilot_fixture.populate(root, [t.id for t in pilot.scored_tasks(PILOT)], pilot.judging_dir, pilot.build_identity)
         with mock.patch.object(manifest, "verify", return_value="d"):
             results = report.collect(root, PILOT)
             decision = report.decide(results, PILOT)
@@ -56,7 +58,9 @@ class RegisteredExperimentsTest(unittest.TestCase):
                 self.assertIsNone(experiment.arm(experiment.baseline).reviewer)
                 if name != "pilot":
                     self.assertEqual((experiment.data_dir, experiment.prereg), (name, f"prereg/{name}.md"))
-                    self.assertFalse(experiment.decision_rule)
+                    self.assertIn(experiment.decision_rule, (None, name))
+                for task_id in experiment.tasks:
+                    self.assertTrue((tasks.TASKS_ROOT / task_id).is_dir(), task_id)
 
     def test_reverse_has_gpt_writing_and_claude_reviewing_cross(self):
         reverse = experiments.EXPERIMENTS["reverse-sonnet"]
@@ -153,7 +157,7 @@ class SyntheticExperimentRunTest(unittest.TestCase):
         self.calls = []
 
     def fake(self, cli):
-        def session(model, prompt, *, role, cwd, out_dir):
+        def session(model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE):
             self.calls.append({"cli": cli, "model": model, "role": role, "followup": "FOLLOWUP.md" in prompt})
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / "transcript.jsonl").touch()
@@ -171,7 +175,7 @@ class SyntheticExperimentRunTest(unittest.TestCase):
 
     def run_experiment(self, experiment):
         data_root = self.root / experiment.data_dir
-        with mock.patch.object(pilot, "scored_tasks", lambda: [DEV]), \
+        with mock.patch.object(pilot, "scored_tasks", lambda experiment: [DEV]), \
              mock.patch.object(manifest, "verify", return_value="d"), \
              mock.patch.object(agents, "run_claude", self.fake("claude")), \
              mock.patch.object(agents, "run_codex", self.fake("codex")):
