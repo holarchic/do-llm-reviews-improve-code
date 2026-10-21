@@ -1,6 +1,6 @@
-"""The pilot schedule: every build, follow-up, calibration and pairwise judgement.
+"""An experiment's schedule: every build, follow-up, calibration and pairwise judgement.
 
-Jobs run in a shuffled, interleaved order (fixed seed), a few at a time, so
+Jobs run in a shuffled, interleaved order (the experiment's seed), a few at a time, so
 provider conditions and quota pressure don't line up with one arm. Each job is
 skipped when a complete record under the current manifest already exists, so
 re-running resumes; failed attempts stay on disk beside the new ones.
@@ -15,29 +15,26 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import judge, loop, manifest, records, tasks
+from .experiments import Experiment
 
-SEED = 20261021
 PARALLEL = 3
-BUILD_ARMS = tuple(loop.ARMS)
-FOLLOWUP_ARMS = tuple(arm for arm in loop.ARMS if arm != "A1r")
-PAIRS = (("A1", "A2"), ("A1", "A3"), ("A2", "A3"))
 
 
-def pilot_tasks() -> list[tasks.Task]:
+def scored_tasks() -> list[tasks.Task]:
     return [task for task in tasks.load_tasks() if not task.is_dev]
 
 
-def build_schedule() -> list[tuple[str, str]]:
-    jobs = [(task.id, arm) for task, arm in itertools.product(pilot_tasks(), BUILD_ARMS)]
-    random.Random(SEED).shuffle(jobs)
+def build_schedule(experiment: Experiment) -> list[tuple[str, str]]:
+    jobs = [(task.id, arm) for task, arm in itertools.product(scored_tasks(), experiment.arm_names)]
+    random.Random(experiment.seed).shuffle(jobs)
     return jobs
 
 
-def judge_schedule() -> list[tuple[str, str, tuple[str, str] | None]]:
+def judge_schedule(experiment: Experiment) -> list[tuple[str, str, tuple[str, str] | None]]:
     """(judge, task, pair); a None pair is that task's calibration."""
-    jobs = [(name, task.id, pair) for name in judge.JUDGES for task in pilot_tasks()
-            for pair in (None, *PAIRS)]
-    random.Random(SEED + 1).shuffle(jobs)
+    jobs = [(name, task.id, pair) for name in judge.JUDGES for task in scored_tasks()
+            for pair in (None, *experiment.pairs)]
+    random.Random(experiment.seed + 1).shuffle(jobs)
     return jobs
 
 
@@ -54,11 +51,12 @@ def complete_followup(exec_dir: Path, digest: str) -> bool:
     return records.followup(exec_dir / "followup" / "record.json", digest) is not None
 
 
-def run_builds(data_root: Path) -> int:
-    digest = manifest.verify()
+def run_builds(data_root: Path, experiment: Experiment) -> int:
+    """data_root is the experiment's own data dir."""
+    digest = manifest.verify(experiment)
     runs_root = data_root / "runs"
-    by_id = {task.id: task for task in pilot_tasks()}
-    jobs = [(by_id[task_id], arm) for task_id, arm in build_schedule()]
+    by_id = {task.id: task for task in scored_tasks()}
+    jobs = [(by_id[task_id], arm) for task_id, arm in build_schedule(experiment)]
 
     task_locks = {task_id: threading.Lock() for task_id in by_id}
 
@@ -73,15 +71,15 @@ def run_builds(data_root: Path) -> int:
         task, arm = item
         exec_dir = complete_build(runs_root, task.id, arm, digest)
         if exec_dir is None:
-            record = loop.execute_run(task, arm, runs_root, manifest_hash=digest)
+            record = loop.execute_run(task, experiment.arm(arm), runs_root, manifest_hash=digest)
             _log(f"build {record['run_id']} {record['exec']}: {record['status']} {record.get('flags')}")
             if record["status"] != "complete":
                 return False
             exec_dir = runs_root / record["run_id"] / record["exec"]
-        if arm not in FOLLOWUP_ARMS or complete_followup(exec_dir, digest):
+        if arm not in experiment.followup_arms or complete_followup(exec_dir, digest):
             return True
         _set_aside(exec_dir / "followup")
-        followup = loop.execute_followup(task, exec_dir, manifest_hash=digest)
+        followup = loop.execute_followup(task, exec_dir, experiment.arm(arm), manifest_hash=digest)
         _log(f"followup {task.id}--{arm}: {followup['status']}")
         return followup["status"] == "complete"
 
@@ -91,15 +89,16 @@ def run_builds(data_root: Path) -> int:
     return 0 if all(results) else 1
 
 
-def run_judging(data_root: Path) -> int:
-    digest = manifest.verify()
+def run_judging(data_root: Path, experiment: Experiment) -> int:
+    digest = manifest.verify(experiment)
     runs_root = data_root / "runs"
-    by_id = {task.id: task for task in pilot_tasks()}
+    by_id = {task.id: task for task in scored_tasks()}
+    judged_arms = sorted({arm for pair in experiment.pairs for arm in pair})
     builds = {(task_id, arm): complete_build(runs_root, task_id, arm, digest)
-              for task_id in by_id for arm in FOLLOWUP_ARMS}
+              for task_id in by_id for arm in judged_arms}
     missing = sorted(f"{t}--{a}" for (t, a), path in builds.items() if path is None)
     if missing:
-        _log(f"judge: builds incomplete, pilot INCOMPLETE: {missing}")
+        _log(f"judge: builds incomplete, {experiment.name} INCOMPLETE: {missing}")
         return 1
 
     @_contained
@@ -126,7 +125,7 @@ def run_judging(data_root: Path) -> int:
         return True
 
     with ThreadPoolExecutor(PARALLEL) as pool:
-        results = list(pool.map(job, judge_schedule()))
+        results = list(pool.map(job, judge_schedule(experiment)))
     _log(f"judgements: {sum(results)}/{len(results)} complete")
     return 0 if all(results) else 1
 

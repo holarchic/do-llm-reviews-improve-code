@@ -13,7 +13,8 @@ Isolation:
   AGENTS.md or config loads. Codex's own read-only sandbox blocks writes, not
   reads, so Codex runs inside an outer macOS Seatbelt profile instead (its own
   sandbox bypassed, as Codex documents for externally sandboxed runs) that
-  denies reads of the private roots and other runs, and writes to its cwd.
+  denies reads and writes of the private roots and other runs; it may write
+  its own home, and its cwd only in the writer role.
 - The transcript audit is a diagnostic: access is denied by the OS, and the
   probes prove it. Audit hits are recorded, not counted as contamination.
 """
@@ -26,9 +27,6 @@ from pathlib import Path
 
 from . import audit, procs
 
-WRITER_MODEL = "claude-haiku-5-5"
-SAME_REVIEWER_MODEL = "claude-haiku-5-5"
-CROSS_REVIEWER_MODEL = "gpt-6-luna"
 CLAUDE_JUDGE_MODEL = "claude-fable-5-1"
 CODEX_JUDGE_MODEL = "gpt-6-astra"
 CODEX_EFFORT = "high"
@@ -44,6 +42,18 @@ _CLAUDE_TOOLS = {
     REVIEWER: ["--tools", "Read,Glob,Grep,Bash"],
     JUDGE: ["--tools", "Read,Glob,Grep"],
 }
+
+
+@dataclass(frozen=True)
+class Agent:
+    """Which CLI runs a session, and on which model."""
+    cli: str  # "claude" | "codex"
+    model: str
+
+
+def run(agent: Agent, prompt: str, *, role: str, cwd: Path, out_dir: Path) -> "Session":
+    session = {"claude": run_claude, "codex": run_codex}[agent.cli]
+    return session(agent.model, prompt, role=role, cwd=cwd, out_dir=out_dir)
 
 
 @dataclass(frozen=True)
@@ -133,7 +143,7 @@ def run_codex(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path) -
         shutil.copy2(Path.home() / ".codex" / "auth.json", codex_home / "auth.json")
         (codex_home / "config.toml").write_text(f'model_reasoning_effort = "{CODEX_EFFORT}"\n', encoding="utf-8")
         profile = out_dir / "seatbelt.sb"
-        profile.write_text(codex_seatbelt_profile(cwd, codex_home), encoding="utf-8")
+        profile.write_text(codex_seatbelt_profile(cwd, codex_home, writable=role == WRITER), encoding="utf-8")
         # Every file Codex touches lives in its own home and is copied out after: out_dir is under a
         # read-denied root, and node aborts at start-up if it cannot stat its stdout.
         inner = {name: codex_home / name for name in ("final.txt", "transcript.jsonl", "stderr.log")}
@@ -152,9 +162,10 @@ def run_codex(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path) -
     return _finish(classify_codex(transcript, final_path, proc, role, model), cwd)
 
 
-def codex_seatbelt_profile(cwd: Path, home: Path) -> str:
-    """Deny reads of every private root and of other runs, and writes to the session's cwd.
-    Later rules win in Seatbelt, so the cwd and Codex's own home are re-allowed after the runs root is denied."""
+def codex_seatbelt_profile(cwd: Path, home: Path, *, writable: bool = False) -> str:
+    """Deny reads and writes of every private root and of other runs. The session reads its cwd and
+    its own home, writes its home, and writes its cwd only when `writable` (the writer role).
+    Later rules win in Seatbelt, so the own dirs are re-allowed after their roots are denied."""
     own = os.path.realpath(cwd)
     own_home = os.path.realpath(home)
     denied = " ".join(f'(subpath "{root}")' for root in audit.sandbox_deny_roots())
@@ -167,7 +178,9 @@ def codex_seatbelt_profile(cwd: Path, home: Path) -> str:
         f"(deny file-read* {denied} {runs})\n"
         f"(allow file-read-metadata {runs_stat})\n"
         f'(allow file-read* (subpath "{own}") (subpath "{own_home}"))\n'
-        f'(deny file-write* (subpath "{own}"))\n'
+        f"(deny file-write* {denied} {runs})\n"
+        f'(allow file-write* (subpath "{own_home}"))\n'
+        + (f'(allow file-write* (subpath "{own}"))\n' if writable else "")
     )
 
 

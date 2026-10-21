@@ -5,9 +5,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from eval.harness import manifest, pilot, report
+from eval.harness import experiments, judge, manifest, pilot, report
 
-TASKS = [task.id for task in pilot.pilot_tasks()]
+TASKS = [task.id for task in pilot.scored_tasks()]
+PILOT = experiments.PILOT
 STATIC = {"ruff_violations": 1, "source_loc": 50, "test_loc": 40, "max_function_branches": 4}
 
 
@@ -26,7 +27,7 @@ class ReportTest(unittest.TestCase):
     def populate(self, primary: dict, judged: dict[str, dict[str, str]], calibration=None):
         """primary: arm -> pass fraction (one for every task, or task -> fraction);
         judged: judge -> pair -> result for every task."""
-        for arm in pilot.BUILD_ARMS:
+        for arm in PILOT.arm_names:
             for task in TASKS:
                 exec_dir = self.root / "runs" / f"{task}--{arm}" / "exec-1"
                 identity = {"run_id": f"{task}--{arm}", "task": task, "arm": arm}
@@ -36,14 +37,14 @@ class ReportTest(unittest.TestCase):
                     **identity, "status": "complete", "manifest": "d", "steps": [], "rounds": {}, "flags": [],
                     "scores": {"primary": primary[arm][task] if isinstance(primary[arm], dict) else primary[arm],
                                "static": STATIC, "hidden_outcomes": {}}})
-                if arm in pilot.FOLLOWUP_ARMS:
+                if arm in PILOT.followup_arms:
                     self.write(exec_dir / "followup" / "record.json", {
                         **identity, "status": "complete", "manifest": "d",
                         "scores": {"new_fraction": 1.0, "regressions": [], "persistent_failures": [], "repaired": []}})
         calibration = calibration or {}
-        for name in pilot.judge.JUDGES:
+        for name in judge.JUDGES:
             for task in TASKS:
-                for pair in (None, *pilot.PAIRS):
+                for pair in (None, *PILOT.pairs):
                     if pair is None:
                         result, builds = ("a" if calibration.get(name, True) else "tie"), None
                     else:
@@ -55,9 +56,9 @@ class ReportTest(unittest.TestCase):
                                 "leak_words": {"a": 0, "b": 2}})
 
     def decide(self):
-        results = report.collect(self.root)
-        decision = report.decide(results)
-        report.render(results, decision)
+        results = report.collect(self.root, PILOT)
+        decision = report.decide(results, PILOT)
+        report.render(results, decision, PILOT)
         return decision
 
     def test_primary_gain_is_go(self):
@@ -75,7 +76,7 @@ class ReportTest(unittest.TestCase):
         self.populate({"A1": 0.8, "A1r": 0.8, "A2": 0.8, "A3": 0.76}, {"fable": both, "astra": both})
         decision = self.decide()
         self.assertEqual(decision.verdict, "GO")
-        self.assertEqual(report.agreed_wins(report.collect(self.root), "A3"), 5)
+        self.assertEqual(report.agreed_wins(report.collect(self.root, PILOT), PILOT, "A3"), 5)
 
     def test_judge_branch_off_when_a_judge_fails_calibration(self):
         both = {"A1-A3": "b"}
@@ -108,7 +109,7 @@ class ReportTest(unittest.TestCase):
     def test_exact_threshold_with_real_denominators_is_go(self):
         # +7/14 on bill-split is exactly +10 arm-mean points; with these real denominators
         # the float difference of means is 9.999999999999998.
-        sizes = {task.id: len(task.expected()["hidden"]) for task in pilot.pilot_tasks()}
+        sizes = {task.id: len(task.expected()["hidden"]) for task in pilot.scored_tasks()}
         a1 = {task: 0.0 for task in sizes}
         a1["token-bucket"] = 9 / sizes["token-bucket"]
         a2 = {**a1, "bill-split": 7 / sizes["bill-split"]}
@@ -170,17 +171,17 @@ class TaskExclusionTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, root)
         with mock.patch.object(manifest, "verify", return_value="d"), \
              mock.patch.object(pilot.loop, "execute_run", fake_execute):
-            pilot.run_builds(root)
+            pilot.run_builds(root, PILOT)
         self.assertEqual(overlaps, [])
 
 
 class ScheduleTest(unittest.TestCase):
     def test_schedules_are_complete_and_seeded(self):
-        builds = pilot.build_schedule()
+        builds = pilot.build_schedule(PILOT)
         self.assertEqual(len(builds), len(TASKS) * 4)
-        self.assertEqual(builds, pilot.build_schedule())
+        self.assertEqual(builds, pilot.build_schedule(PILOT))
         self.assertNotEqual(builds, sorted(builds))
-        self.assertEqual(len(pilot.judge_schedule()), 2 * len(TASKS) * 4)
+        self.assertEqual(len(pilot.judge_schedule(PILOT)), 2 * len(TASKS) * 4)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from eval.harness import agents, loop, tasks
+from eval.harness import agents, experiments, loop, prompts, tasks
 
 DEV = tasks.Task(tasks.TASKS_ROOT / "dev-intervals")
 REFERENCE = (DEV.path("reference") / "intervals.py").read_text()
@@ -21,7 +21,8 @@ def session(out: Path, terminal=agents.COMPLETED, text="done") -> agents.Session
 class FakeAgents:
     """Writer writes the reference on any build/solo step; reviewer answers from a script."""
 
-    def __init__(self, review_text="VERDICT: YELLOW\nISSUES:\n1. [HIGH] intervals.py:1 — x\n"):
+    def __init__(self, review_text="VERDICT: YELLOW\nISSUES:\n1. [HIGH] intervals.py:1 — x\n"
+                                   "   Basis: TASK.md behaviour 2 — adjacent spans stay apart\n"):
         self.review_text = review_text
         self.prompts: list[tuple[str, str]] = []
         self.writer_infra_left = 0
@@ -54,7 +55,7 @@ class LoopTest(unittest.TestCase):
     def run_arm(self, arm, fake):
         with mock.patch.object(agents, "run_claude", fake.run_claude), \
              mock.patch.object(agents, "run_codex", fake.run_codex):
-            return loop.execute_run(DEV, arm, self.tmp, manifest_hash=None)
+            return loop.execute_run(DEV, experiments.PILOT.arm(arm), self.tmp, manifest_hash=None)
 
     def test_reviewer_never_green_hits_both_caps_and_head_is_scored(self):
         record = self.run_arm("A2", FakeAgents())
@@ -110,10 +111,87 @@ class LoopTest(unittest.TestCase):
 
 class VerdictTest(unittest.TestCase):
     def test_labels(self):
-        self.assertFalse(loop.parse_verdict("VERDICT: GREEN\n").blocking)
-        self.assertTrue(loop.parse_verdict("**VERDICT: RED**\n1. [MEDIUM] x").blocking)
-        self.assertTrue(loop.parse_verdict("VERDICT: YELLOW\nno tags").blocking)
-        self.assertTrue(loop.parse_verdict("").malformed)
+        for rule in (False, True):
+            with self.subTest(basis_rule=rule):
+                self.assertFalse(loop.parse_verdict("VERDICT: GREEN\n", basis_rule=rule).blocking)
+                self.assertTrue(loop.parse_verdict("VERDICT: YELLOW\nno tags", basis_rule=rule).blocking)
+                self.assertTrue(loop.parse_verdict("", basis_rule=rule).malformed)
+        self.assertTrue(loop.parse_verdict("**VERDICT: RED**\n1. [MEDIUM] x", basis_rule=False).blocking)
+
+
+MIXED = """VERDICT: YELLOW
+SUMMARY: s
+
+ISSUES:
+1. [MEDIUM] a.py:1 — cited
+   Basis: SPEC Acceptance Criteria row 2 — wrong order
+   Fix: sort
+2. [HIGH] a.py:9 — uncited
+   Fix: harden
+3. [MEDIUM] a.py:12 — empty basis
+   Basis:
+   Fix: x
+4. [LOW] a.py:20 — nit
+   Fix: y
+
+CLAIMS CHECKED:
+1. Basis: this line is not inside an issue
+"""
+
+
+class BasisRuleTest(unittest.TestCase):
+    def test_uncited_and_empty_basis_are_low(self):
+        verdict = loop.parse_verdict(MIXED, basis_rule=True)
+        self.assertEqual([(i.number, i.stated, i.effective) for i in verdict.issues],
+                         [(1, "MEDIUM", "MEDIUM"), (2, "HIGH", "LOW"), (3, "MEDIUM", "LOW"), (4, "LOW", "LOW")])
+        self.assertTrue(verdict.blocking)
+
+    def test_issue_prose_in_capitals_does_not_end_the_block(self):
+        text = ("VERDICT: YELLOW\nISSUES:\n1. [HIGH] a.py:3 — crash\nNOTE: this fails for empty input\n"
+                "   Basis: SPEC criterion 4 — empty input must return []\n   Fix: guard\n\nCLAIMS CHECKED:\n"
+                "1. x — ✓\nBasis: not part of any issue\n")
+        verdict = loop.parse_verdict(text, basis_rule=True)
+        self.assertEqual(verdict.issues[0].effective, "HIGH")
+        self.assertTrue(verdict.blocking)
+
+    def test_basis_in_a_later_section_does_not_count(self):
+        text = "VERDICT: YELLOW\nISSUES:\n1. [MEDIUM] a.py:3 — x\n   Fix: y\n\nCLAIMS CHECKED:\nBasis: SPEC — z\n"
+        self.assertEqual(loop.parse_verdict(text, basis_rule=True).issues[0].effective, "LOW")
+
+    def test_basis_belongs_to_its_own_issue(self):
+        text = "VERDICT: YELLOW\n1. [MEDIUM] a — uncited\n   Fix: x\n2. [LOW] b — nit\n   Basis: rule — y\n"
+        verdict = loop.parse_verdict(text, basis_rule=True)
+        self.assertEqual(verdict.issues[0].effective, "LOW")
+        self.assertFalse(verdict.blocking)
+
+    def test_without_the_rule_stated_severities_stand(self):
+        verdict = loop.parse_verdict(MIXED.replace("   Basis: SPEC Acceptance Criteria row 2 — wrong order\n", ""),
+                                     basis_rule=False)
+        self.assertTrue(verdict.blocking)
+        self.assertTrue(all(i.effective == i.stated for i in verdict.issues))
+
+    def test_only_uncited_findings_do_not_block(self):
+        text = MIXED.replace("   Basis: SPEC Acceptance Criteria row 2 — wrong order\n", "")
+        self.assertFalse(loop.parse_verdict(text, basis_rule=True).blocking)
+
+    def test_writer_sees_effective_severities_across_passes(self):
+        verdicts = {"correctness": loop.parse_verdict(MIXED, basis_rule=True),
+                    "architecture": loop.parse_verdict("VERDICT: YELLOW\n1. [MEDIUM] m.py:3 — uncited\n", basis_rule=True)}
+        prompt = prompts.loop_fix_writer({n: v.text for n, v in verdicts.items()}, loop.severity_note(verdicts))
+        self.assertIn("correctness issue 1: MEDIUM\n", prompt)
+        self.assertIn("correctness issue 2: HIGH → LOW (no basis)", prompt)
+        self.assertIn("architecture issue 1: MEDIUM → LOW (no basis)", prompt)
+        self.assertIn("Fix every issue whose effective severity above is HIGH or MEDIUM", prompt)
+        self.assertNotIn("Fix every HIGH and MEDIUM issue", prompt)
+
+    def test_plan_revision_sees_effective_severities(self):
+        verdict = loop.parse_verdict(MIXED, basis_rule=True)
+        prompt = prompts.loop_plan_revision_writer(verdict.text, loop.severity_note({"plan": verdict}))
+        self.assertIn("plan issue 2: HIGH → LOW (no basis)", prompt)
+        self.assertIn("resolve every item whose effective severity above is HIGH or MEDIUM", prompt)
+
+    def test_shipped_template_requires_basis(self):
+        self.assertTrue(prompts.basis_required())
 
 
 class ClassifyTest(unittest.TestCase):
@@ -175,9 +253,9 @@ class FollowupTest(unittest.TestCase):
             return session(out_dir)
 
         with mock.patch.object(agents, "run_claude", build_writer):
-            loop.execute_run(DEV, "A1", self.tmp, manifest_hash=None)
+            loop.execute_run(DEV, experiments.PILOT.arm("A1"), self.tmp, manifest_hash=None)
         with mock.patch.object(agents, "run_claude", followup_writer):
-            return loop.execute_followup(DEV, self.tmp / "dev-intervals--A1" / "exec-1", manifest_hash=None)
+            return loop.execute_followup(DEV, self.tmp / "dev-intervals--A1" / "exec-1", experiments.PILOT.arm("A1"), manifest_hash=None)
 
     def test_reference_followup_scores_full_without_regressions(self):
         record = self.followup(REFERENCE, (DEV.path("reference_followup") / "intervals.py").read_text())
@@ -205,7 +283,7 @@ class HardeningTest(unittest.TestCase):
 
     def run_with(self, writer, arm="A1"):
         with mock.patch.object(agents, "run_claude", writer):
-            return loop.execute_run(DEV, arm, self.tmp, manifest_hash=None)
+            return loop.execute_run(DEV, experiments.PILOT.arm(arm), self.tmp, manifest_hash=None)
 
     def test_session_exception_is_a_retried_infra_attempt(self):
         calls = []
@@ -263,7 +341,7 @@ class TimeoutAndPreservationTest(unittest.TestCase):
     def run_arm(self, arm, fake):
         with mock.patch.object(agents, "run_claude", fake.run_claude), \
              mock.patch.object(agents, "run_codex", fake.run_codex):
-            return loop.execute_run(DEV, arm, self.tmp, manifest_hash=None)
+            return loop.execute_run(DEV, experiments.PILOT.arm(arm), self.tmp, manifest_hash=None)
 
     def test_build_timeout_stops_reviews_and_scores_head(self):
         fake = FakeAgents(review_text="VERDICT: GREEN\n")
@@ -297,7 +375,73 @@ class TimeoutAndPreservationTest(unittest.TestCase):
 
         with mock.patch.object(agents, "run_claude", writer), \
              mock.patch.object(loop.shutil, "copytree", side_effect=OSError("disk full")):
-            record = loop.execute_run(DEV, "A1", self.tmp, manifest_hash=None)
+            record = loop.execute_run(DEV, experiments.PILOT.arm("A1"), self.tmp, manifest_hash=None)
         self.assertEqual(record["status"], "invalid")
         self.assertIn("preserving the repo failed", record["invalid_reason"])
         self.assertTrue((self.tmp / "dev-intervals--A1" / "exec-1" / "record.json").exists())
+
+
+class AblationTest(unittest.TestCase):
+    """Arm switches change exactly the steps and prompts they name."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="eval-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.calls = []
+
+    def fakes(self, review_text):
+        fake = FakeAgents(review_text=review_text)
+
+        def claude(model, prompt, *, role, cwd, out_dir):
+            self.calls.append(("claude", role, prompt))
+            return fake.run_claude(model, prompt, role=role, cwd=cwd, out_dir=out_dir)
+
+        def codex(model, prompt, *, role, cwd, out_dir):
+            self.calls.append(("codex", role, prompt))
+            if role == agents.WRITER:
+                return fake.run_claude(model, prompt, role=role, cwd=cwd, out_dir=out_dir)
+            return fake.run_codex(model, prompt, role=role, cwd=cwd, out_dir=out_dir)
+
+        return claude, codex
+
+    def run_arm(self, arm, review_text="VERDICT: GREEN\n"):
+        claude, codex = self.fakes(review_text)
+        with mock.patch.object(agents, "run_claude", claude), mock.patch.object(agents, "run_codex", codex):
+            return loop.execute_run(DEV, arm, self.tmp, manifest_hash=None)
+
+    def names(self, record):
+        return [step["name"] for step in record["steps"]]
+
+    def test_rubric_off_writer_gets_no_rules_reviewer_keeps_rubric(self):
+        arm = loop.Arm("X", experiments.HAIKU, experiments.LUNA, writer_rules=False)
+        self.run_arm(arm)
+        writer_prompts = [p for cli, role, p in self.calls if role == agents.WRITER]
+        reviewer_prompts = [p for cli, role, p in self.calls if role == agents.REVIEWER]
+        self.assertTrue(writer_prompts)
+        self.assertFalse(any("Full rubric" in p or "## Code" in p for p in writer_prompts))
+        self.assertTrue(all("Code Architecture Rule Set" in p for p in reviewer_prompts[1:]))
+
+    def test_architecture_pass_off_runs_one_pass_per_round(self):
+        arm = loop.Arm("X", experiments.HAIKU, experiments.LUNA, passes=("correctness",))
+        record = self.run_arm(arm)
+        self.assertIn("correctness-review-1", self.names(record))
+        self.assertFalse(any(n.startswith("architecture-review") for n in self.names(record)))
+
+    def test_plan_review_off_has_no_plan_review_steps(self):
+        arm = loop.Arm("X", experiments.HAIKU, experiments.LUNA, plan_review=False)
+        record = self.run_arm(arm)
+        self.assertEqual(self.names(record)[:2], ["plan", "build"])
+        self.assertNotIn("plan", record["rounds"])
+
+    def test_codex_writer_arm_and_its_followup_use_codex(self):
+        arm = loop.Arm("G", agents.Agent("codex", "gpt-5.6-terra"), agents.Agent("claude", "claude-sonnet-5-5"))
+        record = self.run_arm(arm)
+        self.assertEqual(record["scores"]["primary"], 1.0)
+        writers = {cli for cli, role, _ in self.calls if role == agents.WRITER}
+        reviewers = {cli for cli, role, _ in self.calls if role == agents.REVIEWER}
+        self.assertEqual((writers, reviewers), ({"codex"}, {"claude"}))
+        self.calls.clear()
+        claude, codex = self.fakes("VERDICT: GREEN\n")
+        with mock.patch.object(agents, "run_claude", claude), mock.patch.object(agents, "run_codex", codex):
+            loop.execute_followup(DEV, self.tmp / "dev-intervals--G" / "exec-1", arm, manifest_hash=None)
+        self.assertEqual([cli for cli, role, _ in self.calls], ["codex"])
