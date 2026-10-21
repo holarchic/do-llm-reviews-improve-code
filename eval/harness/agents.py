@@ -15,6 +15,8 @@ Isolation:
   sandbox bypassed, as Codex documents for externally sandboxed runs) that
   denies reads and writes of the private roots and other runs; it may write
   its own home, and its cwd only in the writer role.
+- Routed sessions (provider "openrouter") get their routing and key from
+  openrouter.py; the operator's Codex login is not copied into their home.
 - The transcript audit is a diagnostic: access is denied by the OS, and the
   probes prove it. Audit hits are recorded, not counted as contamination.
 """
@@ -25,7 +27,7 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import audit, procs
+from . import audit, openrouter, procs
 
 CLAUDE_JUDGE_MODEL = "claude-fable-5-1"
 CODEX_JUDGE_MODEL = "gpt-6-astra"
@@ -35,6 +37,7 @@ WRITER, REVIEWER, JUDGE = "writer", "reviewer", "judge"
 TIMEOUT_SECONDS = {WRITER: 1800, REVIEWER: 1200, JUDGE: 900}
 
 COMPLETED, TIMEOUT, INFRA = "completed", "timeout", "infra"
+NATIVE, OPENROUTER = "native", "openrouter"
 
 _FILE_TOOLS = ("Read", "Edit", "Write", "Glob", "Grep")
 _CLAUDE_TOOLS = {
@@ -46,14 +49,15 @@ _CLAUDE_TOOLS = {
 
 @dataclass(frozen=True)
 class Agent:
-    """Which CLI runs a session, and on which model."""
+    """Which CLI runs a session, on which model, served by whom."""
     cli: str  # "claude" | "codex"
     model: str
+    provider: str = NATIVE  # NATIVE: the CLI's own login | OPENROUTER
 
 
 def run(agent: Agent, prompt: str, *, role: str, cwd: Path, out_dir: Path) -> "Session":
     session = {"claude": run_claude, "codex": run_codex}[agent.cli]
-    return session(agent.model, prompt, role=role, cwd=cwd, out_dir=out_dir)
+    return session(agent.model, prompt, role=role, cwd=cwd, out_dir=out_dir, provider=agent.provider)
 
 
 @dataclass(frozen=True)
@@ -79,13 +83,15 @@ class Session:
         }
 
 
-def claude_settings(role: str, cwd: Path) -> dict:
+def claude_settings(role: str, cwd: Path, provider: str = NATIVE) -> dict:
     roots = [str(root) for root in audit.sandbox_deny_roots()]
     filesystem: dict = {"denyRead": roots}
     if role == REVIEWER:
         # Read-only like the Codex reviewer: any shell command, no writes to the repo.
         filesystem["denyWrite"] = [os.path.realpath(cwd)]
+    routing = {"apiKeyHelper": openrouter.claude_key_helper()} if provider == OPENROUTER else {}
     return {
+        **routing,
         "sandbox": {
             "enabled": True,
             "failIfUnavailable": True,
@@ -115,23 +121,24 @@ def claude_argv(model: str, role: str, settings_path: Path) -> list[str]:
     ]
 
 
-def run_claude(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path) -> Session:
+def run_claude(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path, provider: str = NATIVE) -> Session:
     # Absolute: the CLI runs in cwd, where a relative settings path would not resolve.
     out_dir = out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     settings_path = out_dir / "settings.json"
-    settings_path.write_text(json.dumps(claude_settings(role, cwd), indent=2), encoding="utf-8")
+    settings_path.write_text(json.dumps(claude_settings(role, cwd, provider), indent=2), encoding="utf-8")
     argv = claude_argv(model, role, settings_path)
     prompt_path = out_dir / "prompt.md"
     prompt_path.write_text(prompt, encoding="utf-8")
     (out_dir / "argv.json").write_text(json.dumps(argv, indent=2), encoding="utf-8")
     transcript = out_dir / "transcript.jsonl"
+    env = openrouter.claude_env(model) if provider == OPENROUTER else None
     proc = procs.run(argv, cwd=cwd, timeout=TIMEOUT_SECONDS[role], stdout_path=transcript,
-                     stderr_path=out_dir / "stderr.log", stdin_path=prompt_path)
+                     stderr_path=out_dir / "stderr.log", env=env, stdin_path=prompt_path)
     return _finish(classify_claude(transcript, proc, role), cwd)
 
 
-def run_codex(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path) -> Session:
+def run_codex(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path, provider: str = NATIVE) -> Session:
     out_dir = out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     final_path = out_dir / "final.txt"
@@ -140,8 +147,14 @@ def run_codex(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path) -
     codex_home = audit.anonymous_workdir()
     try:
         os.chmod(codex_home, 0o700)
-        shutil.copy2(Path.home() / ".codex" / "auth.json", codex_home / "auth.json")
-        (codex_home / "config.toml").write_text(f'model_reasoning_effort = "{CODEX_EFFORT}"\n', encoding="utf-8")
+        config = f'model_reasoning_effort = "{CODEX_EFFORT}"\n'
+        if provider == OPENROUTER:
+            config += openrouter.CODEX_PROVIDER_CONFIG
+            env = openrouter.codex_env(codex_home)
+        else:
+            shutil.copy2(Path.home() / ".codex" / "auth.json", codex_home / "auth.json")
+            env = {**os.environ, "CODEX_HOME": str(codex_home)}
+        (codex_home / "config.toml").write_text(config, encoding="utf-8")
         profile = out_dir / "seatbelt.sb"
         profile.write_text(codex_seatbelt_profile(cwd, codex_home, writable=role == WRITER), encoding="utf-8")
         # Every file Codex touches lives in its own home and is copied out after: out_dir is under a
@@ -151,7 +164,6 @@ def run_codex(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path) -
         prompt_path.write_text(prompt, encoding="utf-8")
         argv = ["sandbox-exec", "-f", str(profile), *codex_argv(model, inner["final.txt"])]
         (out_dir / "argv.json").write_text(json.dumps(argv, indent=2), encoding="utf-8")
-        env = {**os.environ, "CODEX_HOME": str(codex_home)}
         proc = procs.run(argv, cwd=cwd, timeout=TIMEOUT_SECONDS[role], stdout_path=inner["transcript.jsonl"],
                          stderr_path=inner["stderr.log"], env=env, stdin_path=prompt_path)
         for name, path in inner.items():
