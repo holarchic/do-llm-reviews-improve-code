@@ -306,20 +306,22 @@ if [ -f /.dockerenv ]; then CODEX_SANDBOX=--dangerously-bypass-approvals-and-san
 
 On the host, read-only means Codex can read files and run read-only commands (`git`, `rg`, linters with caching off, small probes) but **cannot write** — so tests that create files, and anything taking a build-tool lock, fail for it. The builder runs every gate itself and states the results in "Final state"; Codex marks those `⚠ trusting reporter's claim`, which is correct, not a gap to chase.
 
-Write each assembled prompt to a file, and capture the reviewer's final message with `-o`. **Parse the verdict from the `-o` file, never from stdout** — stdout echoes the prompt, so its first `VERDICT:` line is the template's placeholder. Keep the prompt and verdict files outside the repo — `TMP=$(mktemp -d)` once per phase — so they never get committed.
+Write each assembled prompt to a file and pass it on stdin (`-` as the prompt argument): a prompt in argv hits the argument-length limit on large reviews, breaks on shell quoting, and shows in every process list. Capture the reviewer's final message with `-o`. **Parse the verdict from the `-o` file, never from stdout** — stdout echoes the prompt, so its first `VERDICT:` line is the template's placeholder. Keep the prompt and verdict files outside the repo — `TMP=$(mktemp -d)` once per phase — so they never get committed.
 
 **Code review** (one run per pass; the two passes are independent and can run in parallel):
 
 ```bash
-codex "$CODEX_SANDBOX" -c model_reasoning_effort=high exec -o "$TMP/arch-r1.verdict" "$(cat "$TMP/arch-r1.prompt.md")" < /dev/null > "$TMP/arch-r1.log" 2>&1
+codex "$CODEX_SANDBOX" -c model_reasoning_effort=high exec -o "$TMP/arch-r1.verdict" - < "$TMP/arch-r1.prompt.md" > "$TMP/arch-r1.log" 2>&1
 ```
 
 **Plan review** — add `--skip-git-repo-check`, since plans can live outside a git repo, where `codex exec` refuses to start:
 
 ```bash
-codex "$CODEX_SANDBOX" -c model_reasoning_effort=high exec --skip-git-repo-check -o "$TMP/plan-r1.verdict" "$(cat "$TMP/plan-r1.prompt.md")" < /dev/null > "$TMP/plan-r1.log" 2>&1
+codex "$CODEX_SANDBOX" -c model_reasoning_effort=high exec --skip-git-repo-check -o "$TMP/plan-r1.verdict" - < "$TMP/plan-r1.prompt.md" > "$TMP/plan-r1.log" 2>&1
 ```
 
+
+**Dead runs.** A run is dead when Codex exits non-zero, the `-o` file is missing or empty, it has no parseable `VERDICT:` line, or the log lacks Codex's `tokens used` completion line. A dead run is not a verdict — never read it as "no findings" — and it does not count as a round. Keep its prompt and log, and rerun it once **over the same required scope**: cut only incidental reading (name the exact files to read; forbid dumping data, lockfiles or generated output), or split the scope into partitions that together cover all of it, where the pass clears only when every partition returns a verdict. If the rerun dies too, or any partition stays dead, stop and show the user the log tail; the gate stays blocked.
 
 **Model and effort.** The model comes from `~/.codex/config.toml`; pass `-m <model>` only when overriding. Reasoning effort is pinned to `high` on every call rather than inherited: higher settings burn the usage quota fast for a gate that runs every phase, and a fixed effort keeps verdicts comparable across runs. A review reads the diff *plus* every file it spot-checks, so a small-context model aborts mid-run on large phases (`remote compaction failed`, stream disconnect). For anything past a few thousand lines, use the largest-context model your account has, and **chunk standing-code review to ≤~4K LOC per run** — one run per subsystem, then synthesise the verdicts yourself. A run that dies mid-way is almost always context pressure: check model and chunk size before blaming anything else. Check `codex --version` and update the CLI before blaming a model error.
 
@@ -329,7 +331,7 @@ codex "$CODEX_SANDBOX" -c model_reasoning_effort=high exec --skip-git-repo-check
 
 Code review returns **two verdicts**. The phase is blocked until BOTH are GREEN or have findings addressed.
 
-1. Parse each pass's VERDICT line from its `-o` file.
+1. Parse each pass's VERDICT line from its `-o` file. A dead run (see Invocation) has no verdict: rerun it first.
 2. **GREEN** — proceed. **LOW issues never block and never need adjudication, under any verdict**: fix them in a round that will be re-run, or leave them and list them to the user when the phase lands. A change after the final GREEN is a new round.
 3. **YELLOW** — for each HIGH/MEDIUM issue: check the `file:line` and the claim. Valid → fix it; a different fix from the one suggested is fine — the re-run grades it. Disagree that it's a problem at all → push back with reasoning and surface the issue + counter-position to the user. Never silently skip.
 4. **RED** — surface immediately. Don't patch in-loop; a design-level error needs the user's judgment.
