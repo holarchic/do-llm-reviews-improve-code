@@ -179,7 +179,9 @@ def render(results: Results, decision: Decision) -> str:
           "; ".join(sorted({f for d in results.diagnostics.get(arm, {}).values() for f in d["flags"]})) or "none"]
          for arm in arms])]
     lines += ["", "## Limits", "",
-              "- Codex sessions are audited, not sandboxed against reads: no detected access is all that is claimed.",
+              "- Isolation is enforced by macOS sandboxes (Claude Code's Bash sandbox, an outer profile around Codex) and"
+              " proved by probes; a command that reaches private material by a route the probes do not cover would go"
+              " unnoticed — the transcript audit is diagnostic only.",
               "- Judge calibration shows the judges see injected defects, not that they rank close builds reliably.",
               "- The treatment bundles rules, rubric, review and extra compute; A2 vs A3 compares reviewer"
               " configurations (model, CLI and tool policy together).",
