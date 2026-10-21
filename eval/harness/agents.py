@@ -99,6 +99,8 @@ def claude_argv(model: str, prompt: str, role: str, settings_path: Path) -> list
 
 
 def run_claude(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path) -> Session:
+    # Absolute: the CLI runs in cwd, where a relative settings path would not resolve.
+    out_dir = out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     settings_path = out_dir / "settings.json"
     settings_path.write_text(json.dumps(claude_settings(role), indent=2), encoding="utf-8")
@@ -111,6 +113,7 @@ def run_claude(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path) 
 
 
 def run_codex(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path) -> Session:
+    out_dir = out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     final_path = out_dir / "final.txt"
     argv = codex_argv(model, prompt, final_path)

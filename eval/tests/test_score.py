@@ -1,3 +1,4 @@
+import os
 import shutil
 import tempfile
 import unittest
@@ -73,6 +74,13 @@ class ScoreTest(unittest.TestCase):
         self.assertTrue(outcome.timed_out)
         self.assertEqual(len(outcome.passed()), 5)
         self.assertEqual(score.pass_fraction(outcome, self.expected), 5 / 8)
+
+    def test_relative_work_dir(self):
+        # A path relative to the caller's cwd; it means nothing from the runner's cwd.
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.tmp)
+        outcome = score.run_suite(DEV.path("reference"), DEV.path("hidden"), Path("relative-work"))
+        self.assertEqual(score.pass_fraction(outcome, self.expected), 1.0)
 
     def test_static_metrics(self):
         code = self.candidate("def f(x):\n    if x and x > 1:\n        return [i for i in x if i]\n    return None\n")

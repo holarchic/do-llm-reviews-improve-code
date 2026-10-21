@@ -136,6 +136,14 @@ change. Run the tests.
     )
 
 
+def followup_writer() -> str:
+    return (
+        _WRITER_PREAMBLE.replace("TASK.md describes the task.", "TASK.md describes what the code does today.")
+        + "\nFOLLOWUP.md describes a change to the existing code. Make the change, keep everything TASK.md requires "
+        "working, and update the tests.\n"
+    )
+
+
 def plan_review() -> str:
     skill = _skill()
     header = fenced_block(skill, "### 1. Header", within=PLAN_SECTION)

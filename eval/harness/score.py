@@ -68,6 +68,8 @@ class _RunnerOutput:
 
 
 def _execute(code_dir: Path, suite_dir: Path, work_dir: Path, *, timeout: float, list_only: bool) -> _RunnerOutput:
+    # Absolute: the runner's cwd is the code copy, where relative paths would not resolve.
+    work_dir = work_dir.resolve()
     work_dir.mkdir(parents=True, exist_ok=False)
     code_copy, suite_copy = work_dir / "code", work_dir / "suite"
     shutil.copytree(code_dir, code_copy, ignore=_COPY_IGNORE)

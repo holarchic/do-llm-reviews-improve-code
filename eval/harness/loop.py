@@ -82,7 +82,7 @@ def parse_verdict(text: str) -> Verdict:
 def execute_run(task: Task, arm_name: str, runs_root: Path, *, manifest_hash: str | None) -> dict:
     arm = ARMS[arm_name]
     run_id = f"{task.id}--{arm.name}"
-    exec_dir = _next_exec_dir(runs_root / run_id)
+    exec_dir = _next_exec_dir(runs_root.resolve() / run_id)
     work = audit.RUNS_ROOT / f"{run_id}-{secrets.token_hex(4)}"
     run = _Run(repo=work / "repo", exec_dir=exec_dir, arm=arm)
     record = {"run_id": run_id, "task": task.id, "arm": arm.name, "exec": exec_dir.name,
@@ -105,6 +105,57 @@ def execute_run(task: Task, arm_name: str, runs_root: Path, *, manifest_hash: st
     record.update(finished=_now(), flags=run.flags, rounds=run.rounds, steps=run.steps)
     (exec_dir / "record.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     return record
+
+
+def execute_followup(task: Task, build_exec_dir: Path, *, manifest_hash: str | None) -> dict:
+    """A fresh solo writer makes the FOLLOWUP.md change in a copy of a finished build.
+
+    Regressions are base test IDs that passed on the build and fail after the change;
+    tests that failed before are reported apart, so a weak build isn't penalised twice.
+    """
+    build_exec_dir = build_exec_dir.resolve()
+    build = json.loads((build_exec_dir / "record.json").read_text(encoding="utf-8"))
+    out_dir = build_exec_dir / "followup"
+    out_dir.mkdir()
+    work = audit.RUNS_ROOT / f"{build['run_id']}-followup-{secrets.token_hex(4)}"
+    run = _Run(repo=work / "repo", exec_dir=out_dir, arm=ARMS[build["arm"]])
+    record = {"run_id": build["run_id"], "task": task.id, "arm": build["arm"], "build_exec": build_exec_dir.name,
+              "manifest": manifest_hash, "cli_versions": _cli_versions(), "started": _now()}
+    try:
+        shutil.copytree(build_exec_dir / "repo", run.repo, symlinks=True)
+        shutil.copy2(task.path("FOLLOWUP.md"), run.repo / "FOLLOWUP.md")
+        run.last_commit = _commit(run.repo, "followup task")
+        _writer(run, "followup", prompts.followup_writer())
+        record["status"] = "complete"
+    except InfraExhausted as exc:
+        record.update(status="invalid", invalid_reason=str(exc))
+    except Exception:
+        record.update(status="invalid", invalid_reason="harness error:\n" + traceback.format_exc())
+    finally:
+        if run.repo.exists():
+            shutil.copytree(run.repo, out_dir / "repo", symlinks=True)
+        shutil.rmtree(work, ignore_errors=True)
+    if record["status"] == "complete":
+        record["scores"] = _followup_scores(task, build["scores"]["hidden_outcomes"], out_dir)
+    record.update(finished=_now(), flags=run.flags, steps=run.steps)
+    (out_dir / "record.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    return record
+
+
+def _followup_scores(task: Task, before: dict[str, str], out_dir: Path) -> dict:
+    expected = task.expected()
+    base = score.run_suite(out_dir / "repo", task.path("hidden"), out_dir / "scoring" / "hidden")
+    new = score.run_suite(out_dir / "repo", task.path("hidden_followup"), out_dir / "scoring" / "followup")
+    passed_before = {test_id for test_id, outcome in before.items() if outcome == "pass"}
+    passed_after = base.passed()
+    base_ids = set(expected["hidden"])
+    return {
+        "new_fraction": score.pass_fraction(new, expected["hidden_followup"]),
+        "regressions": sorted(passed_before - passed_after),
+        "persistent_failures": sorted(base_ids - passed_before - passed_after),
+        "repaired": sorted((passed_after & base_ids) - passed_before),
+        "base_fraction_after": score.pass_fraction(base, expected["hidden"]),
+    }
 
 
 def _solo(run: _Run) -> None:

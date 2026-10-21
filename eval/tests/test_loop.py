@@ -157,3 +157,42 @@ class ClassifyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FollowupTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="eval-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp)
+
+    def followup(self, base_source: str, followup_source: str) -> dict:
+        def build_writer(model, prompt, *, role, cwd, out_dir):
+            (cwd / "intervals.py").write_text(base_source)
+            return session(out_dir)
+
+        def followup_writer(model, prompt, *, role, cwd, out_dir):
+            assert (cwd / "FOLLOWUP.md").exists()
+            (cwd / "intervals.py").write_text(followup_source)
+            return session(out_dir)
+
+        with mock.patch.object(agents, "run_claude", build_writer):
+            loop.execute_run(DEV, "A1", self.tmp, manifest_hash=None)
+        with mock.patch.object(agents, "run_claude", followup_writer):
+            return loop.execute_followup(DEV, self.tmp / "dev-intervals--A1" / "exec-1", manifest_hash=None)
+
+    def test_reference_followup_scores_full_without_regressions(self):
+        record = self.followup(REFERENCE, (DEV.path("reference_followup") / "intervals.py").read_text())
+        self.assertEqual(record["scores"]["new_fraction"], 1.0)
+        self.assertEqual(record["scores"]["regressions"], [])
+
+    def test_change_that_breaks_adjacency_is_a_regression(self):
+        broken = (DEV.path("reference_followup") / "intervals.py").read_text().replace(
+            "merged[-1][1] + 1", "merged[-1][1]")
+        record = self.followup(REFERENCE, broken)
+        self.assertEqual(record["scores"]["regressions"], ["test_merge.MergeTest.test_adjacent_merge"])
+
+    def test_failure_present_before_is_persistent_not_regression(self):
+        weak = (DEV.path("wrong") / "adjacent-not-merged" / "intervals.py").read_text()
+        followup = weak + "\n\ndef total_covered(spans):\n    return sum(e - s + 1 for s, e in merge(spans))\n"
+        record = self.followup(weak, followup)
+        self.assertEqual(record["scores"]["regressions"], [])
+        self.assertEqual(record["scores"]["persistent_failures"], ["test_merge.MergeTest.test_adjacent_merge"])
