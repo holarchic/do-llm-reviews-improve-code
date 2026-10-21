@@ -72,7 +72,12 @@ def verify(experiment) -> str:
     if not path.exists():
         raise ManifestMismatch(f"no manifest for {experiment.name}: run `python3 -m eval freeze --experiment "
                                f"{experiment.name}` first")
-    frozen = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        frozen = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ManifestMismatch(f"{path.name} is not valid JSON: {exc}") from None
+    if not (isinstance(frozen, dict) and isinstance(frozen.get("files"), dict)):
+        raise ManifestMismatch(f"{path.name} has no files table")
     if frozen.get("experiment", PILOT_NAME) != experiment.name:
         raise ManifestMismatch(f"{path.name} freezes {frozen.get('experiment', PILOT_NAME)}, not {experiment.name}")
     current = compute(experiment)

@@ -24,7 +24,7 @@ class ArgvTest(unittest.TestCase):
 
     def check(self, run):
         with mock.patch.object(procs, "run", self.fake_run):
-            run(agents.WRITER_MODEL if run is agents.run_claude else agents.CROSS_REVIEWER_MODEL, SECRET_PROMPT,
+            run("claude-haiku-5-5" if run is agents.run_claude else "gpt-6-luna", SECRET_PROMPT,
                 role=agents.REVIEWER, cwd=self.tmp, out_dir=self.tmp / "out")
         argv, stdin_path = self.calls[0]
         self.assertFalse(any("PROMPT-CONTENT" in arg for arg in argv))

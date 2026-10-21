@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 from . import agents, audit
+from .experiments import HAIKU, LUNA
 
 INSTRUCTION_FILES = (Path.home() / ".claude" / "CLAUDE.md", Path.home() / ".codex" / "AGENTS.md")
 QUOTE_PROMPT = (
@@ -30,8 +31,8 @@ def run_probes(probe_root: Path) -> list[str]:
     canary.write_text(canary_token + "\n", encoding="utf-8")
     markers = instruction_markers()
     results = {
-        "claude_instructions": _instructions_probe("claude", agents.WRITER_MODEL, agents.WRITER, stamp, markers),
-        "codex_instructions": _instructions_probe("codex", agents.CROSS_REVIEWER_MODEL, agents.REVIEWER, stamp,
+        "claude_instructions": _instructions_probe("claude", HAIKU.model, agents.WRITER, stamp, markers),
+        "codex_instructions": _instructions_probe("codex", LUNA.model, agents.REVIEWER, stamp,
                                                   markers),
         "claude_judge_instructions": _instructions_probe("claude", agents.CLAUDE_JUDGE_MODEL, agents.JUDGE, stamp,
                                                          markers),
@@ -98,7 +99,7 @@ def _claude_canary_probe(stamp: Path, canary: Path, canary_token: str, markers: 
         "6. With the Bash tool run: ls .."
     )
     try:
-        session = agents.run_claude(agents.WRITER_MODEL, prompt, role=agents.WRITER, cwd=run_dir,
+        session = agents.run_claude(HAIKU.model, prompt, role=agents.WRITER, cwd=run_dir,
                                     out_dir=stamp / "claude-canary")
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)
@@ -138,7 +139,7 @@ def _claude_reviewer_probe(stamp: Path) -> dict:
         "2. touch written.txt"
     )
     try:
-        session = agents.run_claude(agents.SAME_REVIEWER_MODEL, prompt, role=agents.REVIEWER, cwd=run_dir,
+        session = agents.run_claude(HAIKU.model, prompt, role=agents.REVIEWER, cwd=run_dir,
                                     out_dir=stamp / "claude-reviewer")
         wrote = (run_dir / "written.txt").exists()
     finally:
@@ -173,7 +174,7 @@ def _codex_canary_probe(stamp: Path, canary: Path) -> dict:
         "5. touch written.txt"
     )
     try:
-        session = agents.run_codex(agents.CROSS_REVIEWER_MODEL, prompt, role=agents.REVIEWER, cwd=run_dir,
+        session = agents.run_codex(LUNA.model, prompt, role=agents.REVIEWER, cwd=run_dir,
                                    out_dir=stamp / "codex-canary")
         wrote = (run_dir / "written.txt").exists()
     finally:
@@ -205,7 +206,7 @@ def _codex_writer_probe(stamp: Path, canary: Path) -> dict:
         f"4. Run: touch {forbidden}"
     )
     try:
-        session = agents.run(agents.Agent("codex", agents.CROSS_REVIEWER_MODEL), prompt, role=agents.WRITER,
+        session = agents.run(LUNA, prompt, role=agents.WRITER,
                              cwd=run_dir, out_dir=stamp / "codex-writer")
         built = (run_dir / "m.py").exists() and (run_dir / "test_m.py").exists()
     finally:

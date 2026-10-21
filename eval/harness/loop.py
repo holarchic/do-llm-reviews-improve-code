@@ -84,8 +84,11 @@ class _Run:
 
 
 _ISSUE_START = re.compile(r"^\s*(\d+)\.\s*\[(HIGH|MEDIUM|LOW)\]", re.MULTILINE)
-# A block ends at the next issue or at the next section header (e.g. "CLAIMS CHECKED:").
-_SECTION = re.compile(r"^[A-Z][A-Z ()/-]{3,}:", re.MULTILINE)
+# A block ends at the next issue or at one of the verdict format's own section headings, matched as a
+# whole line — issue prose such as "NOTE: …" must not end it.
+_SECTION = re.compile(r"^(?:ISSUES|PLAN EDITS|CLAIMS CHECKED|CONCERNS CHECKED|CONSTRAINTS VERIFIED|DESIGN ISSUE[^\n]*"
+                      r"|ASSUMPTIONS REVIEWED|TRADEOFFS REVIEWED|OPEN QUESTIONS ADDRESSED|RISKS NOT IN PLAN"
+                      r"|LOW-priority notes[^\n]*):[ \t]*$", re.MULTILINE)
 _BASIS = re.compile(r"^[ \t]*Basis:[ \t]*\S", re.MULTILINE)
 
 
@@ -164,10 +167,10 @@ def execute_followup(task: Task, build_exec_dir: Path, arm: Arm, *, manifest_has
     build = records.build(build_exec_dir / "record.json", manifest_hash)
     if build is None:
         raise ValueError(f"no complete build record under this manifest in {build_exec_dir}")
-    out_dir = build_exec_dir / "followup"
-    out_dir.mkdir()
     if build["arm"] != arm.name:
         raise ValueError(f"build is arm {build['arm']}, follow-up asked for {arm.name}")
+    out_dir = build_exec_dir / "followup"
+    out_dir.mkdir()
     run = _Run(repo=audit.anonymous_workdir() / "repo", exec_dir=out_dir, arm=arm)
     record = {"run_id": build["run_id"], "task": task.id, "arm": build["arm"], "build_exec": build_exec_dir.name,
               "manifest": manifest_hash, "cli_versions": _cli_versions(), "started": _now()}

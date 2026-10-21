@@ -39,6 +39,13 @@ class ManifestTest(unittest.TestCase):
         with self.assertRaisesRegex(manifest.ManifestMismatch, "loop.py"):
             pilot.run_judging(self.tmp / "data", PILOT)
 
+    def test_malformed_manifest_refuses_cleanly(self):
+        for text in ("[]", "{not json", '{"digest": "x"}'):
+            with self.subTest(text=text):
+                manifest.MANIFEST.write_text(text)
+                with self.assertRaises(manifest.ManifestMismatch):
+                    manifest.verify(PILOT)
+
     def test_added_file_refuses(self):
         extra = self.tmp / "eval" / "tasks" / "t" / "new.py"
         extra.write_text("x\n")

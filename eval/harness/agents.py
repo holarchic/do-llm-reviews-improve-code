@@ -13,7 +13,8 @@ Isolation:
   AGENTS.md or config loads. Codex's own read-only sandbox blocks writes, not
   reads, so Codex runs inside an outer macOS Seatbelt profile instead (its own
   sandbox bypassed, as Codex documents for externally sandboxed runs) that
-  denies reads of the private roots and other runs, and writes to its cwd.
+  denies reads and writes of the private roots and other runs; it may write
+  its own home, and its cwd only in the writer role.
 - The transcript audit is a diagnostic: access is denied by the OS, and the
   probes prove it. Audit hits are recorded, not counted as contamination.
 """
@@ -26,9 +27,6 @@ from pathlib import Path
 
 from . import audit, procs
 
-WRITER_MODEL = "claude-haiku-5-5"
-SAME_REVIEWER_MODEL = "claude-haiku-5-5"
-CROSS_REVIEWER_MODEL = "gpt-6-luna"
 CLAUDE_JUDGE_MODEL = "claude-fable-5-1"
 CODEX_JUDGE_MODEL = "gpt-6-astra"
 CODEX_EFFORT = "high"

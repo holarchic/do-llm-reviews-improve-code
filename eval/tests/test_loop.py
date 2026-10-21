@@ -146,6 +146,18 @@ class BasisRuleTest(unittest.TestCase):
                          [(1, "MEDIUM", "MEDIUM"), (2, "HIGH", "LOW"), (3, "MEDIUM", "LOW"), (4, "LOW", "LOW")])
         self.assertTrue(verdict.blocking)
 
+    def test_issue_prose_in_capitals_does_not_end_the_block(self):
+        text = ("VERDICT: YELLOW\nISSUES:\n1. [HIGH] a.py:3 — crash\nNOTE: this fails for empty input\n"
+                "   Basis: SPEC criterion 4 — empty input must return []\n   Fix: guard\n\nCLAIMS CHECKED:\n"
+                "1. x — ✓\nBasis: not part of any issue\n")
+        verdict = loop.parse_verdict(text, basis_rule=True)
+        self.assertEqual(verdict.issues[0].effective, "HIGH")
+        self.assertTrue(verdict.blocking)
+
+    def test_basis_in_a_later_section_does_not_count(self):
+        text = "VERDICT: YELLOW\nISSUES:\n1. [MEDIUM] a.py:3 — x\n   Fix: y\n\nCLAIMS CHECKED:\nBasis: SPEC — z\n"
+        self.assertEqual(loop.parse_verdict(text, basis_rule=True).issues[0].effective, "LOW")
+
     def test_basis_belongs_to_its_own_issue(self):
         text = "VERDICT: YELLOW\n1. [MEDIUM] a — uncited\n   Fix: x\n2. [LOW] b — nit\n   Basis: rule — y\n"
         verdict = loop.parse_verdict(text, basis_rule=True)

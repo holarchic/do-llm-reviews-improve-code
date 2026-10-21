@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from eval.harness import experiments, manifest, pilot, report
+from eval.harness import experiments, judge, manifest, pilot, report
 
 TASKS = [task.id for task in pilot.scored_tasks()]
 PILOT = experiments.PILOT
@@ -42,7 +42,7 @@ class ReportTest(unittest.TestCase):
                         **identity, "status": "complete", "manifest": "d",
                         "scores": {"new_fraction": 1.0, "regressions": [], "persistent_failures": [], "repaired": []}})
         calibration = calibration or {}
-        for name in pilot.judge.JUDGES:
+        for name in judge.JUDGES:
             for task in TASKS:
                 for pair in (None, *PILOT.pairs):
                     if pair is None:

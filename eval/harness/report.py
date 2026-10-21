@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from statistics import mean
 
-from . import manifest, pilot, records
+from . import judge, manifest, pilot, records
 from .experiments import Experiment
 
 PRIMARY_THRESHOLD = 10.0
@@ -56,7 +56,7 @@ def collect(data_root: Path, experiment: Experiment) -> Results:
                     results.followup.setdefault(arm, {})[task_id] = followup["scores"]
                 else:
                     results.missing.append(f"followup {task_id}--{arm}")
-    for name in pilot.judge.JUDGES:
+    for name in judge.JUDGES:
         for task_id in results.tasks:
             for pair in (None, *experiment.pairs):
                 judgement = records.judgement(pilot.judging_dir(data_root, name, task_id, pair) / "judgement.json",

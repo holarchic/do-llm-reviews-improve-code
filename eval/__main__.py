@@ -85,13 +85,14 @@ def _run(args) -> int:
         print("run: scored tasks run only from a frozen schedule", file=sys.stderr)
         return 2
     arm = experiment.arm(args.arm)
-    record = loop.execute_run(task, arm, DATA_ROOT / "runs", manifest_hash=None)
+    runs_root = _data_root(experiment) / "runs"
+    record = loop.execute_run(task, arm, runs_root, manifest_hash=None)
     print(json.dumps({k: record.get(k) for k in ("run_id", "exec", "status", "flags", "rounds", "scores")}))
     if record["status"] != "complete":
         return 1
     if arm.name not in experiment.followup_arms:
         return 0
-    exec_dir = DATA_ROOT / "runs" / record["run_id"] / record["exec"]
+    exec_dir = runs_root / record["run_id"] / record["exec"]
     followup = loop.execute_followup(task, exec_dir, arm, manifest_hash=None)
     print(json.dumps({k: followup.get(k) for k in ("status", "flags", "scores")}))
     return 0 if followup["status"] == "complete" else 1
@@ -112,11 +113,16 @@ def _judge(args) -> int:
         print("judge: scored tasks are judged only from a frozen schedule", file=sys.stderr)
         return 2
     stamp = time.strftime("%Y%m%dT%H%M%S")
+    data_root = _data_root(args.experiment)
     if args.pair:
-        a, b = (loop.latest_complete_exec(DATA_ROOT / "runs", f"{task.id}--{arm}") / "artifact" for arm in args.pair)
-        result = judge.judge_pair(args.judge, task, a, b, DATA_ROOT / "dev-judgements" / f"{stamp}-{args.judge}")
+        unknown = [arm for arm in args.pair if arm not in args.experiment.arm_names]
+        if unknown:
+            print(f"judge: {unknown} not arms of {args.experiment.name}", file=sys.stderr)
+            return 2
+        a, b = (loop.latest_complete_exec(data_root / "runs", f"{task.id}--{arm}") / "artifact" for arm in args.pair)
+        result = judge.judge_pair(args.judge, task, a, b, data_root / "dev-judgements" / f"{stamp}-{args.judge}")
     else:
-        result = judge.calibrate(args.judge, task, DATA_ROOT / "dev-calibration" / f"{stamp}-{args.judge}")
+        result = judge.calibrate(args.judge, task, data_root / "dev-calibration" / f"{stamp}-{args.judge}")
     print(json.dumps({"result": result["result"], "picks": [o["pick"] for o in result["orders"]],
                       "leak_words": result["leak_words"]}))
     return 0
