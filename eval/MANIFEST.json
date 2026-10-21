@@ -1,24 +1,25 @@
 {
   "files": {
-    "eval/PREREG.md": "38e601371e71bbaf5f6955744e2637614bdadf23c158a92e138d08bd40d6413c",
+    "eval/PREREG.md": "1ac7716bb387fa469544b77bf652dee73bcfe1aebf05b4a90bdf5545cb0a2068",
     "eval/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "eval/__main__.py": "c3999fc13d2164e72f5ff9bbb3d1a1bc95be56aca2119ddcc09788ced5664b18",
+    "eval/__main__.py": "7e76f800b615e263e89ebfce324386590e3938eef778dd1bc662591f693a175c",
     "skills/codex-review/SKILL.md": "2c5a0b65b96f3766a96c90352ab6e4a0ce534177db6489071fb9d80027ba9ddb",
     "skills/build-loop/SKILL.md": "4c0e95e37357eab4cf8afc3c92377b71768c10ea0974ac9716db5bdd2e5dc791",
     "skills/build-loop/references/code-architecture-rules.md": "66980bf35aa207e823f63e08c49800e1db37144a9f67db5496848f7b5ffd06b0",
     "eval/harness/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "eval/harness/agents.py": "26cbbd22dcd2e61f165b36b692dc77925aab7497a21280c2eb2f064dba304e47",
-    "eval/harness/audit.py": "51a4e55b9c0e57727400f3c8d4cbcdc3cebba3adced9e2aa38a2a1bc9001a423",
-    "eval/harness/judge.py": "2df51aac9d1d2e2836eca1bf54a1cac85cdc7a3231c019f61abeae7c32d0e659",
-    "eval/harness/loop.py": "0504677cb0a8b940f2c4dfb77140a6b24fe27c6a8686e98bb42f8bb20548af74",
+    "eval/harness/agents.py": "d3cbff46950e718f9d59ce60dcde6d1638f5badccfc2a7d7aad626a675e31a14",
+    "eval/harness/audit.py": "76c12c7cf2807c5778a3bb1da907a25e53c51c9b74f4e72263a29d3fc48ad283",
+    "eval/harness/judge.py": "7da0ed3ca67a75bd288cff76677c01c7270d4f91da12a6e892f74ae752d70d7b",
+    "eval/harness/loop.py": "de3bee10451a5a120a955c07a529c640dfc744a3feeea11c4dfd13fec7cbf126",
     "eval/harness/manifest.py": "989506bd57694bb9ef4e0e7ea691312d4de0fd11f050506a227d300113c166ca",
-    "eval/harness/pilot.py": "4b6d3a55655f8fdd83050d1e0c0efc346f48bad392733afc2ebb28ff587a3090",
-    "eval/harness/probe.py": "e022470beda1e631e9607d03c56f4ff2d4483bc263f9c3f04d25b64f59472e08",
-    "eval/harness/procs.py": "fbca0aeb135a7deaa0742948c44e0609c5969485e95ac297156b2c7483940312",
+    "eval/harness/pilot.py": "b59ae0cfc643120affd45d4d39e6098ab44f8661cc31a2d5a42487170a6a88da",
+    "eval/harness/probe.py": "44b9c4d3d16295e418331e7f7c142e41ca1c356901ff3d2d1ab4dff32520912e",
+    "eval/harness/procs.py": "176abb9135d890dda58d63be8519ddbc0dd76362758923c20f4a425aaabaddeb",
     "eval/harness/prompts.py": "b69f142680177eb94bbc6a074beda81459b7fe2749dab06c66a42e3f6d624fbb",
-    "eval/harness/report.py": "a2fbdd1b6cf7d647334590b7ef1cbfda693dd8ad4bfc3545209c8ed315241c5d",
+    "eval/harness/records.py": "17cb6a43d3b75781f46c46185c62154ad04c7909b883c2a4ce0a6335ebe17cc0",
+    "eval/harness/report.py": "5940668ed4a50326f0c6293714b9d7f9ed9670df7e8e4278160fdd59bb7e57f7",
     "eval/harness/runner.py": "8b1a51fb2284de89c76736894e8e6e18457e6ce54b628ade1d4df0f971f09a3a",
-    "eval/harness/score.py": "52b28d7587b44556fca4ca3651619a633806705775d43a4301b4f1e5c257baef",
+    "eval/harness/score.py": "69de79a77018763e8cdeab3ade1f71a60cface8b2b83c18b683d0fcda00c0192",
     "eval/harness/tasks.py": "7f49ed4c3b6558bc979a298b751e9d59e61df97d2221891fc03359fa12743e5e",
     "eval/tasks/bill-split/FOLLOWUP.md": "8b998d1e88068d7ae77e4bb81dd502233d0ce6642b3c0e4843fe10677add43fc",
     "eval/tasks/bill-split/TASK.md": "4e3a27c33003a8ade098e19a82c2da1dcb4bab0ed4b3a782c3dc4ade141e832f",
@@ -86,5 +87,5 @@
     "eval/tasks/token-bucket/wrong/no-tolerance/ratelimit.py": "c9d74583b00bcf03605781fdfe73f42b0ef69af584f92ae4c69afbc998ac5000",
     "eval/tasks/token-bucket/wrong_followup/forget-removes-all/ratelimit.py": "e435f07295e46658582aaa6f552c0533e377a725c477c9216c390dad690d60ae"
   },
-  "digest": "05e8af421fd8050b22bf73edf8aaa148a4a76e2bec23be7f492790c0ad66ca56"
+  "digest": "4e63efb7cecb9652406ae221765498e977d611f1d598b193947899602814361f"
 }
