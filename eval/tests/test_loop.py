@@ -55,7 +55,7 @@ class LoopTest(unittest.TestCase):
     def run_arm(self, arm, fake):
         with mock.patch.object(agents, "run_claude", fake.run_claude), \
              mock.patch.object(agents, "run_codex", fake.run_codex):
-            return loop.execute_run(DEV, arm, self.tmp, manifest_hash=None)
+            return loop.execute_run(DEV, loop.ARMS[arm], self.tmp, manifest_hash=None)
 
     def test_reviewer_never_green_hits_both_caps_and_head_is_scored(self):
         record = self.run_arm("A2", FakeAgents())
@@ -241,9 +241,9 @@ class FollowupTest(unittest.TestCase):
             return session(out_dir)
 
         with mock.patch.object(agents, "run_claude", build_writer):
-            loop.execute_run(DEV, "A1", self.tmp, manifest_hash=None)
+            loop.execute_run(DEV, loop.ARMS["A1"], self.tmp, manifest_hash=None)
         with mock.patch.object(agents, "run_claude", followup_writer):
-            return loop.execute_followup(DEV, self.tmp / "dev-intervals--A1" / "exec-1", manifest_hash=None)
+            return loop.execute_followup(DEV, self.tmp / "dev-intervals--A1" / "exec-1", loop.ARMS["A1"], manifest_hash=None)
 
     def test_reference_followup_scores_full_without_regressions(self):
         record = self.followup(REFERENCE, (DEV.path("reference_followup") / "intervals.py").read_text())
@@ -271,7 +271,7 @@ class HardeningTest(unittest.TestCase):
 
     def run_with(self, writer, arm="A1"):
         with mock.patch.object(agents, "run_claude", writer):
-            return loop.execute_run(DEV, arm, self.tmp, manifest_hash=None)
+            return loop.execute_run(DEV, loop.ARMS[arm], self.tmp, manifest_hash=None)
 
     def test_session_exception_is_a_retried_infra_attempt(self):
         calls = []
@@ -329,7 +329,7 @@ class TimeoutAndPreservationTest(unittest.TestCase):
     def run_arm(self, arm, fake):
         with mock.patch.object(agents, "run_claude", fake.run_claude), \
              mock.patch.object(agents, "run_codex", fake.run_codex):
-            return loop.execute_run(DEV, arm, self.tmp, manifest_hash=None)
+            return loop.execute_run(DEV, loop.ARMS[arm], self.tmp, manifest_hash=None)
 
     def test_build_timeout_stops_reviews_and_scores_head(self):
         fake = FakeAgents(review_text="VERDICT: GREEN\n")
@@ -363,7 +363,73 @@ class TimeoutAndPreservationTest(unittest.TestCase):
 
         with mock.patch.object(agents, "run_claude", writer), \
              mock.patch.object(loop.shutil, "copytree", side_effect=OSError("disk full")):
-            record = loop.execute_run(DEV, "A1", self.tmp, manifest_hash=None)
+            record = loop.execute_run(DEV, loop.ARMS["A1"], self.tmp, manifest_hash=None)
         self.assertEqual(record["status"], "invalid")
         self.assertIn("preserving the repo failed", record["invalid_reason"])
         self.assertTrue((self.tmp / "dev-intervals--A1" / "exec-1" / "record.json").exists())
+
+
+class AblationTest(unittest.TestCase):
+    """Arm switches change exactly the steps and prompts they name."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="eval-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.calls = []
+
+    def fakes(self, review_text):
+        fake = FakeAgents(review_text=review_text)
+
+        def claude(model, prompt, *, role, cwd, out_dir):
+            self.calls.append(("claude", role, prompt))
+            return fake.run_claude(model, prompt, role=role, cwd=cwd, out_dir=out_dir)
+
+        def codex(model, prompt, *, role, cwd, out_dir):
+            self.calls.append(("codex", role, prompt))
+            if role == agents.WRITER:
+                return fake.run_claude(model, prompt, role=role, cwd=cwd, out_dir=out_dir)
+            return fake.run_codex(model, prompt, role=role, cwd=cwd, out_dir=out_dir)
+
+        return claude, codex
+
+    def run_arm(self, arm, review_text="VERDICT: GREEN\n"):
+        claude, codex = self.fakes(review_text)
+        with mock.patch.object(agents, "run_claude", claude), mock.patch.object(agents, "run_codex", codex):
+            return loop.execute_run(DEV, arm, self.tmp, manifest_hash=None)
+
+    def names(self, record):
+        return [step["name"] for step in record["steps"]]
+
+    def test_rubric_off_writer_gets_no_rules_reviewer_keeps_rubric(self):
+        arm = loop.Arm("X", loop._HAIKU, loop._LUNA, writer_rules=False)
+        self.run_arm(arm)
+        writer_prompts = [p for cli, role, p in self.calls if role == agents.WRITER]
+        reviewer_prompts = [p for cli, role, p in self.calls if role == agents.REVIEWER]
+        self.assertTrue(writer_prompts)
+        self.assertFalse(any("Full rubric" in p or "## Code" in p for p in writer_prompts))
+        self.assertTrue(all("Code Architecture Rule Set" in p for p in reviewer_prompts[1:]))
+
+    def test_architecture_pass_off_runs_one_pass_per_round(self):
+        arm = loop.Arm("X", loop._HAIKU, loop._LUNA, passes=("correctness",))
+        record = self.run_arm(arm)
+        self.assertIn("correctness-review-1", self.names(record))
+        self.assertFalse(any(n.startswith("architecture-review") for n in self.names(record)))
+
+    def test_plan_review_off_has_no_plan_review_steps(self):
+        arm = loop.Arm("X", loop._HAIKU, loop._LUNA, plan_review=False)
+        record = self.run_arm(arm)
+        self.assertEqual(self.names(record)[:2], ["plan", "build"])
+        self.assertNotIn("plan", record["rounds"])
+
+    def test_codex_writer_arm_and_its_followup_use_codex(self):
+        arm = loop.Arm("G", agents.Agent("codex", "gpt-5.6-terra"), agents.Agent("claude", "claude-sonnet-5-5"))
+        record = self.run_arm(arm)
+        self.assertEqual(record["scores"]["primary"], 1.0)
+        writers = {cli for cli, role, _ in self.calls if role == agents.WRITER}
+        reviewers = {cli for cli, role, _ in self.calls if role == agents.REVIEWER}
+        self.assertEqual((writers, reviewers), ({"codex"}, {"claude"}))
+        self.calls.clear()
+        claude, codex = self.fakes("VERDICT: GREEN\n")
+        with mock.patch.object(agents, "run_claude", claude), mock.patch.object(agents, "run_codex", codex):
+            loop.execute_followup(DEV, self.tmp / "dev-intervals--G" / "exec-1", arm, manifest_hash=None)
+        self.assertEqual([cli for cli, role, _ in self.calls], ["codex"])

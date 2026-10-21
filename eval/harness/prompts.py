@@ -79,8 +79,13 @@ def solo_writer() -> str:
     return _WRITER_PREAMBLE + "\nImplement TASK.md, with tests.\n"
 
 
-def loop_plan_writer() -> str:
-    return _with_rules(
+def _without_rules(prompt: str) -> str:
+    """The rubric-off ablation: the writer gets neither the Code rules nor the rubric."""
+    return prompt
+
+
+def loop_plan_writer(*, rules: bool = True) -> str:
+    return (_with_rules if rules else _without_rules)(
         _WRITER_PREAMBLE
         + f"""
 This step is planning only — write no code yet.
@@ -110,8 +115,8 @@ def _targets(severities: str, noun: str) -> str:
     return f"{noun} whose effective severity above is HIGH or MEDIUM (LOW {noun}s are optional)"
 
 
-def loop_plan_revision_writer(verdict: str, severities: str = "") -> str:
-    return _with_rules(
+def loop_plan_revision_writer(verdict: str, severities: str = "", *, rules: bool = True) -> str:
+    return (_with_rules if rules else _without_rules)(
         _WRITER_PREAMBLE
         + f"""
 This step is planning only — write no code yet. A reviewer reviewed `{PLAN_PATH}` and SPEC.md:
@@ -126,8 +131,8 @@ your design and record the reason under Open questions in the plan. TASK.md stay
     )
 
 
-def loop_build_writer() -> str:
-    return _with_rules(
+def loop_build_writer(*, rules: bool = True) -> str:
+    return (_with_rules if rules else _without_rules)(
         _WRITER_PREAMBLE
         + f"""
 Build the plan in `{PLAN_PATH}`, chunk by chunk, to SPEC.md and TASK.md. Write tests for each chunk and run them.
@@ -136,9 +141,9 @@ Tick each chunk in the plan as it passes its check.
     )
 
 
-def loop_fix_writer(verdicts: dict[str, str], severities: str = "") -> str:
+def loop_fix_writer(verdicts: dict[str, str], severities: str = "", *, rules: bool = True) -> str:
     reviews = "\n\n".join(f"<{name}-review>\n{text.strip()}\n</{name}-review>" for name, text in verdicts.items())
-    return _with_rules(
+    return (_with_rules if rules else _without_rules)(
         _WRITER_PREAMBLE
         + f"""
 Reviewers reviewed your build:

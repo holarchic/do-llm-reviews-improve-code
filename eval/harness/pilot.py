@@ -73,7 +73,7 @@ def run_builds(data_root: Path) -> int:
         task, arm = item
         exec_dir = complete_build(runs_root, task.id, arm, digest)
         if exec_dir is None:
-            record = loop.execute_run(task, arm, runs_root, manifest_hash=digest)
+            record = loop.execute_run(task, loop.ARMS[arm], runs_root, manifest_hash=digest)
             _log(f"build {record['run_id']} {record['exec']}: {record['status']} {record.get('flags')}")
             if record["status"] != "complete":
                 return False
@@ -81,7 +81,7 @@ def run_builds(data_root: Path) -> int:
         if arm not in FOLLOWUP_ARMS or complete_followup(exec_dir, digest):
             return True
         _set_aside(exec_dir / "followup")
-        followup = loop.execute_followup(task, exec_dir, manifest_hash=digest)
+        followup = loop.execute_followup(task, exec_dir, loop.ARMS[arm], manifest_hash=digest)
         _log(f"followup {task.id}--{arm}: {followup['status']}")
         return followup["status"] == "complete"
 

@@ -34,15 +34,24 @@ _REPO_GITIGNORE = "__pycache__/\n*.pyc\n"
 
 @dataclass(frozen=True)
 class Arm:
+    """One treatment. Without a reviewer the writer works alone from TASK.md. The switches are the
+    ablations: `writer_rules` (the writer gets the Code rules and rubric — reviewers always keep the
+    rubric), `plan_review`, and which review `passes` run after the build."""
     name: str
-    reviewer: str | None  # None = solo; else "claude" or "codex"
+    writer: agents.Agent
+    reviewer: agents.Agent | None = None
+    writer_rules: bool = True
+    plan_review: bool = True
+    passes: tuple[str, ...] = REVIEW_PASSES
 
 
+_HAIKU = agents.Agent("claude", agents.WRITER_MODEL)
+_LUNA = agents.Agent("codex", agents.CROSS_REVIEWER_MODEL)
 ARMS = {
-    "A1": Arm("A1", None),
-    "A1r": Arm("A1r", None),
-    "A2": Arm("A2", "claude"),
-    "A3": Arm("A3", "codex"),
+    "A1": Arm("A1", _HAIKU),
+    "A1r": Arm("A1r", _HAIKU),
+    "A2": Arm("A2", _HAIKU, _HAIKU),
+    "A3": Arm("A3", _HAIKU, _LUNA),
 }
 
 
@@ -133,8 +142,7 @@ def severity_note(verdicts: dict[str, Verdict]) -> str:
     return "\n".join(lines)
 
 
-def execute_run(task: Task, arm_name: str, runs_root: Path, *, manifest_hash: str | None) -> dict:
-    arm = ARMS[arm_name]
+def execute_run(task: Task, arm: Arm, runs_root: Path, *, manifest_hash: str | None) -> dict:
     run_id = f"{task.id}--{arm.name}"
     exec_dir = _next_exec_dir(runs_root.resolve() / run_id)
     run = _Run(repo=audit.anonymous_workdir() / "repo", exec_dir=exec_dir, arm=arm,
@@ -155,8 +163,8 @@ def execute_run(task: Task, arm_name: str, runs_root: Path, *, manifest_hash: st
     return record
 
 
-def execute_followup(task: Task, build_exec_dir: Path, *, manifest_hash: str | None) -> dict:
-    """A fresh solo writer makes the FOLLOWUP.md change in a copy of a finished build.
+def execute_followup(task: Task, build_exec_dir: Path, arm: Arm, *, manifest_hash: str | None) -> dict:
+    """A fresh solo session of the arm's writer makes the FOLLOWUP.md change in a copy of a finished build.
 
     Regressions are base test IDs that passed on the build and fail after the change;
     tests that failed before are reported apart, so a weak build isn't penalised twice.
@@ -167,7 +175,9 @@ def execute_followup(task: Task, build_exec_dir: Path, *, manifest_hash: str | N
         raise ValueError(f"no complete build record under this manifest in {build_exec_dir}")
     out_dir = build_exec_dir / "followup"
     out_dir.mkdir()
-    run = _Run(repo=audit.anonymous_workdir() / "repo", exec_dir=out_dir, arm=ARMS[build["arm"]])
+    if build["arm"] != arm.name:
+        raise ValueError(f"build is arm {build['arm']}, follow-up asked for {arm.name}")
+    run = _Run(repo=audit.anonymous_workdir() / "repo", exec_dir=out_dir, arm=arm)
     record = {"run_id": build["run_id"], "task": task.id, "arm": build["arm"], "build_exec": build_exec_dir.name,
               "manifest": manifest_hash, "cli_versions": _cli_versions(), "started": _now()}
 
@@ -268,8 +278,9 @@ def _solo(run: _Run) -> None:
 
 
 def _loop(run: _Run) -> None:
-    _writer(run, "plan", prompts.loop_plan_writer())
-    for round_no in range(1, MAX_ROUNDS + 1):
+    rules = run.arm.writer_rules
+    _writer(run, "plan", prompts.loop_plan_writer(rules=rules))
+    for round_no in range(1, MAX_ROUNDS + 1 if run.arm.plan_review else 1):
         run.rounds["plan"] = round_no
         verdict = _review(run, f"plan-review-{round_no}", prompts.plan_review())
         if not verdict.blocking:
@@ -278,10 +289,10 @@ def _loop(run: _Run) -> None:
             run.flags.append("plan_capped")
             break
         _writer(run, f"plan-revise-{round_no}", prompts.loop_plan_revision_writer(
-            verdict.text, severity_note({"plan": verdict}) if run.basis_rule else ""))
+            verdict.text, severity_note({"plan": verdict}) if run.basis_rule else "", rules=rules))
 
     base = run.last_commit
-    _writer(run, "build", prompts.loop_build_writer())
+    _writer(run, "build", prompts.loop_build_writer(rules=rules))
     for round_no in range(1, MAX_ROUNDS + 1):
         run.rounds["phase"] = round_no
         commits = _git(run.repo, "log", "--oneline", f"{base}..HEAD")
@@ -289,7 +300,7 @@ def _loop(run: _Run) -> None:
         verdicts = {
             name: _review(run, f"{name}-review-{round_no}",
                           prompts.code_review(name, base, commits=commits, final_state=final_state))
-            for name in REVIEW_PASSES
+            for name in run.arm.passes
         }
         if not any(v.blocking for v in verdicts.values()):
             break
@@ -297,12 +308,13 @@ def _loop(run: _Run) -> None:
             run.flags.append("review_capped")
             break
         _writer(run, f"fix-{round_no}", prompts.loop_fix_writer(
-            {n: v.text for n, v in verdicts.items()}, severity_note(verdicts) if run.basis_rule else ""))
+            {n: v.text for n, v in verdicts.items()}, severity_note(verdicts) if run.basis_rule else "",
+            rules=rules))
 
 
 def _writer(run: _Run, name: str, prompt: str) -> None:
-    session = _step(run, name, lambda out: agents.run_claude(
-        agents.WRITER_MODEL, prompt, role=agents.WRITER, cwd=run.repo, out_dir=out))
+    session = _step(run, name, lambda out: agents.run(
+        run.arm.writer, prompt, role=agents.WRITER, cwd=run.repo, out_dir=out))
     run.last_commit = _commit(run.repo, name)
     if session.terminal == agents.TIMEOUT:
         run.flags.append(f"timeout:{name}")
@@ -310,15 +322,8 @@ def _writer(run: _Run, name: str, prompt: str) -> None:
 
 
 def _review(run: _Run, name: str, prompt: str) -> Verdict:
-    if run.arm.reviewer == "claude":
-        def call(out):
-            return agents.run_claude(agents.SAME_REVIEWER_MODEL, prompt, role=agents.REVIEWER,
-                                     cwd=run.repo, out_dir=out)
-    else:
-        def call(out):
-            return agents.run_codex(agents.CROSS_REVIEWER_MODEL, prompt, role=agents.REVIEWER,
-                                    cwd=run.repo, out_dir=out)
-    session = _step(run, name, call)
+    session = _step(run, name, lambda out: agents.run(
+        run.arm.reviewer, prompt, role=agents.REVIEWER, cwd=run.repo, out_dir=out))
     if _git(run.repo, "status", "--porcelain"):
         run.flags.append(f"reviewer_wrote:{name}")
         _reset(run.repo, run.last_commit)

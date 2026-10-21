@@ -68,14 +68,14 @@ def _run(args) -> int:
     if not task.is_dev:
         print("run: pilot tasks run only from the frozen schedule", file=sys.stderr)
         return 2
-    record = loop.execute_run(task, args.arm, DATA_ROOT / "runs", manifest_hash=None)
+    record = loop.execute_run(task, loop.ARMS[args.arm], DATA_ROOT / "runs", manifest_hash=None)
     print(json.dumps({k: record.get(k) for k in ("run_id", "exec", "status", "flags", "rounds", "scores")}))
     if record["status"] != "complete":
         return 1
     if args.arm == "A1r":
         return 0
     exec_dir = DATA_ROOT / "runs" / record["run_id"] / record["exec"]
-    followup = loop.execute_followup(task, exec_dir, manifest_hash=None)
+    followup = loop.execute_followup(task, exec_dir, loop.ARMS[args.arm], manifest_hash=None)
     print(json.dumps({k: followup.get(k) for k in ("status", "flags", "scores")}))
     return 0 if followup["status"] == "complete" else 1
 
