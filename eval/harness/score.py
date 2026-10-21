@@ -11,7 +11,7 @@ import json
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from . import procs
@@ -86,6 +86,18 @@ def _execute(code_dir: Path, suite_dir: Path, work_dir: Path, *, timeout: float,
             # A kill mid-write leaves a torn last line; that test is unfinished.
             continue
     return _RunnerOutput(records=records, timed_out=proc.timed_out)
+
+
+def score_build(repo: Path, task, work_dir: Path) -> dict:
+    """Primary and static scores of a finished build (task is a tasks.Task)."""
+    expected = task.expected()["hidden"]
+    outcome = run_suite(repo, task.path("hidden"), work_dir / "hidden")
+    return {
+        "primary": pass_fraction(outcome, expected),
+        "hidden_outcomes": {test_id: outcome.outcomes.get(test_id, "missing") for test_id in expected},
+        "hidden_timed_out": outcome.timed_out,
+        "static": asdict(static_metrics(repo)),
+    }
 
 
 def static_metrics(code_dir: Path) -> StaticMetrics:
