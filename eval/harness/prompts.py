@@ -24,7 +24,7 @@ CONTRACT_NOTE = (
 _WRITER_PREAMBLE = """You are working alone in a git repository (the current directory). TASK.md describes the task.
 
 - Hidden tests will import exactly the interface TASK.md names; match module, function and exception names exactly.
-- Python 3.11+, standard library only. Write tests with `unittest` and run them with `python3 -m unittest`.
+- Use the `python3` on PATH and the standard library only. Write tests with `unittest` and run them with `python3 -m unittest`.
 - Work only inside this directory. Do not commit: the harness commits when you finish.
 """
 

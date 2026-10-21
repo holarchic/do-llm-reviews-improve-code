@@ -158,6 +158,16 @@ def _followup_scores(task: Task, before: dict[str, str], out_dir: Path) -> dict:
     }
 
 
+def latest_complete_exec(runs_root: Path, run_id: str) -> Path:
+    """The newest exec of run_id whose record is complete."""
+    execs = sorted((runs_root / run_id).glob("exec-*"), key=lambda p: int(p.name.split("-")[1]), reverse=True)
+    for exec_dir in execs:
+        record = exec_dir / "record.json"
+        if record.exists() and json.loads(record.read_text(encoding="utf-8")).get("status") == "complete":
+            return exec_dir
+    raise FileNotFoundError(f"no complete exec for {run_id}")
+
+
 def _solo(run: _Run) -> None:
     _writer(run, "build", prompts.solo_writer())
 

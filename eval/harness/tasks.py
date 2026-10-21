@@ -6,6 +6,7 @@ Layout of tasks/<id>/:
     hidden/, hidden_followup/   unittest suites (follow-up suite holds new behaviour only)
     reference/, reference_followup/
     wrong/<variant>/, wrong_followup/<variant>/
+    degraded/                   reference with injected quality defects, behaviour unchanged (judge calibration)
     expected.json               written by validate: collected test IDs per suite
 """
 
@@ -50,7 +51,7 @@ def load_tasks(root: Path = TASKS_ROOT) -> list[Task]:
 def validate(task: Task) -> list[str]:
     """Return the task's problems; when there are none, write expected.json."""
     missing = [name for name in ("TASK.md", "FOLLOWUP.md", "traps.md", "hidden", "hidden_followup",
-                                 "reference", "reference_followup") if not task.path(name).exists()]
+                                 "reference", "reference_followup", "degraded") if not task.path(name).exists()]
     if missing:
         return [f"{task.id}: missing {', '.join(missing)}"]
     if not task.variants("wrong") or not task.variants("wrong_followup"):
@@ -89,6 +90,7 @@ def _validate_in(task: Task, work: _WorkDirs) -> list[str]:
         ("reference_followup passes hidden", fraction(reference_followup, hidden, "hidden") == 1.0),
         ("reference_followup passes hidden_followup", fraction(reference_followup, followup, "hidden_followup") == 1.0),
         ("reference fails every follow-up test", fraction(reference, followup, "hidden_followup") == 0.0),
+        ("degraded passes hidden", fraction(task.path("degraded"), hidden, "hidden") == 1.0),
     ]
     for variant in task.variants("wrong"):
         checks.append((f"wrong/{variant.name} fails hidden", fraction(variant, hidden, "hidden") < 1.0))

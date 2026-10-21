@@ -1,6 +1,6 @@
 # Task: merge integer intervals
 
-Write a Python module `intervals.py` at the repository root (standard library only, Python 3.11+). Tests import it as `import intervals`.
+Write a Python module `intervals.py` at the repository root (standard library only). Tests import it as `import intervals`.
 
 ## Interface
 
