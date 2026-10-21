@@ -76,7 +76,7 @@ Every session runs without the operator's global instructions. Reads of private 
 
 ## Schedule
 
-Runs are shuffled and interleaved with seed 20261021, three at a time.
+Runs are shuffled and interleaved with seed 20261021, three at a time, never two of the same task at once.
 
 ## Freeze
 
