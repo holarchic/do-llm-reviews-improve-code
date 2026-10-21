@@ -16,10 +16,10 @@ Writer in every arm: `claude-haiku-5-5`.
 |---|---|---|
 | A1 solo | none | TASK.md |
 | A1r solo replicate | none | TASK.md (primary metric only, to show run-to-run spread) |
-| A2 loop-same | `claude-haiku-5-5` via Claude Code, read-only tools | TASK.md + the build-loop `## Code` rules + the rubric |
+| A2 loop-same | `claude-haiku-5-5` via Claude Code, sandboxed shell with repo writes denied | TASK.md + the build-loop `## Code` rules + the rubric |
 | A3 loop-cross | `gpt-6-luna` via Codex CLI, read-only sandbox, effort `high` | same as A2 |
 
-The treatment bundles rules, rubric, review and extra compute. A2 vs A3 compares reviewer configurations (model, CLI and tool policy together), not model families in isolation.
+The treatment bundles rules, rubric, review and extra compute. Both reviewers can read files and run commands but cannot write to the repo; A2 vs A3 still compares reviewer configurations (model and CLI together), not model families in isolation.
 
 Loop: writer plans → reviewer plan review → revise until GREEN (cap 5) → writer builds with tests → reviewer correctness pass and architecture pass → writer fixes HIGH/MEDIUM until both GREEN (cap 5 per pass). TASK.md is the authoritative contract for every reviewer.
 

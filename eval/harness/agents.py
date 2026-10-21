@@ -38,8 +38,7 @@ COMPLETED, TIMEOUT, INFRA = "completed", "timeout", "infra"
 _FILE_TOOLS = ("Read", "Edit", "Write", "Glob", "Grep")
 _CLAUDE_TOOLS = {
     WRITER: ["--tools", "Bash,Read,Edit,Write,Glob,Grep", "--permission-mode", "acceptEdits"],
-    REVIEWER: ["--tools", "Read,Glob,Grep,Bash",
-               "--allowedTools", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)"],
+    REVIEWER: ["--tools", "Read,Glob,Grep,Bash"],
     JUDGE: ["--tools", "Read,Glob,Grep"],
 }
 
@@ -67,18 +66,23 @@ class Session:
         }
 
 
-def claude_settings(role: str) -> dict:
+def claude_settings(role: str, cwd: Path) -> dict:
     roots = [str(root) for root in audit.sandbox_deny_roots()]
+    filesystem: dict = {"denyRead": roots}
+    if role == REVIEWER:
+        # Read-only like the Codex reviewer: any shell command, no writes to the repo.
+        filesystem["denyWrite"] = [os.path.realpath(cwd)]
     return {
         "sandbox": {
             "enabled": True,
             "failIfUnavailable": True,
-            "autoAllowBashIfSandboxed": role == WRITER,
+            "autoAllowBashIfSandboxed": role in (WRITER, REVIEWER),
             "allowUnsandboxedCommands": False,
-            "filesystem": {"denyRead": roots},
+            "filesystem": filesystem,
         },
         # "//" marks an absolute path in permission rules.
-        "permissions": {"deny": [f"{tool}(/{root}/**)" for tool in _FILE_TOOLS for root in roots]},
+        "permissions": {"deny": [f"{tool}(/{root}/**)" for tool in _FILE_TOOLS for root in roots]
+                        + (["Edit", "Write"] if role != WRITER else [])},
     }
 
 
@@ -103,7 +107,7 @@ def run_claude(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path) 
     out_dir = out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     settings_path = out_dir / "settings.json"
-    settings_path.write_text(json.dumps(claude_settings(role), indent=2), encoding="utf-8")
+    settings_path.write_text(json.dumps(claude_settings(role, cwd), indent=2), encoding="utf-8")
     argv = claude_argv(model, prompt, role, settings_path)
     (out_dir / "argv.json").write_text(json.dumps(argv, indent=2), encoding="utf-8")
     transcript = out_dir / "transcript.jsonl"
