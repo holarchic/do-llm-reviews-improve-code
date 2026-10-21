@@ -30,7 +30,7 @@ QUOTE_PROMPT = (
 @dataclass(frozen=True)
 class Probe:
     name: str
-    kind: str  # instructions | claude_canary | codex_canary | claude_reviewer | codex_writer | key
+    kind: str  # instructions | claude_canary | codex_canary | claude_reviewer | codex_writer | key | passthrough
     agent: agents.Agent
     role: str
 
@@ -72,6 +72,7 @@ def probe_plan(experiment) -> list[Probe]:
                            (None, None))
         if agent is not None:
             add(f"{cli}_key", "key", agent, role)
+            add(f"{cli}_passthrough", "passthrough", agent, role)
     return plan
 
 
@@ -95,8 +96,10 @@ def run_probes(probe_root: Path, experiment) -> list[str]:
             results[probe.name] = _claude_reviewer_probe(probe, stamp)
         elif probe.kind == "codex_writer":
             results[probe.name] = _codex_writer_probe(probe, stamp, canary)
-        else:
+        elif probe.kind == "key":
             results[probe.name] = _key_probe(probe, stamp)
+        else:
+            results[probe.name] = _passthrough_probe(probe, stamp)
     (stamp / "summary.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
     problems = [f"{name}: {problem}" for name, found in results.items() for problem in found["problems"]]
     if experiment.routed:
@@ -343,6 +346,28 @@ def _key_probe(probe: Probe, stamp: Path) -> dict:
         shutil.rmtree(run_dir, ignore_errors=True)
     return key_problems(session.transcript.read_text(encoding="utf-8", errors="replace"), permitted_token,
                         _routing_problems(probe, session))
+
+
+def passthrough_token() -> str:
+    """Text a provider-side PII guardrail rewrites: a ten-digit run, a phone number, an email address."""
+    digits = "".join(secrets.choice("0123456789") for _ in range(10))
+    return f"PASS-{digits} tel +1 415 555 {digits[:4]} mail probe-{digits[:6]}@example.com"
+
+
+def _passthrough_probe(probe: Probe, stamp: Path) -> dict:
+    """Routed text reaches the model and comes back unaltered: an OpenRouter account guardrail once
+    rewrote digit runs as [PHONE], corrupting the code a writer saw."""
+    token = passthrough_token()
+    run_dir = _run_dir(probe.name)
+    try:
+        session = agents.run(probe.agent, f"Do not use any tools. Reply with exactly this line and nothing else:\n{token}",
+                             role=probe.role, cwd=run_dir, out_dir=stamp / _slug(probe.name))
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+    problems = [] if session.terminal == agents.COMPLETED else [f"session did not complete: {session.reason}"]
+    if token not in session.final_text:
+        problems.append(f"text altered in transit (a provider guardrail?): got {session.final_text.strip()[:200]!r}")
+    return {"problems": problems + _routing_problems(probe, session)}
 
 
 def key_problems(transcript_text: str, permitted_token: str, routing: list[str]) -> dict:

@@ -17,7 +17,8 @@ class ProbePlanTest(unittest.TestCase):
         plan = {p.name: p for p in probe.probe_plan(experiments.PILOT2)}
         self.assertEqual(set(plan), {"claude_instructions", "codex_instructions",
                                      "codex_instructions:z-ai/glm-5.3-flash", "claude_canary", "codex_canary",
-                                     "codex_writer", "claude_key", "codex_key"})
+                                     "codex_writer", "claude_key", "codex_key", "claude_passthrough",
+                                     "codex_passthrough"})
         self.assertTrue(all(p.agent.provider == agents.OPENROUTER for p in plan.values()))
         self.assertEqual(plan["claude_key"].agent, experiments.DEEPSEEK_WRITER)
         self.assertEqual(plan["codex_key"].role, agents.REVIEWER)

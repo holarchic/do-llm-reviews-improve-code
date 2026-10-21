@@ -27,7 +27,8 @@ def main(argv: list[str]) -> int:
         parsers[name].add_argument("--experiment", default="pilot", help="a name from eval/harness/experiments.py")
     parsers["run"].add_argument("--task", help="run one task (a dev task, or a pilot task after freeze)")
     parsers["run"].add_argument("--arm", help="with --task: one of the experiment's arms")
-    parsers["calibrate"].add_argument("--task", help="one of the experiment's tasks (default: all)")
+    parsers["calibrate"].add_argument("--task", action="append", help="one of the experiment's tasks, repeatable "
+                                      "(default: all); one process, so one writer of the spend ledger")
     parsers["calibrate"].add_argument("--arm", help="default: the baseline arm; a loop arm gives a cost sample")
     parsers["calibrate"].add_argument("--reps", type=int, default=2)
     parsers["judge"].add_argument("--task", help="dev task: calibrate, or judge --pair, on one task")
@@ -106,7 +107,7 @@ def _calibrate(args) -> int:
     from .harness import openrouter, pilot, replicated
 
     experiment = args.experiment
-    task_ids = [args.task] if args.task else list(experiment.tasks)
+    task_ids = args.task or list(experiment.tasks)
     arm = args.arm or experiment.baseline
     if arm not in experiment.arm_names or any(t not in experiment.tasks for t in task_ids):
         print(f"calibrate: arm one of {experiment.arm_names}, task one of {experiment.tasks}", file=sys.stderr)
