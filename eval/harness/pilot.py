@@ -20,6 +20,7 @@ from . import judge, loop, manifest, openrouter, records, tasks
 from .experiments import Experiment
 
 SPEND_LEDGER = "spend.json"
+CALIBRATION_CAP_USD = 3.0
 
 
 def scored_tasks(experiment: Experiment) -> list[tasks.Task]:
@@ -101,6 +102,30 @@ def run_builds(data_root: Path, experiment: Experiment) -> int:
         results = list(pool.map(job, jobs))
     _log(f"builds: {sum(results)}/{len(results)} complete")
     return 0 if all(results) else 1
+
+
+def run_calibration(data_root: Path, experiment: Experiment, task_ids: list[str], arm: str, reps: int) -> list[dict]:
+    """Unscored builds of the experiment's tasks before its freeze: difficulty screening (baseline arm)
+    and cost samples (a loop arm). Stored apart under calibration/, never read by the report; a routed
+    experiment's calibration spend has its own cap."""
+    runs_root = data_root / "calibration" / "runs"
+    cap = (openrouter.SpendCap(data_root / SPEND_LEDGER, "calibration", CALIBRATION_CAP_USD)
+           if experiment.routed else None)
+    by_id = {task.id: task for task in scored_tasks(experiment)}
+
+    @_contained
+    def job(task_id):
+        built = []
+        for rep in range(1, reps + 1):
+            if cap is not None and not cap.admit():
+                _log(f"calibration {task_id} r{rep}: not admitted (spend cap or unreadable usage)")
+                break
+            built.append(loop.execute_run(by_id[task_id], experiment.arm(arm), runs_root, rep=rep, manifest_hash=None))
+        return built
+
+    # One worker per task: a task's replicates run one after another.
+    with ThreadPoolExecutor(max(1, len(task_ids))) as pool:
+        return [record for built in pool.map(job, task_ids) if built for record in built]
 
 
 def run_judging(data_root: Path, experiment: Experiment) -> int:

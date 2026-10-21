@@ -10,12 +10,13 @@ DATA_ROOT = Path(__file__).resolve().parent / "data"
 COMMANDS = {
     "validate": "check every task's hidden suites against its reference and wrong variants",
     "probe": "prove isolation of headless Claude and Codex sessions",
+    "calibrate": "unscored builds of the experiment's tasks before its freeze (difficulty and cost)",
     "freeze": "write the experiment's manifest over its frozen inputs",
     "run": "execute the experiment's arm runs, resuming finished ones",
     "judge": "run judge calibration and pairwise judging",
     "report": "regenerate the experiment's report from raw run records",
 }
-EXPERIMENT_COMMANDS = ("probe", "freeze", "run", "judge", "report")
+EXPERIMENT_COMMANDS = ("probe", "calibrate", "freeze", "run", "judge", "report")
 
 
 def main(argv: list[str]) -> int:
@@ -26,6 +27,9 @@ def main(argv: list[str]) -> int:
         parsers[name].add_argument("--experiment", default="pilot", help="a name from eval/harness/experiments.py")
     parsers["run"].add_argument("--task", help="run one task (a dev task, or a pilot task after freeze)")
     parsers["run"].add_argument("--arm", help="with --task: one of the experiment's arms")
+    parsers["calibrate"].add_argument("--task", help="one of the experiment's tasks (default: all)")
+    parsers["calibrate"].add_argument("--arm", help="default: the baseline arm; a loop arm gives a cost sample")
+    parsers["calibrate"].add_argument("--reps", type=int, default=2)
     parsers["judge"].add_argument("--task", help="dev task: calibrate, or judge --pair, on one task")
     parsers["judge"].add_argument("--judge", choices=["fable", "astra"], required=False)
     parsers["judge"].add_argument("--pair", nargs=2, metavar="ARM", help="with --task: judge two arms' builds")
@@ -98,6 +102,28 @@ def _run(args) -> int:
     return 0 if followup["status"] == "complete" else 1
 
 
+def _calibrate(args) -> int:
+    from .harness import openrouter, pilot, replicated
+
+    experiment = args.experiment
+    task_ids = [args.task] if args.task else list(experiment.tasks)
+    arm = args.arm or experiment.baseline
+    if arm not in experiment.arm_names or any(t not in experiment.tasks for t in task_ids):
+        print(f"calibrate: arm one of {experiment.arm_names}, task one of {experiment.tasks}", file=sys.stderr)
+        return 2
+    data_root = _data_root(experiment)
+    built = pilot.run_calibration(data_root, experiment, task_ids, arm, args.reps)
+    for record in built:
+        scores = record.get("scores") or {}
+        planted = (scores.get("planted") or {}).get("fraction")
+        print(f"{record['run_id']} {record['exec']}: {record['status']}"
+              f" primary={scores.get('primary', float('nan')) * 100:.1f}"
+              f" planted={'n/a' if planted is None else f'{planted * 100:.1f}'}"
+              f" est=${replicated.build_cost(record, experiment):.3f} flags={record.get('flags')}")
+    print(f"calibration spend so far: {openrouter.spent(data_root / pilot.SPEND_LEDGER, 'calibration')}")
+    return 0 if built and all(record["status"] == "complete" for record in built) else 1
+
+
 def _judge(args) -> int:
     import json
 
@@ -135,15 +161,16 @@ def _freeze(args) -> int:
 
 
 def _report(args) -> int:
-    from .harness import report
+    from .harness import replicated, report
 
     experiment = args.experiment
     data_root = _data_root(experiment)
 
     def write() -> int:
-        results = report.collect(data_root, experiment)
-        decision = report.decide(results, experiment)
-        text = report.render(results, decision, experiment)
+        module = replicated if experiment.report == "replicated" else report
+        results = module.collect(data_root, experiment)
+        decision = module.decide(results, experiment)
+        text = module.render(results, decision, experiment)
         data_root.mkdir(parents=True, exist_ok=True)
         (data_root / "report.md").write_text(text, encoding="utf-8")
         print(text)
@@ -163,8 +190,8 @@ def _guarded(action) -> int:
         return 3
 
 
-HANDLERS = {"validate": _validate, "probe": _probe, "freeze": _freeze, "run": _run, "judge": _judge,
-            "report": _report}
+HANDLERS = {"validate": _validate, "probe": _probe, "calibrate": _calibrate, "freeze": _freeze, "run": _run,
+            "judge": _judge, "report": _report}
 
 
 if __name__ == "__main__":
