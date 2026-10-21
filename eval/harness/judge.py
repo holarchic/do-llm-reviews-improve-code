@@ -10,8 +10,8 @@ import re
 import shutil
 from pathlib import Path
 
-from . import agents
-from .loop import MAX_ATTEMPTS, InfraExhausted, anonymous_workdir, guarded_call
+from . import agents, audit
+from .loop import MAX_ATTEMPTS, InfraExhausted, guarded_call
 from .tasks import Task
 
 JUDGES = {
@@ -99,7 +99,7 @@ def judge_pair(judge: str, task: Task, a_repo: Path, b_repo: Path, out_dir: Path
     for order, (x, y) in enumerate((("a", "b"), ("b", "a")), start=1):
         order_dir = out_dir / f"order-{order}"
         # The judge's cwd is a neutral folder outside the repo: no project instructions, no arm names in paths.
-        cwd = anonymous_workdir()
+        cwd = audit.anonymous_workdir()
         try:
             shutil.copytree(exports[x], cwd / "X")
             shutil.copytree(exports[y], cwd / "Y")

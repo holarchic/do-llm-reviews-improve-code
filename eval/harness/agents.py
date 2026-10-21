@@ -21,7 +21,6 @@ Isolation:
 import json
 import os
 import shutil
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -125,13 +124,14 @@ def run_codex(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path) -
     out_dir.mkdir(parents=True, exist_ok=True)
     final_path = out_dir / "final.txt"
     transcript = out_dir / "transcript.jsonl"
-    codex_home = Path(tempfile.mkdtemp(prefix="eval-codex-home-"))
+    # Under the unlistable runs root, like run dirs: no other session can find it.
+    codex_home = audit.anonymous_workdir()
     try:
         os.chmod(codex_home, 0o700)
         shutil.copy2(Path.home() / ".codex" / "auth.json", codex_home / "auth.json")
         (codex_home / "config.toml").write_text(f'model_reasoning_effort = "{CODEX_EFFORT}"\n', encoding="utf-8")
         profile = out_dir / "seatbelt.sb"
-        profile.write_text(codex_seatbelt_profile(cwd), encoding="utf-8")
+        profile.write_text(codex_seatbelt_profile(cwd, codex_home), encoding="utf-8")
         # Every file Codex touches lives in its own home and is copied out after: out_dir is under a
         # read-denied root, and node aborts at start-up if it cannot stat its stdout.
         inner = {name: codex_home / name for name in ("final.txt", "transcript.jsonl", "stderr.log")}
@@ -148,10 +148,11 @@ def run_codex(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path) -
     return _finish(classify_codex(transcript, final_path, proc, role, model), cwd)
 
 
-def codex_seatbelt_profile(cwd: Path) -> str:
+def codex_seatbelt_profile(cwd: Path, home: Path) -> str:
     """Deny reads of every private root and of other runs, and writes to the session's cwd.
-    Later rules win in Seatbelt, so the cwd is re-allowed for reading after the runs root is denied."""
+    Later rules win in Seatbelt, so the cwd and Codex's own home are re-allowed after the runs root is denied."""
     own = os.path.realpath(cwd)
+    own_home = os.path.realpath(home)
     denied = " ".join(f'(subpath "{root}")' for root in audit.sandbox_deny_roots())
     runs_roots = sorted({str(audit.RUNS_ROOT), os.path.realpath(audit.RUNS_ROOT)})
     runs = " ".join(f'(subpath "{root}")' for root in runs_roots)
@@ -161,7 +162,7 @@ def codex_seatbelt_profile(cwd: Path) -> str:
         "(version 1)\n(allow default)\n"
         f"(deny file-read* {denied} {runs})\n"
         f"(allow file-read-metadata {runs_stat})\n"
-        f'(allow file-read* (subpath "{own}"))\n'
+        f'(allow file-read* (subpath "{own}") (subpath "{own_home}"))\n'
         f'(deny file-write* (subpath "{own}"))\n'
     )
 

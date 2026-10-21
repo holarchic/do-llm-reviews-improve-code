@@ -10,7 +10,6 @@ import hashlib
 import io
 import json
 import re
-import secrets
 import shutil
 import subprocess
 import sys
@@ -90,7 +89,7 @@ def execute_run(task: Task, arm_name: str, runs_root: Path, *, manifest_hash: st
     arm = ARMS[arm_name]
     run_id = f"{task.id}--{arm.name}"
     exec_dir = _next_exec_dir(runs_root.resolve() / run_id)
-    run = _Run(repo=anonymous_workdir() / "repo", exec_dir=exec_dir, arm=arm)
+    run = _Run(repo=audit.anonymous_workdir() / "repo", exec_dir=exec_dir, arm=arm)
     record = {"run_id": run_id, "task": task.id, "arm": arm.name, "exec": exec_dir.name,
               "manifest": manifest_hash, "cli_versions": _cli_versions(), "started": _now()}
 
@@ -119,7 +118,7 @@ def execute_followup(task: Task, build_exec_dir: Path, *, manifest_hash: str | N
         raise ValueError(f"no complete build record under this manifest in {build_exec_dir}")
     out_dir = build_exec_dir / "followup"
     out_dir.mkdir()
-    run = _Run(repo=anonymous_workdir() / "repo", exec_dir=out_dir, arm=ARMS[build["arm"]])
+    run = _Run(repo=audit.anonymous_workdir() / "repo", exec_dir=out_dir, arm=ARMS[build["arm"]])
     record = {"run_id": build["run_id"], "task": task.id, "arm": build["arm"], "build_exec": build_exec_dir.name,
               "manifest": manifest_hash, "cli_versions": _cli_versions(), "started": _now()}
 
@@ -187,17 +186,6 @@ def artifact_digest(artifact: Path) -> str:
     for path in sorted(p for p in artifact.rglob("*") if p.is_file()):
         digest.update(str(path.relative_to(artifact)).encode() + b"\0" + path.read_bytes() + b"\0")
     return digest.hexdigest()
-
-
-def anonymous_workdir() -> Path:
-    """A neutral, unguessable dir under the runs root. The root is not listable even by its
-    owner (0311: write and traverse only), so a session cannot find another run's dir;
-    the name reveals no task or arm."""
-    audit.RUNS_ROOT.mkdir(parents=True, exist_ok=True)
-    audit.RUNS_ROOT.chmod(0o311)
-    path = audit.RUNS_ROOT / secrets.token_hex(8)
-    path.mkdir()
-    return path
 
 
 def _followup_scores(task: Task, before: dict[str, str], artifact: Path, out_dir: Path) -> dict:

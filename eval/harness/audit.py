@@ -9,6 +9,7 @@ commands cannot be complete (`cd` chains, variables, built strings).
 import json
 import os
 import re
+import secrets
 from pathlib import Path
 
 HOME = Path.home()
@@ -38,6 +39,17 @@ _STOP = r"[^\s'\"`;|&<>(),=]"
 # Any token starting with ~ or .., or containing a slash: relative tokens matter
 # because a symlink planted in the run dir can point into a private root.
 _PATH_TOKEN = re.compile(rf"~{_STOP}*|\.\.{_STOP}*|{_STOP}*/{_STOP}*")
+
+
+def anonymous_workdir() -> Path:
+    """A neutral, unguessable dir under the runs root. The root is not listable even by its
+    owner (0311: write and traverse only), so a session cannot find another run's dir;
+    the name reveals no task or arm."""
+    RUNS_ROOT.mkdir(parents=True, exist_ok=True)
+    RUNS_ROOT.chmod(0o311)
+    path = RUNS_ROOT / secrets.token_hex(8)
+    path.mkdir()
+    return path
 
 
 def private_roots() -> list[Path]:

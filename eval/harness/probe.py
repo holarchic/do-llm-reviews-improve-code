@@ -11,7 +11,7 @@ import shutil
 import time
 from pathlib import Path
 
-from . import agents, audit, loop
+from . import agents, audit
 
 INSTRUCTION_FILES = (Path.home() / ".claude" / "CLAUDE.md", Path.home() / ".codex" / "AGENTS.md")
 QUOTE_PROMPT = (
@@ -60,7 +60,7 @@ def instruction_markers() -> list[str]:
 
 def _run_dir(name: str) -> Path:
     # The production builder: probes must see the same dir layout and root permissions as runs.
-    return loop.anonymous_workdir()
+    return audit.anonymous_workdir()
 
 
 def _instructions_probe(cli: str, model: str, role: str, stamp: Path, markers: list[str]) -> dict:
