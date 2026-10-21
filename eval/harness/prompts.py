@@ -94,7 +94,23 @@ A reviewer will review the plan before you build.
     )
 
 
-def loop_plan_revision_writer(verdict: str) -> str:
+def basis_required() -> bool:
+    """Whether the shipped review templates require a `Basis:` for HIGH/MEDIUM findings."""
+    return "Basis:" in fenced_block(_skill(), "### 8. Verdict format")
+
+
+def _severity_block(severities: str) -> str:
+    return f"\n<effective-severities>\n{severities.strip()}\n</effective-severities>\n" if severities else ""
+
+
+def _targets(severities: str, noun: str) -> str:
+    """What the writer must resolve: by stated severity, or by effective severity under the basis rule."""
+    if not severities:
+        return f"HIGH and MEDIUM {noun}"
+    return f"{noun} whose effective severity above is HIGH or MEDIUM (LOW {noun}s are optional)"
+
+
+def loop_plan_revision_writer(verdict: str, severities: str = "") -> str:
     return _with_rules(
         _WRITER_PREAMBLE
         + f"""
@@ -103,8 +119,8 @@ This step is planning only — write no code yet. A reviewer reviewed `{PLAN_PAT
 <review>
 {verdict.strip()}
 </review>
-
-Revise `{PLAN_PATH}` and SPEC.md to resolve every HIGH and MEDIUM item. Where you disagree with an item, keep
+{_severity_block(severities)}
+Revise `{PLAN_PATH}` and SPEC.md to resolve every {_targets(severities, "item")}. Where you disagree with an item, keep
 your design and record the reason under Open questions in the plan. TASK.md stays authoritative.
 """
     )
@@ -120,7 +136,7 @@ Tick each chunk in the plan as it passes its check.
     )
 
 
-def loop_fix_writer(verdicts: dict[str, str]) -> str:
+def loop_fix_writer(verdicts: dict[str, str], severities: str = "") -> str:
     reviews = "\n\n".join(f"<{name}-review>\n{text.strip()}\n</{name}-review>" for name, text in verdicts.items())
     return _with_rules(
         _WRITER_PREAMBLE
@@ -128,8 +144,8 @@ def loop_fix_writer(verdicts: dict[str, str]) -> str:
 Reviewers reviewed your build:
 
 {reviews}
-
-Fix every HIGH and MEDIUM issue. Check each claim against the code before changing it; where a finding is wrong,
+{_severity_block(severities)}
+Fix every {_targets(severities, "issue")}. Check each claim against the code before changing it; where a finding is wrong,
 leave the code and record why in a Log section at the end of `{PLAN_PATH}`. Keep SPEC.md in step with any contract
 change. Run the tests.
 """

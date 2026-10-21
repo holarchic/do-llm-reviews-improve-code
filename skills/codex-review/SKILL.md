@@ -139,7 +139,10 @@ ISSUES:
 <GREEN: "None" or LOW observations only. YELLOW/RED: numbered.>
 
 1. [<HIGH | MEDIUM | LOW>] <file>:<line> — <issue>
+   Basis: <requirement broken (SPEC § or criterion, plan step, the user's task) or rubric rule by name> — <how this code breaks it>
    Fix: <concrete code or design change>
+
+Every HIGH or MEDIUM issue needs a `Basis:` naming the requirement it breaks (SPEC section or acceptance criterion, plan step, the user's task) or the rubric rule it violates (by name), and how. A HIGH or MEDIUM without one is read as LOW.
 
 CLAIMS CHECKED:
 1. <claim name> — ✓ verified | ✗ failed | ⚠ partial: <note>
@@ -235,7 +238,10 @@ SUMMARY: <one-sentence headline finding>
 PLAN EDITS:
 <GREEN: "None". YELLOW: numbered.>
 1. [<HIGH | MEDIUM | LOW>] <plan section/line> — <issue>
+   Basis: <requirement broken (SPEC § or criterion, the user's task) or rubric rule by name> — <how this plan breaks it>
    Change: <concrete plan edit>
+
+Every HIGH or MEDIUM issue needs a `Basis:` naming the requirement it breaks (SPEC section or acceptance criterion, plan step, the user's task) or the rubric rule it violates (by name), and how. A HIGH or MEDIUM without one is read as LOW.
 
 DESIGN ISSUE (RED only):
 <root cause + suggested rework>
@@ -333,7 +339,7 @@ Code review returns **two verdicts**. The phase is blocked until BOTH are GREEN 
 
 1. Parse each pass's VERDICT line from its `-o` file. A dead run (see Invocation) has no verdict: rerun it first.
 2. **GREEN** — proceed. **LOW issues never block and never need adjudication, under any verdict**: fix them in a round that will be re-run, or leave them and list them to the user when the phase lands. A change after the final GREEN is a new round.
-3. **YELLOW** — for each HIGH/MEDIUM issue: check the `file:line` and the claim. Valid → fix it; a different fix from the one suggested is fine — the re-run grades it. Disagree that it's a problem at all → push back with reasoning and surface the issue + counter-position to the user. Never silently skip.
+3. **YELLOW** — first read each HIGH/MEDIUM issue's `Basis:`. One without a basis is LOW: it doesn't block (step 2). A basis is still a claim: check that the cited requirement or rule actually covers the finding, and push back when it doesn't. Then, for each HIGH/MEDIUM issue: check the `file:line` and the claim. Valid → fix it; a different fix from the one suggested is fine — the re-run grades it. Disagree that it's a problem at all → push back with reasoning and surface the issue + counter-position to the user. Never silently skip.
 4. **RED** — surface immediately. Don't patch in-loop; a design-level error needs the user's judgment.
 5. **Architecture findings don't need a failing test to be blocking.** "Nothing is broken yet" is not a dismissal. Dismiss only with a substantive structural counter-argument, surfaced to the user.
 6. **After fixes you MUST re-invoke.** A fix that changes code or contract (SPEC decisions, criteria, failure modes) re-runs **both** passes — the other pass has to grade the new state even if it was GREEN. Only a fix confined to ARCHITECTURE.md or plan prose re-runs just the pass that raised it. The re-review prompt — plan or code — adds a `## Previous round` section just before the rubric: each prior issue with its disposition (fixed at `file:line`, or pushed back with the reason). Instruct the reviewer to verify each disposition independently, then review fresh — not just check the list. The loop has exactly three exits: (a) GREEN on a re-run, (b) a disagreement the user adjudicated, (c) the round-5 cap surfaced to the user. Proceeding past YELLOW/RED on "I made the edits, so it's resolved" is a process violation — that self-grade is exactly the drift this gate exists to stop.

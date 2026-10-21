@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from eval.harness import agents, loop, tasks
+from eval.harness import agents, loop, prompts, tasks
 
 DEV = tasks.Task(tasks.TASKS_ROOT / "dev-intervals")
 REFERENCE = (DEV.path("reference") / "intervals.py").read_text()
@@ -21,7 +21,8 @@ def session(out: Path, terminal=agents.COMPLETED, text="done") -> agents.Session
 class FakeAgents:
     """Writer writes the reference on any build/solo step; reviewer answers from a script."""
 
-    def __init__(self, review_text="VERDICT: YELLOW\nISSUES:\n1. [HIGH] intervals.py:1 — x\n"):
+    def __init__(self, review_text="VERDICT: YELLOW\nISSUES:\n1. [HIGH] intervals.py:1 — x\n"
+                                   "   Basis: TASK.md behaviour 2 — adjacent spans stay apart\n"):
         self.review_text = review_text
         self.prompts: list[tuple[str, str]] = []
         self.writer_infra_left = 0
@@ -110,10 +111,75 @@ class LoopTest(unittest.TestCase):
 
 class VerdictTest(unittest.TestCase):
     def test_labels(self):
-        self.assertFalse(loop.parse_verdict("VERDICT: GREEN\n").blocking)
-        self.assertTrue(loop.parse_verdict("**VERDICT: RED**\n1. [MEDIUM] x").blocking)
-        self.assertTrue(loop.parse_verdict("VERDICT: YELLOW\nno tags").blocking)
-        self.assertTrue(loop.parse_verdict("").malformed)
+        for rule in (False, True):
+            with self.subTest(basis_rule=rule):
+                self.assertFalse(loop.parse_verdict("VERDICT: GREEN\n", basis_rule=rule).blocking)
+                self.assertTrue(loop.parse_verdict("VERDICT: YELLOW\nno tags", basis_rule=rule).blocking)
+                self.assertTrue(loop.parse_verdict("", basis_rule=rule).malformed)
+        self.assertTrue(loop.parse_verdict("**VERDICT: RED**\n1. [MEDIUM] x", basis_rule=False).blocking)
+
+
+MIXED = """VERDICT: YELLOW
+SUMMARY: s
+
+ISSUES:
+1. [MEDIUM] a.py:1 — cited
+   Basis: SPEC Acceptance Criteria row 2 — wrong order
+   Fix: sort
+2. [HIGH] a.py:9 — uncited
+   Fix: harden
+3. [MEDIUM] a.py:12 — empty basis
+   Basis:
+   Fix: x
+4. [LOW] a.py:20 — nit
+   Fix: y
+
+CLAIMS CHECKED:
+1. Basis: this line is not inside an issue
+"""
+
+
+class BasisRuleTest(unittest.TestCase):
+    def test_uncited_and_empty_basis_are_low(self):
+        verdict = loop.parse_verdict(MIXED, basis_rule=True)
+        self.assertEqual([(i.number, i.stated, i.effective) for i in verdict.issues],
+                         [(1, "MEDIUM", "MEDIUM"), (2, "HIGH", "LOW"), (3, "MEDIUM", "LOW"), (4, "LOW", "LOW")])
+        self.assertTrue(verdict.blocking)
+
+    def test_basis_belongs_to_its_own_issue(self):
+        text = "VERDICT: YELLOW\n1. [MEDIUM] a — uncited\n   Fix: x\n2. [LOW] b — nit\n   Basis: rule — y\n"
+        verdict = loop.parse_verdict(text, basis_rule=True)
+        self.assertEqual(verdict.issues[0].effective, "LOW")
+        self.assertFalse(verdict.blocking)
+
+    def test_without_the_rule_stated_severities_stand(self):
+        verdict = loop.parse_verdict(MIXED.replace("   Basis: SPEC Acceptance Criteria row 2 — wrong order\n", ""),
+                                     basis_rule=False)
+        self.assertTrue(verdict.blocking)
+        self.assertTrue(all(i.effective == i.stated for i in verdict.issues))
+
+    def test_only_uncited_findings_do_not_block(self):
+        text = MIXED.replace("   Basis: SPEC Acceptance Criteria row 2 — wrong order\n", "")
+        self.assertFalse(loop.parse_verdict(text, basis_rule=True).blocking)
+
+    def test_writer_sees_effective_severities_across_passes(self):
+        verdicts = {"correctness": loop.parse_verdict(MIXED, basis_rule=True),
+                    "architecture": loop.parse_verdict("VERDICT: YELLOW\n1. [MEDIUM] m.py:3 — uncited\n", basis_rule=True)}
+        prompt = prompts.loop_fix_writer({n: v.text for n, v in verdicts.items()}, loop.severity_note(verdicts))
+        self.assertIn("correctness issue 1: MEDIUM\n", prompt)
+        self.assertIn("correctness issue 2: HIGH → LOW (no basis)", prompt)
+        self.assertIn("architecture issue 1: MEDIUM → LOW (no basis)", prompt)
+        self.assertIn("Fix every issue whose effective severity above is HIGH or MEDIUM", prompt)
+        self.assertNotIn("Fix every HIGH and MEDIUM issue", prompt)
+
+    def test_plan_revision_sees_effective_severities(self):
+        verdict = loop.parse_verdict(MIXED, basis_rule=True)
+        prompt = prompts.loop_plan_revision_writer(verdict.text, loop.severity_note({"plan": verdict}))
+        self.assertIn("plan issue 2: HIGH → LOW (no basis)", prompt)
+        self.assertIn("resolve every item whose effective severity above is HIGH or MEDIUM", prompt)
+
+    def test_shipped_template_requires_basis(self):
+        self.assertTrue(prompts.basis_required())
 
 
 class ClassifyTest(unittest.TestCase):

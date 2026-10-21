@@ -47,11 +47,20 @@ ARMS = {
 
 
 @dataclass(frozen=True)
+class Issue:
+    number: int
+    stated: str
+    effective: str
+    has_basis: bool
+
+
+@dataclass(frozen=True)
 class Verdict:
     label: str
     blocking: bool
     malformed: bool
     text: str
+    issues: tuple[Issue, ...] = ()
 
 
 class InfraExhausted(Exception):
@@ -71,25 +80,65 @@ class _Run:
     steps: list[dict] = field(default_factory=list)
     flags: list[str] = field(default_factory=list)
     rounds: dict[str, int] = field(default_factory=dict)
+    basis_rule: bool = False
 
 
-def parse_verdict(text: str) -> Verdict:
+_ISSUE_START = re.compile(r"^\s*(\d+)\.\s*\[(HIGH|MEDIUM|LOW)\]", re.MULTILINE)
+# A block ends at the next issue or at the next section header (e.g. "CLAIMS CHECKED:").
+_SECTION = re.compile(r"^[A-Z][A-Z ()/-]{3,}:", re.MULTILINE)
+_BASIS = re.compile(r"^[ \t]*Basis:[ \t]*\S", re.MULTILINE)
+
+
+def parse_verdict(text: str, *, basis_rule: bool) -> Verdict:
     """A missing verdict line is malformed and counts as YELLOW. LOW-only findings never block;
-    a non-GREEN verdict without any severity tags can't be read as LOW-only, so it blocks."""
+    a non-GREEN verdict without any severity tags can't be read as LOW-only, so it blocks.
+
+    Under the basis rule (the graded template asks for `Basis:`), a HIGH or MEDIUM issue whose
+    own block has no non-empty `Basis:` line is effectively LOW.
+    """
     match = re.search(r"^\W*VERDICT:\W*(GREEN|YELLOW|RED)\b", text, flags=re.MULTILINE)
     if match is None:
         return Verdict("YELLOW", True, True, text)
     label = match.group(1)
-    tags = re.findall(r"\[(HIGH|MEDIUM|LOW)\]", text)
-    blocking = label != "GREEN" and (not tags or any(tag != "LOW" for tag in tags))
-    return Verdict(label, blocking, False, text)
+    issues = _issues(text, basis_rule=basis_rule)
+    if basis_rule:
+        blocking = label != "GREEN" and (not issues or any(i.effective != "LOW" for i in issues))
+    else:
+        tags = re.findall(r"\[(HIGH|MEDIUM|LOW)\]", text)
+        blocking = label != "GREEN" and (not tags or any(tag != "LOW" for tag in tags))
+    return Verdict(label, blocking, False, text, issues)
+
+
+def _issues(text: str, *, basis_rule: bool) -> tuple[Issue, ...]:
+    starts = list(_ISSUE_START.finditer(text))
+    issues = []
+    for index, start in enumerate(starts):
+        end = starts[index + 1].start() if index + 1 < len(starts) else len(text)
+        section = _SECTION.search(text, start.end(), end)
+        block = text[start.start():section.start() if section else end]
+        stated = start.group(2)
+        has_basis = bool(_BASIS.search(block))
+        effective = "LOW" if basis_rule and stated != "LOW" and not has_basis else stated
+        issues.append(Issue(int(start.group(1)), stated, effective, has_basis))
+    return tuple(issues)
+
+
+def severity_note(verdicts: dict[str, Verdict]) -> str:
+    """Effective severities for the writer, one line per issue, under the basis rule."""
+    lines = ["Each HIGH or MEDIUM finding must cite its basis; one without a basis counts as LOW."]
+    for name, verdict in verdicts.items():
+        for issue in verdict.issues:
+            change = f"{issue.stated} → {issue.effective} (no basis)" if issue.effective != issue.stated else issue.stated
+            lines.append(f"{name} issue {issue.number}: {change}")
+    return "\n".join(lines)
 
 
 def execute_run(task: Task, arm_name: str, runs_root: Path, *, manifest_hash: str | None) -> dict:
     arm = ARMS[arm_name]
     run_id = f"{task.id}--{arm.name}"
     exec_dir = _next_exec_dir(runs_root.resolve() / run_id)
-    run = _Run(repo=audit.anonymous_workdir() / "repo", exec_dir=exec_dir, arm=arm)
+    run = _Run(repo=audit.anonymous_workdir() / "repo", exec_dir=exec_dir, arm=arm,
+               basis_rule=prompts.basis_required())
     record = {"run_id": run_id, "task": task.id, "arm": arm.name, "exec": exec_dir.name,
               "manifest": manifest_hash, "cli_versions": _cli_versions(), "started": _now()}
 
@@ -228,7 +277,8 @@ def _loop(run: _Run) -> None:
         if round_no == MAX_ROUNDS:
             run.flags.append("plan_capped")
             break
-        _writer(run, f"plan-revise-{round_no}", prompts.loop_plan_revision_writer(verdict.text))
+        _writer(run, f"plan-revise-{round_no}", prompts.loop_plan_revision_writer(
+            verdict.text, severity_note({"plan": verdict}) if run.basis_rule else ""))
 
     base = run.last_commit
     _writer(run, "build", prompts.loop_build_writer())
@@ -246,7 +296,8 @@ def _loop(run: _Run) -> None:
         if round_no == MAX_ROUNDS:
             run.flags.append("review_capped")
             break
-        _writer(run, f"fix-{round_no}", prompts.loop_fix_writer({n: v.text for n, v in verdicts.items()}))
+        _writer(run, f"fix-{round_no}", prompts.loop_fix_writer(
+            {n: v.text for n, v in verdicts.items()}, severity_note(verdicts) if run.basis_rule else ""))
 
 
 def _writer(run: _Run, name: str, prompt: str) -> None:
@@ -274,7 +325,7 @@ def _review(run: _Run, name: str, prompt: str) -> Verdict:
     if session.terminal == agents.TIMEOUT:
         run.flags.append(f"timeout:{name}")
         raise ModelTimeout(name)
-    verdict = parse_verdict(session.final_text)
+    verdict = parse_verdict(session.final_text, basis_rule=run.basis_rule)
     if verdict.malformed:
         run.flags.append(f"malformed_verdict:{name}")
     run.steps[-1]["verdict"] = {"label": verdict.label, "blocking": verdict.blocking, "malformed": verdict.malformed}
