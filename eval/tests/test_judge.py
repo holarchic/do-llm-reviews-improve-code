@@ -69,6 +69,38 @@ class JudgeTest(unittest.TestCase):
         with self.assertRaises(InfraExhausted):
             self.pair([None, None, None])
 
+    def test_judge_runs_in_neutral_folder_outside_repo(self):
+        cwds = []
+
+        def fake(model, prompt, *, role, cwd, out_dir):
+            cwds.append(cwd)
+            self.assertTrue((cwd / "X").is_dir())
+            return session(out_dir, text=verdict("X"))
+
+        with mock.patch.object(agents, "run_claude", fake):
+            judge.calibrate("fable", DEV, self.tmp / "out" / "A1-vs-A2")
+        repo = Path(judge.__file__).resolve().parents[2]
+        for cwd in cwds:
+            self.assertNotIn(repo, cwd.parents)
+            self.assertNotRegex(str(cwd), r"A1|vs|order|calibration|fable")
+            self.assertFalse(cwd.exists())
+
+    def test_empty_build_is_judged(self):
+        empty = self.tmp / "empty"
+        empty.mkdir()
+        fake = FakeJudge([verdict("X"), verdict("Y")])
+        with mock.patch.object(agents, "run_claude", fake):
+            result = judge.judge_pair("fable", DEV, DEV.path("reference"), empty, self.tmp / "out")
+        self.assertEqual(result["result"], "a")
+        self.assertIn("contains no Python files", fake.prompts[0])
+
+    def test_session_exception_counts_toward_infra_budget(self):
+        def boom(model, prompt, *, role, cwd, out_dir):
+            raise OSError("spawn failed")
+
+        with mock.patch.object(agents, "run_codex", boom), self.assertRaises(InfraExhausted):
+            judge.calibrate("astra", DEV, self.tmp / "out")
+
     def test_export_keeps_only_python_outside_plans_and_git(self):
         repo = self.tmp / "repo"
         for name in ("a.py", "tests/test_a.py", "SPEC.md", "plans/plan.md", "plans/x.py", ".git/hooks/h.py"):
@@ -80,8 +112,9 @@ class JudgeTest(unittest.TestCase):
 
     def test_parse(self):
         self.assertEqual(judge.parse_judgement('{"winner": "TIE", "reasons": []}'), "TIE")
-        self.assertIsNone(judge.parse_judgement('{"winner": "Z"}'))
-        self.assertEqual(judge.parse_judgement('{"winner": "X"} then {"winner": "Y", "reasons": ["a}"]}'), "Y")
+        self.assertIsNone(judge.parse_judgement('{"winner": "Z", "reasons": []}'))
+        self.assertIsNone(judge.parse_judgement('{"winner": "X"}'))
+        self.assertEqual(judge.parse_judgement('{"winner": "X", "reasons": []} then {"winner": "Y", "reasons": ["a}"]}'), "Y")
 
 
 if __name__ == "__main__":

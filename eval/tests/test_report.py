@@ -23,14 +23,16 @@ class ReportTest(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data))
 
-    def populate(self, primary: dict[str, float], judged: dict[str, dict[str, str]], calibration=None):
-        """primary: arm -> pass fraction for every task; judged: judge -> pair -> result for every task."""
+    def populate(self, primary: dict, judged: dict[str, dict[str, str]], calibration=None):
+        """primary: arm -> pass fraction (one for every task, or task -> fraction);
+        judged: judge -> pair -> result for every task."""
         for arm in pilot.BUILD_ARMS:
             for task in TASKS:
                 exec_dir = self.root / "runs" / f"{task}--{arm}" / "exec-1"
                 self.write(exec_dir / "record.json", {
                     "status": "complete", "manifest": "d", "steps": [], "rounds": {}, "flags": [],
-                    "scores": {"primary": primary[arm], "static": STATIC}})
+                    "scores": {"primary": primary[arm][task] if isinstance(primary[arm], dict) else primary[arm],
+                               "static": STATIC}})
                 if arm in pilot.FOLLOWUP_ARMS:
                     self.write(exec_dir / "followup" / "record.json", {
                         "status": "complete", "manifest": "d",
@@ -95,6 +97,28 @@ class ReportTest(unittest.TestCase):
         decision = self.decide()
         self.assertEqual(decision.verdict, "GO")
         self.assertEqual(decision.primary_sensitivity, "changes with A1r in place of A1")
+
+
+    def test_exact_threshold_with_real_denominators_is_go(self):
+        # +7/14 on bill-split is exactly +10 arm-mean points; with these real denominators
+        # the float difference of means is 9.999999999999998.
+        sizes = {task.id: len(task.expected()["hidden"]) for task in pilot.pilot_tasks()}
+        a1 = {task: 0.0 for task in sizes}
+        a1["token-bucket"] = 9 / sizes["token-bucket"]
+        a2 = {**a1, "bill-split": 7 / sizes["bill-split"]}
+        self.populate({"A1": a1, "A1r": a1, "A2": a2, "A3": a1}, {})
+        self.assertEqual(self.decide().verdict, "GO")
+
+    def test_sensitivity_compares_the_whole_trigger(self):
+        self.populate({"A1": 0.6, "A1r": 0.65, "A2": 0.7, "A3": 0.8}, {})
+        self.assertEqual(self.decide().primary_sensitivity, "unchanged with A1r in place of A1")
+
+    def test_malformed_record_is_incomplete(self):
+        self.populate({"A1": 0.7, "A1r": 0.7, "A2": 0.9, "A3": 0.7}, {})
+        record = self.root / "runs" / f"{TASKS[0]}--A3" / "exec-1" / "record.json"
+        self.write(record, {"status": "complete", "manifest": "d"})
+        decision = self.decide()
+        self.assertEqual(decision.verdict, "INCOMPLETE")
 
 
 class ScheduleTest(unittest.TestCase):

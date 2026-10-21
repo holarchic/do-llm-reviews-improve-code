@@ -7,11 +7,12 @@ pair is judged in both orders; only a pick that survives the swap is a win.
 
 import json
 import re
+import secrets
 import shutil
 from pathlib import Path
 
-from . import agents
-from .loop import MAX_ATTEMPTS, InfraExhausted
+from . import agents, audit
+from .loop import MAX_ATTEMPTS, InfraExhausted, guarded_call
 from .tasks import Task
 
 JUDGES = {
@@ -39,7 +40,8 @@ End your reply with a JSON object, and nothing after it:
 
 
 def export_build(repo: Path, dest: Path) -> list[str]:
-    """Copy only the build's Python files (source and tests) into dest."""
+    """Copy only the build's Python files (source and tests) into dest; dest exists even when there are none."""
+    dest.mkdir(parents=True, exist_ok=True)
     files = []
     for path in sorted(repo.rglob("*.py")):
         relative = path.relative_to(repo)
@@ -62,7 +64,10 @@ def build_prompt(task_text: str, x_dir: Path, y_dir: Path) -> str:
     parts = [JUDGE_PROMPT, "# TASK.md\n", task_text]
     for label, folder in (("X", x_dir), ("Y", y_dir)):
         parts.append(f"\n# Version {label}\n")
-        for path in sorted(folder.rglob("*.py")):
+        files = sorted(folder.rglob("*.py"))
+        if not files:
+            parts.append("\n(This version contains no Python files.)\n")
+        for path in files:
             parts.append(f"\n## {path.relative_to(folder)}\n\n```python\n{path.read_text(encoding='utf-8')}\n```\n")
     return "".join(parts)
 
@@ -75,9 +80,10 @@ def parse_judgement(text: str) -> str | None:
             data, _ = decoder.raw_decode(text, start)
         except json.JSONDecodeError:
             continue
-        winner = data.get("winner") if isinstance(data, dict) else None
-        if winner in ("X", "Y", "TIE"):
-            return winner
+        if not isinstance(data, dict) or not isinstance(data.get("reasons"), list):
+            continue
+        if data.get("winner") in ("X", "Y", "TIE"):
+            return data["winner"]
     return None
 
 
@@ -92,10 +98,14 @@ def judge_pair(judge: str, task: Task, a_repo: Path, b_repo: Path, out_dir: Path
     orders = []
     for order, (x, y) in enumerate((("a", "b"), ("b", "a")), start=1):
         order_dir = out_dir / f"order-{order}"
-        cwd = order_dir / "judge"
-        shutil.copytree(exports[x], cwd / "X")
-        shutil.copytree(exports[y], cwd / "Y")
-        pick, attempts = _judge_once(judge, build_prompt(task_text, cwd / "X", cwd / "Y"), cwd, order_dir)
+        # The judge's cwd is a neutral folder outside the repo: no project instructions, no arm names in paths.
+        cwd = audit.RUNS_ROOT / secrets.token_hex(8)
+        try:
+            shutil.copytree(exports[x], cwd / "X")
+            shutil.copytree(exports[y], cwd / "Y")
+            pick, attempts = _judge_once(judge, build_prompt(task_text, cwd / "X", cwd / "Y"), cwd, order_dir)
+        finally:
+            shutil.rmtree(cwd, ignore_errors=True)
         orders.append({"x": x, "y": y, "pick": pick, "winner": {"X": x, "Y": y}.get(pick, "tie"),
                        "attempts": attempts})
     winners = {o["winner"] for o in orders}
@@ -122,7 +132,8 @@ def _judge_once(judge: str, prompt: str, cwd: Path, order_dir: Path) -> tuple[st
     run = agents.run_claude if cli == "claude" else agents.run_codex
     attempts, infra, malformed = [], 0, 0
     while True:
-        session = run(model, prompt, role=agents.JUDGE, cwd=cwd, out_dir=order_dir / f"attempt-{len(attempts) + 1}")
+        session = guarded_call(lambda out: run(model, prompt, role=agents.JUDGE, cwd=cwd, out_dir=out),
+                               order_dir / f"attempt-{len(attempts) + 1}")
         attempts.append(session.to_record())
         if session.terminal == agents.INFRA:
             infra += 1

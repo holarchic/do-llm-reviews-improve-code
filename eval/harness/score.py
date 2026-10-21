@@ -139,14 +139,20 @@ def _max_function_branches(text: str) -> int:
 
 
 def _branches(function: ast.AST) -> int:
+    """Branches in this function's own body; nested functions and classes are measured on their own."""
     count = 0
-    for node in ast.walk(function):
+    pending = list(ast.iter_child_nodes(function))
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
         if isinstance(node, _BRANCH_NODES):
             count += 1
         elif isinstance(node, ast.BoolOp):
             count += len(node.values) - 1
         elif isinstance(node, ast.comprehension):
             count += len(node.ifs)
+        pending.extend(ast.iter_child_nodes(node))
     return count
 
 

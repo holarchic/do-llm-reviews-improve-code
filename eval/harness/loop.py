@@ -6,12 +6,14 @@ holds the latest attempt and an infrastructure retry restarts from it.
 Terminal rules are the pre-registered ones in PREREG.md.
 """
 
+import io
 import json
 import re
 import secrets
 import shutil
 import subprocess
 import sys
+import tarfile
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -83,26 +85,19 @@ def execute_run(task: Task, arm_name: str, runs_root: Path, *, manifest_hash: st
     arm = ARMS[arm_name]
     run_id = f"{task.id}--{arm.name}"
     exec_dir = _next_exec_dir(runs_root.resolve() / run_id)
-    work = audit.RUNS_ROOT / f"{run_id}-{secrets.token_hex(4)}"
-    run = _Run(repo=work / "repo", exec_dir=exec_dir, arm=arm)
+    run = _Run(repo=_anonymous_workdir() / "repo", exec_dir=exec_dir, arm=arm)
     record = {"run_id": run_id, "task": task.id, "arm": arm.name, "exec": exec_dir.name,
               "manifest": manifest_hash, "cli_versions": _cli_versions(), "started": _now()}
-    try:
+
+    def work():
         _init_repo(run, task)
         (_loop if arm.reviewer else _solo)(run)
-        record["status"] = "complete"
-    except InfraExhausted as exc:
-        record.update(status="invalid", invalid_reason=str(exc))
-    except Exception:
-        # A harness exception is an infrastructure failure of this run, not a model outcome.
-        record.update(status="invalid", invalid_reason="harness error:\n" + traceback.format_exc())
-    finally:
-        if run.repo.exists():
-            shutil.copytree(run.repo, exec_dir / "repo", symlinks=True)
-        shutil.rmtree(work, ignore_errors=True)
-    if record["status"] == "complete":
-        record["scores"] = score.score_build(exec_dir / "repo", task, exec_dir / "scoring")
-    record.update(finished=_now(), flags=run.flags, rounds=run.rounds, steps=run.steps)
+
+    def scores(artifact: Path) -> dict:
+        return score.score_build(artifact, task, exec_dir / "scoring")
+
+    _execute(run, record, work, scores)
+    record.update(rounds=run.rounds)
     (exec_dir / "record.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     return record
 
@@ -117,15 +112,34 @@ def execute_followup(task: Task, build_exec_dir: Path, *, manifest_hash: str | N
     build = json.loads((build_exec_dir / "record.json").read_text(encoding="utf-8"))
     out_dir = build_exec_dir / "followup"
     out_dir.mkdir()
-    work = audit.RUNS_ROOT / f"{build['run_id']}-followup-{secrets.token_hex(4)}"
-    run = _Run(repo=work / "repo", exec_dir=out_dir, arm=ARMS[build["arm"]])
+    run = _Run(repo=_anonymous_workdir() / "repo", exec_dir=out_dir, arm=ARMS[build["arm"]])
     record = {"run_id": build["run_id"], "task": task.id, "arm": build["arm"], "build_exec": build_exec_dir.name,
               "manifest": manifest_hash, "cli_versions": _cli_versions(), "started": _now()}
-    try:
+
+    def work():
         shutil.copytree(build_exec_dir / "repo", run.repo, symlinks=True)
+        # The follow-up starts from the build's final commit, not from files it left untracked.
+        _reset(run.repo, "HEAD")
         shutil.copy2(task.path("FOLLOWUP.md"), run.repo / "FOLLOWUP.md")
         run.last_commit = _commit(run.repo, "followup task")
         _writer(run, "followup", prompts.followup_writer())
+
+    def scores(artifact: Path) -> dict:
+        return _followup_scores(task, build["scores"]["hidden_outcomes"], artifact, out_dir)
+
+    _execute(run, record, work, scores)
+    (out_dir / "record.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    return record
+
+
+def _execute(run: "_Run", record: dict, work, scores) -> None:
+    """Run the work, keep the repo, then score the final commit's files (`artifact/`).
+
+    Any failure — retries exhausted, a harness exception, a scoring crash — makes the
+    record invalid; a harness failure is never a model outcome.
+    """
+    try:
+        work()
         record["status"] = "complete"
     except InfraExhausted as exc:
         record.update(status="invalid", invalid_reason=str(exc))
@@ -133,19 +147,38 @@ def execute_followup(task: Task, build_exec_dir: Path, *, manifest_hash: str | N
         record.update(status="invalid", invalid_reason="harness error:\n" + traceback.format_exc())
     finally:
         if run.repo.exists():
-            shutil.copytree(run.repo, out_dir / "repo", symlinks=True)
-        shutil.rmtree(work, ignore_errors=True)
+            shutil.copytree(run.repo, run.exec_dir / "repo", symlinks=True)
+        shutil.rmtree(run.repo.parent, ignore_errors=True)
     if record["status"] == "complete":
-        record["scores"] = _followup_scores(task, build["scores"]["hidden_outcomes"], out_dir)
+        try:
+            artifact = run.exec_dir / "artifact"
+            materialize_head(run.exec_dir / "repo", artifact)
+            record["scores"] = scores(artifact)
+        except Exception:
+            record.update(status="invalid", invalid_reason="scoring error:\n" + traceback.format_exc())
     record.update(finished=_now(), flags=run.flags, steps=run.steps)
-    (out_dir / "record.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
-    return record
 
 
-def _followup_scores(task: Task, before: dict[str, str], out_dir: Path) -> dict:
+def materialize_head(repo: Path, dest: Path) -> None:
+    """Write the tracked files of repo's HEAD commit to dest: what the run actually committed."""
+    archive = subprocess.run(["git", "archive", "--format=tar", "HEAD"], cwd=repo, env=_git_env(),
+                             capture_output=True, check=True).stdout
+    dest.mkdir(parents=True)
+    with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+        tar.extractall(dest, filter="data")
+
+
+def _anonymous_workdir() -> Path:
+    # A neutral name: the path a session sees must not reveal its task or arm.
+    path = audit.RUNS_ROOT / secrets.token_hex(8)
+    path.mkdir(parents=True)
+    return path
+
+
+def _followup_scores(task: Task, before: dict[str, str], artifact: Path, out_dir: Path) -> dict:
     expected = task.expected()
-    base = score.run_suite(out_dir / "repo", task.path("hidden"), out_dir / "scoring" / "hidden")
-    new = score.run_suite(out_dir / "repo", task.path("hidden_followup"), out_dir / "scoring" / "followup")
+    base = score.run_suite(artifact, task.path("hidden"), out_dir / "scoring" / "hidden")
+    new = score.run_suite(artifact, task.path("hidden_followup"), out_dir / "scoring" / "followup")
     passed_before = {test_id for test_id, outcome in before.items() if outcome == "pass"}
     passed_after = base.passed()
     base_ids = set(expected["hidden"])
@@ -237,7 +270,7 @@ def _step(run: _Run, name: str, call) -> agents.Session:
     step_dir = run.exec_dir / "steps" / f"{len(run.steps):02d}-{name}"
     attempts = []
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        session = call(step_dir / f"attempt-{attempt}")
+        session = guarded_call(call, step_dir / f"attempt-{attempt}")
         attempts.append(session.to_record())
         if session.terminal != agents.INFRA:
             run.steps.append({"name": name, "attempts": attempts})
@@ -245,6 +278,16 @@ def _step(run: _Run, name: str, call) -> agents.Session:
         _reset(run.repo, run.last_commit)
     run.steps.append({"name": name, "attempts": attempts})
     raise InfraExhausted(f"{name}: {session.reason}")
+
+
+def guarded_call(call, out_dir: Path) -> agents.Session:
+    """A session that raises is an infrastructure attempt like any other, so it is recorded and retried."""
+    try:
+        return call(out_dir)
+    except Exception:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return agents.Session(agents.INFRA, "harness exception:\n" + traceback.format_exc(), "",
+                              out_dir / "transcript.jsonl", 0.0)
 
 
 def _own_tests_summary(run: _Run) -> str:
@@ -277,9 +320,12 @@ def _reset(repo: Path, commit: str) -> None:
     _git(repo, "clean", "-q", "-fdx")
 
 
+def _git_env() -> dict[str, str]:
+    return {"PATH": "/usr/bin:/bin:/opt/homebrew/bin", "HOME": str(Path.home()), **_GIT_ENV}
+
+
 def _git(repo: Path, *args: str) -> str:
-    env = {"PATH": "/usr/bin:/bin:/opt/homebrew/bin", "HOME": str(Path.home()), **_GIT_ENV}
-    completed = subprocess.run(["git", *args], cwd=repo, env=env,
+    completed = subprocess.run(["git", *args], cwd=repo, env=_git_env(),
                                capture_output=True, text=True, check=True)
     return completed.stdout
 

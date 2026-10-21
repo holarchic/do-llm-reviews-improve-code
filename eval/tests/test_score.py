@@ -82,6 +82,11 @@ class ScoreTest(unittest.TestCase):
         outcome = score.run_suite(DEV.path("reference"), DEV.path("hidden"), Path("relative-work"))
         self.assertEqual(score.pass_fraction(outcome, self.expected), 1.0)
 
+    def test_nested_function_branches_counted_separately(self):
+        source = ("def outer(x):\n    if x:\n        pass\n\n    def inner(y):\n"
+                  "        if y:\n            return 1\n        if not y:\n            return 2\n\n    return inner\n")
+        self.assertEqual(score.static_metrics(self.candidate(source)).max_function_branches, 2)
+
     def test_static_metrics(self):
         code = self.candidate("def f(x):\n    if x and x > 1:\n        return [i for i in x if i]\n    return None\n")
         (code / "test_f.py").write_text("import f\n\n\nx = 1\n")

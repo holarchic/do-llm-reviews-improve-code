@@ -49,6 +49,12 @@ class AuditTest(unittest.TestCase):
     def test_multiline_command_flagged(self):
         self.assertTrue(self.hits(self.claude_call("Bash", {"command": f"echo hi\n{PRIVATE}"})))
 
+    def test_written_content_is_not_an_access(self):
+        self.assertEqual(self.hits(self.claude_call("Write", {"file_path": "notes.py", "content": f"# see {PRIVATE}\n"})), [])
+
+    def test_eval_tree_is_private(self):
+        self.assertTrue(self.hits(self.codex_call(f"cat {audit.EVAL_ROOT / 'tasks' / 'x' / 'hidden' / 't.py'}")))
+
     def test_legitimate_session_not_flagged(self):
         events = [
             self.claude_call("Bash", {"command": "python3 -m unittest discover -s tests && git status"}),

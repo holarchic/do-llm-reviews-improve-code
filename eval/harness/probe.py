@@ -30,8 +30,13 @@ def run_probes(probe_root: Path) -> list[str]:
     canary.write_text(canary_token + "\n", encoding="utf-8")
     markers = instruction_markers()
     results = {
-        "claude_instructions": _instructions_probe("claude", stamp, markers),
-        "codex_instructions": _instructions_probe("codex", stamp, markers),
+        "claude_instructions": _instructions_probe("claude", agents.WRITER_MODEL, agents.WRITER, stamp, markers),
+        "codex_instructions": _instructions_probe("codex", agents.CROSS_REVIEWER_MODEL, agents.REVIEWER, stamp,
+                                                  markers),
+        "claude_judge_instructions": _instructions_probe("claude", agents.CLAUDE_JUDGE_MODEL, agents.JUDGE, stamp,
+                                                         markers),
+        "codex_judge_instructions": _instructions_probe("codex", agents.CODEX_JUDGE_MODEL, agents.JUDGE, stamp,
+                                                        markers),
         "claude_canary": _claude_canary_probe(stamp, canary, canary_token),
         "codex_canary": _codex_canary_probe(stamp, canary),
         "claude_reviewer_read_only": _claude_reviewer_probe(stamp),
@@ -59,16 +64,12 @@ def _run_dir(name: str) -> Path:
     return path
 
 
-def _instructions_probe(cli: str, stamp: Path, markers: list[str]) -> dict:
-    run_dir = _run_dir(f"{cli}-instructions")
+def _instructions_probe(cli: str, model: str, role: str, stamp: Path, markers: list[str]) -> dict:
+    run_dir = _run_dir(f"{cli}-{role}-instructions")
     try:
-        out_dir = stamp / f"{cli}-instructions"
-        if cli == "claude":
-            session = agents.run_claude(agents.WRITER_MODEL, QUOTE_PROMPT, role=agents.WRITER,
-                                        cwd=run_dir, out_dir=out_dir)
-        else:
-            session = agents.run_codex(agents.CROSS_REVIEWER_MODEL, QUOTE_PROMPT, role=agents.REVIEWER,
-                                       cwd=run_dir, out_dir=out_dir)
+        out_dir = stamp / f"{cli}-{role}-instructions"
+        run = agents.run_claude if cli == "claude" else agents.run_codex
+        session = run(model, QUOTE_PROMPT, role=role, cwd=run_dir, out_dir=out_dir)
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)
     problems = []

@@ -13,13 +13,16 @@ from pathlib import Path
 
 HOME = Path.home()
 RUNS_ROOT = Path("/private/tmp/eval-runs")
+EVAL_ROOT = Path(__file__).resolve().parents[1]
 PRIVATE_ROOTS = (
+    EVAL_ROOT,
     HOME / "Library" / "CloudStorage" / "Dropbox",
     HOME / "pg",
     HOME / ".claude",
     HOME / ".codex",
     RUNS_ROOT,
 )
+_ACCESS_FIELDS = ("command", "file_path", "path", "pattern", "notebook_path")
 _STOP = r"[^\s'\"`;|&<>(),=]"
 # Any token starting with ~ or .., or containing a slash: relative tokens matter
 # because a symlink planted in the run dir can point into a private root.
@@ -73,7 +76,10 @@ def _claude_tool_inputs(event: dict):
     content = message.get("content") if isinstance(message, dict) else None
     for block in content if isinstance(content, list) else []:
         if isinstance(block, dict) and block.get("type") == "tool_use":
-            yield from _strings(block.get("input", {}))
+            tool_input = block.get("input")
+            if isinstance(tool_input, dict):
+                # Only fields that name what the tool touches; file content written is not an access.
+                yield from _strings({key: value for key, value in tool_input.items() if key in _ACCESS_FIELDS})
 
 
 def _strings(value):

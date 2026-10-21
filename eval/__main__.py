@@ -22,7 +22,7 @@ def main(argv: list[str]) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     parsers = {name: sub.add_parser(name, help=help_text) for name, help_text in COMMANDS.items()}
     parsers["run"].add_argument("--task", help="run one task (a dev task, or a pilot task after freeze)")
-    parsers["run"].add_argument("--arm", choices=["A1", "A1r", "A2", "A3"], help="with --task: the arm")
+    parsers["run"].add_argument("--arm", help="with --task: the arm (A1, A1r, A2, A3)")
     parsers["judge"].add_argument("--task", help="dev task: calibrate, or judge --pair, on one task")
     parsers["judge"].add_argument("--judge", choices=["fable", "astra"], required=False)
     parsers["judge"].add_argument("--pair", nargs=2, metavar="ARM", help="with --task: judge two arms' builds")
@@ -61,8 +61,8 @@ def _run(args) -> int:
 
     if not args.task:
         return _guarded(lambda: pilot.run_builds(DATA_ROOT))
-    if not args.arm:
-        print("run: --task needs --arm", file=sys.stderr)
+    if args.arm not in loop.ARMS:
+        print(f"run: --task needs --arm, one of {', '.join(loop.ARMS)}", file=sys.stderr)
         return 2
     task = tasks.Task(tasks.TASKS_ROOT / args.task)
     if not task.is_dev:
@@ -96,7 +96,7 @@ def _judge(args) -> int:
         return 2
     stamp = time.strftime("%Y%m%dT%H%M%S")
     if args.pair:
-        a, b = (loop.latest_complete_exec(DATA_ROOT / "runs", f"{task.id}--{arm}") / "repo" for arm in args.pair)
+        a, b = (loop.latest_complete_exec(DATA_ROOT / "runs", f"{task.id}--{arm}") / "artifact" for arm in args.pair)
         result = judge.judge_pair(args.judge, task, a, b, DATA_ROOT / "dev-judgements" / f"{stamp}-{args.judge}")
     else:
         result = judge.calibrate(args.judge, task, DATA_ROOT / "dev-calibration" / f"{stamp}-{args.judge}")

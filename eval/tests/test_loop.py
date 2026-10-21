@@ -196,3 +196,60 @@ class FollowupTest(unittest.TestCase):
         record = self.followup(weak, followup)
         self.assertEqual(record["scores"]["regressions"], [])
         self.assertEqual(record["scores"]["persistent_failures"], ["test_merge.MergeTest.test_adjacent_merge"])
+
+
+class HardeningTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="eval-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp)
+
+    def run_with(self, writer, arm="A1"):
+        with mock.patch.object(agents, "run_claude", writer):
+            return loop.execute_run(DEV, arm, self.tmp, manifest_hash=None)
+
+    def test_session_exception_is_a_retried_infra_attempt(self):
+        calls = []
+
+        def writer(model, prompt, *, role, cwd, out_dir):
+            calls.append(cwd)
+            if len(calls) == 1:
+                raise OSError("spawn failed")
+            (cwd / "intervals.py").write_text(REFERENCE)
+            return session(out_dir)
+
+        record = self.run_with(writer)
+        self.assertEqual(record["status"], "complete")
+        attempts = record["steps"][0]["attempts"]
+        self.assertEqual([a["terminal"] for a in attempts], [agents.INFRA, agents.COMPLETED])
+        self.assertIn("harness exception", attempts[0]["reason"])
+
+    def test_score_uses_committed_files_only(self):
+        def writer(model, prompt, *, role, cwd, out_dir):
+            (cwd / "intervals.py").write_text(REFERENCE)
+            with open(cwd / ".gitignore", "a") as handle:
+                handle.write("intervals.py\n")
+            return session(out_dir)
+
+        record = self.run_with(writer)
+        self.assertEqual(record["scores"]["primary"], 0.0)
+        self.assertFalse((self.tmp / "dev-intervals--A1" / "exec-1" / "artifact" / "intervals.py").exists())
+
+    def test_scoring_crash_makes_run_invalid(self):
+        def writer(model, prompt, *, role, cwd, out_dir):
+            return session(out_dir)
+
+        with mock.patch.object(loop.score, "score_build", side_effect=RuntimeError("boom")):
+            record = self.run_with(writer)
+        self.assertEqual(record["status"], "invalid")
+        self.assertIn("scoring error", record["invalid_reason"])
+
+    def test_session_cwd_is_neutral(self):
+        seen = []
+
+        def writer(model, prompt, *, role, cwd, out_dir):
+            seen.append(cwd)
+            return session(out_dir)
+
+        self.run_with(writer)
+        self.assertNotIn("dev-intervals", str(seen[0]))
+        self.assertNotIn("A1", seen[0].parent.name)

@@ -18,8 +18,8 @@ from . import judge, loop, manifest, tasks
 
 SEED = 20261021
 PARALLEL = 3
-BUILD_ARMS = ("A1", "A1r", "A2", "A3")
-FOLLOWUP_ARMS = ("A1", "A2", "A3")
+BUILD_ARMS = tuple(loop.ARMS)
+FOLLOWUP_ARMS = tuple(arm for arm in loop.ARMS if arm != "A1r")
 PAIRS = (("A1", "A2"), ("A1", "A3"), ("A2", "A3"))
 
 
@@ -108,7 +108,7 @@ def run_judging(data_root: Path) -> int:
             if pair is None:
                 result = judge.calibrate(name, task, out_dir, manifest_hash=digest)
             else:
-                a, b = (builds[(task_id, arm)] / "repo" for arm in pair)
+                a, b = (builds[(task_id, arm)] / "artifact" for arm in pair)
                 result = judge.judge_pair(name, task, a, b, out_dir, manifest_hash=digest)
         except loop.InfraExhausted as exc:
             _log(f"judge {name} {task_id} {pair}: infrastructure failure: {exc}")

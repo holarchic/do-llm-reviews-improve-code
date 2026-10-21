@@ -9,13 +9,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from statistics import mean
 
-from . import manifest, pilot
+from . import loop, manifest, pilot
 
 PRIMARY_THRESHOLD = 10.0
 PRIMARY_LOSS_LIMIT = 5.0
 JUDGE_WINS_NEEDED = 4
 CALIBRATION_NEEDED = 4
-TREATMENTS = ("A2", "A3")
+# Pass fractions over different denominators make exact thresholds land a few ulps short.
+TOLERANCE = 1e-9
+TREATMENTS = tuple(name for name, arm in loop.ARMS.items() if arm.reviewer)
+_STATIC_KEYS = ("ruff_violations", "source_loc", "test_loc", "max_function_branches")
 
 
 @dataclass
@@ -43,12 +46,16 @@ def collect(data_root: Path) -> Results:
                 results.missing.append(f"build {task_id}--{arm}")
                 continue
             record = _read(exec_dir / "record.json")
+            if not _valid_build(record):
+                results.missing.append(f"malformed build record {task_id}--{arm}")
+                continue
             results.primary.setdefault(arm, {})[task_id] = 100 * record["scores"]["primary"]
             results.static.setdefault(arm, {})[task_id] = record["scores"]["static"]
             results.diagnostics.setdefault(arm, {})[task_id] = _diagnostics(record)
             if arm in pilot.FOLLOWUP_ARMS:
                 followup = _read(exec_dir / "followup" / "record.json")
-                if followup.get("status") == "complete" and followup.get("manifest") == digest:
+                if followup.get("status") == "complete" and followup.get("manifest") == digest \
+                        and _valid_followup(followup):
                     results.followup.setdefault(arm, {})[task_id] = followup["scores"]
                 else:
                     results.missing.append(f"followup {task_id}--{arm}")
@@ -56,7 +63,7 @@ def collect(data_root: Path) -> Results:
         for task_id in results.tasks:
             for pair in (None, *pilot.PAIRS):
                 judgement = _read(pilot.judging_dir(data_root, name, task_id, pair) / "judgement.json")
-                if judgement.get("manifest") != digest:
+                if judgement.get("manifest") != digest or not _valid_judgement(judgement):
                     results.missing.append(f"judge {name} {task_id} {pair or 'calibration'}")
                     continue
                 if pair is None:
@@ -85,17 +92,25 @@ def decide(results: Results) -> Decision:
     baseline = _arm_mean(results, "A1")
     for arm in TREATMENTS:
         gain = _arm_mean(results, arm) - baseline
-        if gain >= PRIMARY_THRESHOLD:
+        if _at_least(gain, PRIMARY_THRESHOLD):
             reasons.append(f"{arm} beats A1 on the primary by {gain:+.1f} points")
         if len(calibrated) == len(results.calibration) == 2:
             wins = agreed_wins(results, arm)
-            if wins >= JUDGE_WINS_NEEDED and gain >= -PRIMARY_LOSS_LIMIT:
+            if wins >= JUDGE_WINS_NEEDED and _at_least(gain, -PRIMARY_LOSS_LIMIT):
                 reasons.append(f"{arm} wins {wins}/5 judge-agreed comparisons against A1 (primary {gain:+.1f})")
-    replicate = _arm_mean(results, "A1r")
-    flips = any((_arm_mean(results, arm) - baseline >= PRIMARY_THRESHOLD)
-                != (_arm_mean(results, arm) - replicate >= PRIMARY_THRESHOLD) for arm in TREATMENTS)
+    flips = _primary_trigger(results, "A1") != _primary_trigger(results, "A1r")
     sensitivity = "changes with A1r in place of A1" if flips else "unchanged with A1r in place of A1"
     return Decision("GO" if reasons else "NO-GO", reasons, calibrated, sensitivity)
+
+
+def _at_least(value: float, bound: float) -> bool:
+    return value >= bound - TOLERANCE
+
+
+def _primary_trigger(results: Results, baseline_arm: str) -> bool:
+    """Whether the primary branch fires for any treatment against this baseline."""
+    baseline = _arm_mean(results, baseline_arm)
+    return any(_at_least(_arm_mean(results, arm) - baseline, PRIMARY_THRESHOLD) for arm in TREATMENTS)
 
 
 def agreed_wins(results: Results, arm: str) -> int:
@@ -166,8 +181,30 @@ def render(results: Results, decision: Decision) -> str:
               "- Judge calibration shows the judges see injected defects, not that they rank close builds reliably.",
               "- The treatment bundles rules, rubric, review and extra compute; A2 vs A3 compares reviewer"
               " configurations (model, CLI and tool policy together).",
-              "- Hidden tests run candidate code on the host without a sandbox.", ""]
+              "- Hidden tests run candidate code on the host without a sandbox, in the same process as the test"
+              " runner: scores assume non-adversarial candidates (a build could forge its own results).", ""]
     return "\n".join(lines)
+
+
+def _valid_build(record: dict) -> bool:
+    scores = record.get("scores")
+    return (isinstance(scores, dict) and isinstance(scores.get("primary"), (int, float))
+            and 0 <= scores["primary"] <= 1 and isinstance(scores.get("static"), dict)
+            and all(isinstance(scores["static"].get(key), int) for key in _STATIC_KEYS)
+            and isinstance(record.get("steps"), list) and isinstance(record.get("flags"), list)
+            and isinstance(record.get("rounds"), dict))
+
+
+def _valid_followup(record: dict) -> bool:
+    scores = record.get("scores")
+    return (isinstance(scores, dict) and isinstance(scores.get("new_fraction"), (int, float))
+            and all(isinstance(scores.get(key), list) for key in ("regressions", "persistent_failures", "repaired")))
+
+
+def _valid_judgement(judgement: dict) -> bool:
+    leaks = judgement.get("leak_words")
+    return (judgement.get("result") in ("a", "b", "tie") and isinstance(leaks, dict)
+            and all(isinstance(leaks.get(side), int) for side in ("a", "b")))
 
 
 def _diagnostics(record: dict) -> dict:
