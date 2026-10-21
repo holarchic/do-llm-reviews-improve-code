@@ -1,0 +1,30 @@
+{
+  "hidden": [
+    "test_logwin.ParseTest.test_basic_line",
+    "test_logwin.ParseTest.test_empty_message",
+    "test_logwin.ParseTest.test_fractional_seconds",
+    "test_logwin.ParseTest.test_invalid_lines_return_none",
+    "test_logwin.ParseTest.test_level_case_and_warning",
+    "test_logwin.ParseTest.test_message_keeps_brackets_and_spaces",
+    "test_logwin.ParseTest.test_missing_offset_is_invalid",
+    "test_logwin.ParseTest.test_negative_offset_crosses_midnight",
+    "test_logwin.ParseTest.test_offset_converted_to_utc",
+    "test_logwin.ParseTest.test_service_charset",
+    "test_logwin.ParseTest.test_unknown_level_is_invalid",
+    "test_logwin.WindowTest.test_accepts_any_iterable",
+    "test_logwin.WindowTest.test_before_epoch_floors_down",
+    "test_logwin.WindowTest.test_counts_and_order",
+    "test_logwin.WindowTest.test_epoch_alignment",
+    "test_logwin.WindowTest.test_fraction_stays_in_window",
+    "test_logwin.WindowTest.test_offsets_land_in_same_utc_window",
+    "test_logwin.WindowTest.test_rejects_bad_width",
+    "test_logwin.WindowTest.test_skips_invalid_lines",
+    "test_logwin.WindowTest.test_starts_are_utc"
+  ],
+  "hidden_followup": [
+    "test_top_services.TopServicesTest.test_invalid_arguments",
+    "test_top_services.TopServicesTest.test_level_rules_apply",
+    "test_top_services.TopServicesTest.test_n_limits",
+    "test_top_services.TopServicesTest.test_sorted_by_count_then_name"
+  ]
+}

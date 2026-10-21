@@ -1,0 +1,30 @@
+{
+  "hidden": [
+    "test_deps.CycleTest.test_cycle_outside_closure_ignored",
+    "test_deps.CycleTest.test_members_exclude_dependents",
+    "test_deps.CycleTest.test_self_dependency",
+    "test_deps.CycleTest.test_two_cycles",
+    "test_deps.MissingTest.test_missing_dependency",
+    "test_deps.MissingTest.test_missing_outside_closure_ignored",
+    "test_deps.MissingTest.test_missing_reported_before_cycle",
+    "test_deps.MissingTest.test_missing_target",
+    "test_deps.OrderTest.test_accepts_iterables",
+    "test_deps.OrderTest.test_alphabetically_smallest_order",
+    "test_deps.OrderTest.test_chain",
+    "test_deps.OrderTest.test_diamond_once",
+    "test_deps.OrderTest.test_duplicates_count_once",
+    "test_deps.OrderTest.test_graph_not_modified",
+    "test_deps.OrderTest.test_large_graph_valid_and_deterministic",
+    "test_deps.OrderTest.test_no_targets",
+    "test_deps.OrderTest.test_only_reachable_packages",
+    "test_deps.OrderTest.test_smallest_order_is_not_dfs_order"
+  ],
+  "hidden_followup": [
+    "test_installed.InstalledTest.test_cycle_behind_installed_is_ignored",
+    "test_installed.InstalledTest.test_installed_need_not_be_in_graph",
+    "test_installed.InstalledTest.test_installed_omitted",
+    "test_installed.InstalledTest.test_installed_target_omitted",
+    "test_installed.InstalledTest.test_not_traversed_past_installed",
+    "test_installed.InstalledTest.test_still_needed_elsewhere"
+  ]
+}

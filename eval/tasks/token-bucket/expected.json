@@ -1,0 +1,32 @@
+{
+  "hidden": [
+    "test_ratelimit.AcquireTest.test_acquire_removes_tokens",
+    "test_ratelimit.AcquireTest.test_fractional_tokens",
+    "test_ratelimit.AcquireTest.test_invalid_amounts_raise",
+    "test_ratelimit.AcquireTest.test_refusal_removes_nothing",
+    "test_ratelimit.AcquireTest.test_whole_capacity_can_be_acquired",
+    "test_ratelimit.ConstructionTest.test_default_clock_works",
+    "test_ratelimit.ConstructionTest.test_rejects_non_positive_parameters",
+    "test_ratelimit.ConstructionTest.test_starts_full",
+    "test_ratelimit.RefillTest.test_available_never_negative",
+    "test_ratelimit.RefillTest.test_backward_clock_adds_nothing",
+    "test_ratelimit.RefillTest.test_backward_step_not_counted_twice",
+    "test_ratelimit.RefillTest.test_float_boundary_after_many_steps",
+    "test_ratelimit.RefillTest.test_float_boundary_succeeds",
+    "test_ratelimit.RefillTest.test_one_clock_read_per_call",
+    "test_ratelimit.RefillTest.test_refill_capped_at_capacity",
+    "test_ratelimit.RefillTest.test_refills_with_time",
+    "test_ratelimit.WaitTimeTest.test_does_not_consume",
+    "test_ratelimit.WaitTimeTest.test_invalid_amounts_raise",
+    "test_ratelimit.WaitTimeTest.test_time_until_enough",
+    "test_ratelimit.WaitTimeTest.test_wait_then_acquire_succeeds",
+    "test_ratelimit.WaitTimeTest.test_zero_when_available"
+  ],
+  "hidden_followup": [
+    "test_keyed.KeyedLimiterTest.test_bucket_starts_at_first_use",
+    "test_keyed.KeyedLimiterTest.test_forget_idle_removes_only_full_buckets",
+    "test_keyed.KeyedLimiterTest.test_keys_are_independent",
+    "test_keyed.KeyedLimiterTest.test_unseen_key_reports_capacity",
+    "test_keyed.KeyedLimiterTest.test_validation"
+  ]
+}

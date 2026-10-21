@@ -1,0 +1,25 @@
+{
+  "hidden": [
+    "test_split.SplitTest.test_duplicate_sharer_counts_once",
+    "test_split.SplitTest.test_even_split",
+    "test_split.SplitTest.test_everyone_listed_in_order",
+    "test_split.SplitTest.test_leftover_cent_tie_goes_to_first",
+    "test_split.SplitTest.test_leftover_goes_to_largest_fractions",
+    "test_split.SplitTest.test_many_people_sum_exactly",
+    "test_split.SplitTest.test_no_items",
+    "test_split.SplitTest.test_shared_by_subsets",
+    "test_split.SplitTest.test_tax_and_tip_on_pre_tax_subtotal",
+    "test_split.SplitTest.test_tie_follows_people_order_not_alphabet",
+    "test_split.SplitTest.test_total_half_up_with_two_people",
+    "test_split.SplitTest.test_total_rounds_half_up",
+    "test_split.SplitTest.test_validation",
+    "test_split.SplitTest.test_zero_price_item"
+  ],
+  "hidden_followup": [
+    "test_discount.DiscountTest.test_discount_before_tax_and_tip",
+    "test_discount.DiscountTest.test_discount_rounding_rules_still_apply",
+    "test_discount.DiscountTest.test_full_discount",
+    "test_discount.DiscountTest.test_invalid_discount",
+    "test_discount.DiscountTest.test_total_rounded_once_after_discount"
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "hidden": [
+    "test_confload.FormatTest.test_accepts_pathlike_and_str",
+    "test_confload.FormatTest.test_basic_assignments",
+    "test_confload.FormatTest.test_blank_and_comment_lines_ignored",
+    "test_confload.FormatTest.test_empty_value",
+    "test_confload.FormatTest.test_include_named_key_is_assignment",
+    "test_confload.FormatTest.test_invalid_key_reports_path_and_line",
+    "test_confload.FormatTest.test_keys_case_sensitive_and_dotted",
+    "test_confload.FormatTest.test_later_assignment_overrides",
+    "test_confload.FormatTest.test_split_on_first_equals",
+    "test_confload.FormatTest.test_unparseable_line_reports_path_and_line",
+    "test_confload.IncludeTest.test_absolute_include",
+    "test_confload.IncludeTest.test_diamond_is_not_a_cycle",
+    "test_confload.IncludeTest.test_include_processed_in_place",
+    "test_confload.IncludeTest.test_indirect_cycle_reports_closing_include",
+    "test_confload.IncludeTest.test_missing_include_reports_include_line",
+    "test_confload.IncludeTest.test_relative_to_including_file_not_cwd",
+    "test_confload.IncludeTest.test_self_include_is_cycle",
+    "test_confload.InterpolationTest.test_dollar_escapes",
+    "test_confload.InterpolationTest.test_escaped_brace_not_interpolated",
+    "test_confload.InterpolationTest.test_forward_reference_is_unknown",
+    "test_confload.InterpolationTest.test_interpolates_current_value",
+    "test_confload.InterpolationTest.test_interpolation_across_include",
+    "test_confload.InterpolationTest.test_later_change_does_not_rewrite",
+    "test_confload.InterpolationTest.test_self_reference_uses_previous_value",
+    "test_confload.InterpolationTest.test_unknown_name_reports_line"
+  ],
+  "hidden_followup": [
+    "test_optional_include.OptionalIncludeTest.test_cycle_through_optional_include_still_raises",
+    "test_optional_include.OptionalIncludeTest.test_missing_optional_include_is_skipped",
+    "test_optional_include.OptionalIncludeTest.test_optional_include_relative_to_including_file",
+    "test_optional_include.OptionalIncludeTest.test_present_optional_include_is_processed",
+    "test_optional_include.OptionalIncludeTest.test_syntax_error_inside_optional_include_still_raises"
+  ]
+}
