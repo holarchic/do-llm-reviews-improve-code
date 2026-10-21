@@ -1,9 +1,9 @@
-"""Find tool calls in a session transcript that touch private material.
+"""Private roots, and a diagnostic scan of tool calls that name them.
 
-Claude writers are also denied private reads by the Bash sandbox; for Codex
-sessions this scan is the only control, so it detects access, it cannot
-prevent it. A command that builds a path at run time (string concatenation,
-environment variables) evades it — that residual risk is reported.
+The roots feed the OS-level denials (Claude's Bash sandbox, the Codex Seatbelt
+profile); those, proved by the probes, are the control. The transcript scan
+only reports which tool calls named a private path — static parsing of shell
+commands cannot be complete (`cd` chains, variables, built strings).
 """
 
 import json

@@ -7,12 +7,11 @@ pair is judged in both orders; only a pick that survives the swap is a win.
 
 import json
 import re
-import secrets
 import shutil
 from pathlib import Path
 
-from . import agents, audit
-from .loop import MAX_ATTEMPTS, InfraExhausted, guarded_call
+from . import agents
+from .loop import MAX_ATTEMPTS, InfraExhausted, anonymous_workdir, guarded_call
 from .tasks import Task
 
 JUDGES = {
@@ -88,7 +87,8 @@ def parse_judgement(text: str) -> str | None:
 
 
 def judge_pair(judge: str, task: Task, a_repo: Path, b_repo: Path, out_dir: Path, *,
-               manifest_hash: str | None = None) -> dict:
+               manifest_hash: str | None = None, builds: dict | None = None) -> dict:
+    """`builds` identifies what a and b are (exec and artifact hash), so a re-run build invalidates this."""
     """Judge builds a and b in both orders. Returns per-order picks and the combined result."""
     out_dir.mkdir(parents=True, exist_ok=False)
     exports = {"a": out_dir / "export-a", "b": out_dir / "export-b"}
@@ -99,7 +99,7 @@ def judge_pair(judge: str, task: Task, a_repo: Path, b_repo: Path, out_dir: Path
     for order, (x, y) in enumerate((("a", "b"), ("b", "a")), start=1):
         order_dir = out_dir / f"order-{order}"
         # The judge's cwd is a neutral folder outside the repo: no project instructions, no arm names in paths.
-        cwd = audit.RUNS_ROOT / secrets.token_hex(8)
+        cwd = anonymous_workdir()
         try:
             shutil.copytree(exports[x], cwd / "X")
             shutil.copytree(exports[y], cwd / "Y")
@@ -112,6 +112,7 @@ def judge_pair(judge: str, task: Task, a_repo: Path, b_repo: Path, out_dir: Path
     result = {
         "judge": judge,
         "manifest": manifest_hash,
+        "builds": builds,
         "orders": orders,
         "result": winners.pop() if len(winners) == 1 else "tie",
         "leak_words": {name: leak_count(path) for name, path in exports.items()},

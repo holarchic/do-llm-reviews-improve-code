@@ -97,7 +97,10 @@ def run_judging(data_root: Path) -> int:
     def job(item):
         name, task_id, pair = item
         out_dir = judging_dir(data_root, name, task_id, pair)
-        if records.judgement(out_dir / "judgement.json", digest) is not None:
+        identity = None if pair is None else {side: build_identity(builds[(task_id, arm)])
+                                              for side, arm in zip(("a", "b"), pair)}
+        existing = records.judgement(out_dir / "judgement.json", digest)
+        if existing is not None and existing.get("builds") == identity:
             return True
         _set_aside(out_dir)
         task = by_id[task_id]
@@ -106,7 +109,7 @@ def run_judging(data_root: Path) -> int:
                 result = judge.calibrate(name, task, out_dir, manifest_hash=digest)
             else:
                 a, b = (builds[(task_id, arm)] / "artifact" for arm in pair)
-                result = judge.judge_pair(name, task, a, b, out_dir, manifest_hash=digest)
+                result = judge.judge_pair(name, task, a, b, out_dir, manifest_hash=digest, builds=identity)
         except loop.InfraExhausted as exc:
             _log(f"judge {name} {task_id} {pair}: infrastructure failure: {exc}")
             return False
@@ -117,6 +120,10 @@ def run_judging(data_root: Path) -> int:
         results = list(pool.map(job, judge_schedule()))
     _log(f"judgements: {sum(results)}/{len(results)} complete")
     return 0 if all(results) else 1
+
+
+def build_identity(exec_dir: Path) -> dict:
+    return {"exec": exec_dir.name, "artifact": loop.artifact_digest(exec_dir / "artifact")}
 
 
 def judging_dir(data_root: Path, name: str, task_id: str, pair: tuple[str, str] | None) -> Path:

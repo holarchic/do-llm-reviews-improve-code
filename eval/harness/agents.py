@@ -10,8 +10,12 @@ Isolation:
   denyRead over the private roots, and denies native file tools the same roots
   (denyRead does not govern them). The sandbox fails closed.
 - Codex: a throwaway CODEX_HOME holding only auth and effort, so no global
-  AGENTS.md or config loads. The read-only sandbox blocks writes, not reads;
-  the transcript audit is the control there.
+  AGENTS.md or config loads. Codex's own read-only sandbox blocks writes, not
+  reads, so Codex runs inside an outer macOS Seatbelt profile instead (its own
+  sandbox bypassed, as Codex documents for externally sandboxed runs) that
+  denies reads of the private roots and other runs, and writes to its cwd.
+- The transcript audit is a diagnostic: access is denied by the OS, and the
+  probes prove it. Audit hits are recorded, not counted as contamination.
 """
 
 import json
@@ -120,25 +124,52 @@ def run_codex(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path) -
     out_dir = out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     final_path = out_dir / "final.txt"
-    argv = codex_argv(model, prompt, final_path)
-    (out_dir / "argv.json").write_text(json.dumps(argv, indent=2), encoding="utf-8")
     transcript = out_dir / "transcript.jsonl"
     codex_home = Path(tempfile.mkdtemp(prefix="eval-codex-home-"))
     try:
         os.chmod(codex_home, 0o700)
         shutil.copy2(Path.home() / ".codex" / "auth.json", codex_home / "auth.json")
         (codex_home / "config.toml").write_text(f'model_reasoning_effort = "{CODEX_EFFORT}"\n', encoding="utf-8")
+        profile = out_dir / "seatbelt.sb"
+        profile.write_text(codex_seatbelt_profile(cwd), encoding="utf-8")
+        # Every file Codex touches lives in its own home and is copied out after: out_dir is under a
+        # read-denied root, and node aborts at start-up if it cannot stat its stdout.
+        inner = {name: codex_home / name for name in ("final.txt", "transcript.jsonl", "stderr.log")}
+        argv = ["sandbox-exec", "-f", str(profile), *codex_argv(model, prompt, inner["final.txt"])]
+        (out_dir / "argv.json").write_text(json.dumps(argv, indent=2), encoding="utf-8")
         env = {**os.environ, "CODEX_HOME": str(codex_home)}
-        proc = procs.run(argv, cwd=cwd, timeout=TIMEOUT_SECONDS[role], stdout_path=transcript,
-                         stderr_path=out_dir / "stderr.log", env=env)
+        proc = procs.run(argv, cwd=cwd, timeout=TIMEOUT_SECONDS[role], stdout_path=inner["transcript.jsonl"],
+                         stderr_path=inner["stderr.log"], env=env)
+        for name, path in inner.items():
+            if path.exists():
+                shutil.copy2(path, out_dir / name)
     finally:
         shutil.rmtree(codex_home, ignore_errors=True)
     return _finish(classify_codex(transcript, final_path, proc, role, model), cwd)
 
 
+def codex_seatbelt_profile(cwd: Path) -> str:
+    """Deny reads of every private root and of other runs, and writes to the session's cwd.
+    Later rules win in Seatbelt, so the cwd is re-allowed for reading after the runs root is denied."""
+    own = os.path.realpath(cwd)
+    denied = " ".join(f'(subpath "{root}")' for root in audit.sandbox_deny_roots())
+    runs_roots = sorted({str(audit.RUNS_ROOT), os.path.realpath(audit.RUNS_ROOT)})
+    runs = " ".join(f'(subpath "{root}")' for root in runs_roots)
+    # Stat (not list) of the runs root itself: node aborts at start-up if it cannot resolve its cwd.
+    runs_stat = " ".join(f'(literal "{root}")' for root in runs_roots)
+    return (
+        "(version 1)\n(allow default)\n"
+        f"(deny file-read* {denied} {runs})\n"
+        f"(allow file-read-metadata {runs_stat})\n"
+        f'(allow file-read* (subpath "{own}"))\n'
+        f'(deny file-write* (subpath "{own}"))\n'
+    )
+
+
 def codex_argv(model: str, prompt: str, final_path: Path) -> list[str]:
     return [
-        "codex", "--sandbox=read-only", "-m", model, "-c", f"model_reasoning_effort={CODEX_EFFORT}",
+        "codex", "--dangerously-bypass-approvals-and-sandbox", "-m", model,
+        "-c", f"model_reasoning_effort={CODEX_EFFORT}",
         "exec", "--skip-git-repo-check", "--ephemeral", "--json", "-o", str(final_path), prompt,
     ]
 
@@ -187,9 +218,7 @@ def _timed_out(transcript: Path, proc: procs.ProcResult, role: str, *, final_tex
 
 def _finish(session: Session, cwd: Path) -> Session:
     hits = audit.audit_transcript(session.transcript, cwd)
-    if not hits:
-        return session
-    return Session(INFRA, "contamination: private path in a tool call", "", session.transcript,
+    return Session(session.terminal, session.reason, session.final_text, session.transcript,
                    session.seconds, session.usage, session.reported_models, hits)
 
 

@@ -7,10 +7,13 @@ counts it as missing.
 """
 
 import json
+import math
 from pathlib import Path
 
 _STATIC_KEYS = ("ruff_violations", "source_loc", "test_loc", "max_function_branches")
 _FOLLOWUP_LISTS = ("regressions", "persistent_failures", "repaired")
+_IDENTITY = ("run_id", "task", "arm")
+_TOKEN_KEYS = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens")
 
 
 def build(path: Path, digest: str) -> dict | None:
@@ -20,9 +23,11 @@ def build(path: Path, digest: str) -> dict | None:
         return None
     scores = record.get("scores")
     valid = (
-        isinstance(scores, dict)
-        and _number(scores.get("primary")) and 0 <= scores["primary"] <= 1
+        _identity(record)
+        and isinstance(scores, dict)
+        and _fraction(scores.get("primary"))
         and isinstance(scores.get("hidden_outcomes"), dict)
+        and all(isinstance(v, str) for v in scores["hidden_outcomes"].values())
         and isinstance(scores.get("static"), dict)
         and all(isinstance(scores["static"].get(key), int) for key in _STATIC_KEYS)
         and _valid_steps(record.get("steps"))
@@ -38,9 +43,11 @@ def followup(path: Path, digest: str) -> dict | None:
         return None
     scores = record.get("scores")
     valid = (
-        isinstance(scores, dict)
-        and _number(scores.get("new_fraction"))
-        and all(isinstance(scores.get(key), list) for key in _FOLLOWUP_LISTS)
+        _identity(record)
+        and isinstance(scores, dict)
+        and _fraction(scores.get("new_fraction"))
+        and all(isinstance(scores.get(key), list) and all(isinstance(i, str) for i in scores[key])
+                for key in _FOLLOWUP_LISTS)
     )
     return record if valid else None
 
@@ -72,14 +79,26 @@ def _valid_steps(steps) -> bool:
         if not isinstance(step, dict) or not isinstance(step.get("attempts"), list):
             return False
         for attempt in step["attempts"]:
-            if not (isinstance(attempt, dict) and _number(attempt.get("seconds"))
+            if not (isinstance(attempt, dict) and _count(attempt.get("seconds"))
                     and isinstance(attempt.get("usage"), dict)):
+                return False
+            usage = attempt["usage"]
+            if not all(_count(usage[key]) for key in _TOKEN_KEYS if key in usage):
                 return False
     return True
 
 
-def _number(value) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+def _identity(record: dict) -> bool:
+    return all(isinstance(record.get(key), str) for key in _IDENTITY)
+
+
+def _count(value) -> bool:
+    """A finite, non-negative number."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value < math.inf
+
+
+def _fraction(value) -> bool:
+    return _count(value) and value <= 1
 
 
 def _object(path: Path) -> dict | None:

@@ -66,9 +66,13 @@ Otherwise the verdict is "did not meet the continuation threshold". The report a
 | Model timeout (writer, reviewer, follow-up) | HEAD is scored |
 | Malformed reviewer verdict | Counts as YELLOW and uses up the round |
 | Malformed judge output | Retried once, then a tie for that order |
-| Infrastructure failure: provider error, non-zero exit, missing final result, judge timeout, harness exception, or the auditor flagging access to private material | The step is retried from the last harness commit, up to 3 attempts in total |
+| Infrastructure failure: provider error, non-zero exit, missing final result, judge timeout, or harness exception | The step is retried from the last harness commit, up to 3 attempts in total |
 
 With no operator in the loop, a RED verdict is handled like YELLOW (the writer revises), and a YELLOW whose findings are all LOW does not block, as in the product. A plan review that reaches the cap without GREEN still goes on to the build. A phase review that reaches the cap without GREEN has HEAD scored. If a step still fails after 3 attempts, the pilot is INCOMPLETE and gets no verdict. Every task stays in every arm's denominator.
+
+## Isolation
+
+Every session runs without the operator's global instructions. Reads of private material (tasks' hidden suites and references, other runs, the operator's configuration) are denied by the operating system: Claude Code's Bash sandbox and file-tool deny rules, and an outer macOS sandbox profile around Codex. Run folders have random names under a folder no session can list. `python3 -m eval probe` proves each denial with a positive control before the pilot. Tool calls that name a private path are recorded as a diagnostic; they do not void an attempt, since the read itself is refused.
 
 ## Schedule
 

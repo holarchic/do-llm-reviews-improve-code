@@ -29,24 +29,30 @@ class ReportTest(unittest.TestCase):
         for arm in pilot.BUILD_ARMS:
             for task in TASKS:
                 exec_dir = self.root / "runs" / f"{task}--{arm}" / "exec-1"
+                identity = {"run_id": f"{task}--{arm}", "task": task, "arm": arm}
+                (exec_dir / "artifact").mkdir(parents=True, exist_ok=True)
+                (exec_dir / "artifact" / "m.py").write_text(f"# {task} {arm}\n")
                 self.write(exec_dir / "record.json", {
-                    "status": "complete", "manifest": "d", "steps": [], "rounds": {}, "flags": [],
+                    **identity, "status": "complete", "manifest": "d", "steps": [], "rounds": {}, "flags": [],
                     "scores": {"primary": primary[arm][task] if isinstance(primary[arm], dict) else primary[arm],
                                "static": STATIC, "hidden_outcomes": {}}})
                 if arm in pilot.FOLLOWUP_ARMS:
                     self.write(exec_dir / "followup" / "record.json", {
-                        "status": "complete", "manifest": "d",
+                        **identity, "status": "complete", "manifest": "d",
                         "scores": {"new_fraction": 1.0, "regressions": [], "persistent_failures": [], "repaired": []}})
         calibration = calibration or {}
         for name in pilot.judge.JUDGES:
             for task in TASKS:
                 for pair in (None, *pilot.PAIRS):
                     if pair is None:
-                        result = "a" if calibration.get(name, True) else "tie"
+                        result, builds = ("a" if calibration.get(name, True) else "tie"), None
                     else:
                         result = judged.get(name, {}).get("-".join(pair), "tie")
+                        builds = {side: pilot.build_identity(self.root / "runs" / f"{task}--{arm}" / "exec-1")
+                                  for side, arm in zip(("a", "b"), pair)}
                     self.write(pilot.judging_dir(self.root, name, task, pair) / "judgement.json",
-                               {"manifest": "d", "result": result, "leak_words": {"a": 0, "b": 2}})
+                               {"manifest": "d", "result": result, "builds": builds,
+                                "leak_words": {"a": 0, "b": 2}})
 
     def decide(self):
         results = report.collect(self.root)
@@ -113,9 +119,20 @@ class ReportTest(unittest.TestCase):
         self.populate({"A1": 0.6, "A1r": 0.65, "A2": 0.7, "A3": 0.8}, {})
         self.assertEqual(self.decide().primary_sensitivity, "unchanged with A1r in place of A1")
 
+    def test_judgement_of_a_replaced_build_is_not_reused(self):
+        self.populate({"A1": 0.7, "A1r": 0.7, "A2": 0.7, "A3": 0.7}, {"fable": {"A1-A2": "b"}, "astra": {"A1-A2": "b"}})
+        self.assertEqual(self.decide().verdict, "GO")
+        (self.root / "runs" / f"{TASKS[0]}--A2" / "exec-1" / "artifact" / "m.py").write_text("# rebuilt\n")
+        decision = self.decide()
+        self.assertEqual(decision.verdict, "INCOMPLETE")
+
     def test_malformed_nested_fields_are_incomplete(self):
         self.populate({"A1": 0.7, "A1r": 0.7, "A2": 0.9, "A3": 0.7}, {})
-        for patch in ({"steps": [{}]}, {"flags": [None]}, {"rounds": {"plan": "x"}}):
+        attempt = {"seconds": 1.0, "usage": {"input_tokens": None}}
+        for patch in ({"steps": [{}]}, {"flags": [None]}, {"rounds": {"plan": "x"}},
+                      {"steps": [{"attempts": [attempt]}]},
+                      {"steps": [{"attempts": [{"seconds": float("nan"), "usage": {}}]}]},
+                      {"run_id": None}):
             with self.subTest(patch=patch):
                 record = self.root / "runs" / f"{TASKS[0]}--A3" / "exec-1" / "record.json"
                 data = json.loads(record.read_text())

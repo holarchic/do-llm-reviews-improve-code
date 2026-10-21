@@ -58,6 +58,13 @@ def collect(data_root: Path) -> Results:
             for pair in (None, *pilot.PAIRS):
                 judgement = records.judgement(pilot.judging_dir(data_root, name, task_id, pair) / "judgement.json",
                                               digest)
+                if judgement is not None and pair is not None:
+                    # A judgement counts only for the builds now on record.
+                    execs = [pilot.complete_build(runs_root, task_id, arm, digest) for arm in pair]
+                    current = None if None in execs else {side: pilot.build_identity(e)
+                                                          for side, e in zip(("a", "b"), execs)}
+                    if judgement.get("builds") != current:
+                        judgement = None
                 if judgement is None:
                     results.missing.append(f"judge {name} {task_id} {pair or 'calibration'}")
                     continue

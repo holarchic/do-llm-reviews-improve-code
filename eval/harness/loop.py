@@ -6,6 +6,7 @@ holds the latest attempt and an infrastructure retry restarts from it.
 Terminal rules are the pre-registered ones in PREREG.md.
 """
 
+import hashlib
 import io
 import json
 import re
@@ -19,7 +20,7 @@ import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import agents, audit, procs, prompts, score
+from . import agents, audit, procs, prompts, records, score
 from .tasks import Task
 
 MAX_ATTEMPTS = 3
@@ -89,7 +90,7 @@ def execute_run(task: Task, arm_name: str, runs_root: Path, *, manifest_hash: st
     arm = ARMS[arm_name]
     run_id = f"{task.id}--{arm.name}"
     exec_dir = _next_exec_dir(runs_root.resolve() / run_id)
-    run = _Run(repo=_anonymous_workdir() / "repo", exec_dir=exec_dir, arm=arm)
+    run = _Run(repo=anonymous_workdir() / "repo", exec_dir=exec_dir, arm=arm)
     record = {"run_id": run_id, "task": task.id, "arm": arm.name, "exec": exec_dir.name,
               "manifest": manifest_hash, "cli_versions": _cli_versions(), "started": _now()}
 
@@ -113,10 +114,12 @@ def execute_followup(task: Task, build_exec_dir: Path, *, manifest_hash: str | N
     tests that failed before are reported apart, so a weak build isn't penalised twice.
     """
     build_exec_dir = build_exec_dir.resolve()
-    build = json.loads((build_exec_dir / "record.json").read_text(encoding="utf-8"))
+    build = records.build(build_exec_dir / "record.json", manifest_hash)
+    if build is None:
+        raise ValueError(f"no complete build record under this manifest in {build_exec_dir}")
     out_dir = build_exec_dir / "followup"
     out_dir.mkdir()
-    run = _Run(repo=_anonymous_workdir() / "repo", exec_dir=out_dir, arm=ARMS[build["arm"]])
+    run = _Run(repo=anonymous_workdir() / "repo", exec_dir=out_dir, arm=ARMS[build["arm"]])
     record = {"run_id": build["run_id"], "task": task.id, "arm": build["arm"], "build_exec": build_exec_dir.name,
               "manifest": manifest_hash, "cli_versions": _cli_versions(), "started": _now()}
 
@@ -178,10 +181,22 @@ def materialize_head(repo: Path, dest: Path) -> None:
         tar.extractall(dest, filter="data")
 
 
-def _anonymous_workdir() -> Path:
-    # A neutral name: the path a session sees must not reveal its task or arm.
+def artifact_digest(artifact: Path) -> str:
+    """Content hash of a build artifact: which exact files a judgement saw."""
+    digest = hashlib.sha256()
+    for path in sorted(p for p in artifact.rglob("*") if p.is_file()):
+        digest.update(str(path.relative_to(artifact)).encode() + b"\0" + path.read_bytes() + b"\0")
+    return digest.hexdigest()
+
+
+def anonymous_workdir() -> Path:
+    """A neutral, unguessable dir under the runs root. The root is not listable even by its
+    owner (0311: write and traverse only), so a session cannot find another run's dir;
+    the name reveals no task or arm."""
+    audit.RUNS_ROOT.mkdir(parents=True, exist_ok=True)
+    audit.RUNS_ROOT.chmod(0o311)
     path = audit.RUNS_ROOT / secrets.token_hex(8)
-    path.mkdir(parents=True)
+    path.mkdir()
     return path
 
 
