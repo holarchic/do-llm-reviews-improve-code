@@ -5,22 +5,26 @@ from eval.harness import agents, experiments, openrouter, probe
 
 
 class ProbePlanTest(unittest.TestCase):
-    def test_pilot_keeps_its_eight_probes_on_its_own_agents(self):
+    def test_pilot_probes_its_own_agents(self):
         plan = {p.name: p for p in probe.probe_plan(experiments.PILOT)}
         self.assertEqual(set(plan), {"claude_instructions", "codex_instructions", "claude_judge_instructions",
                                      "codex_judge_instructions", "claude_canary", "codex_canary",
-                                     "claude_reviewer_read_only", "codex_writer"})
+                                     "claude_reviewer_read_only"})
         self.assertEqual(plan["claude_canary"].agent, experiments.HAIKU)
-        self.assertEqual((plan["codex_writer"].agent, plan["codex_writer"].role), (experiments.LUNA, agents.WRITER))
+
+    def test_a_codex_writer_gets_the_writer_control(self):
+        plan = {p.name: p for p in probe.probe_plan(experiments.EXPERIMENTS["reverse-sonnet"])}
+        self.assertEqual((plan["codex_writer"].agent, plan["codex_writer"].role),
+                         (experiments.TERRA, agents.WRITER))
 
     def test_pilot2_probes_every_routed_session_and_the_key(self):
         plan = {p.name: p for p in probe.probe_plan(experiments.PILOT2)}
         self.assertEqual(set(plan), {"claude_instructions", "codex_instructions",
-                                     "codex_instructions:z-ai/glm-5.3-flash", "claude_canary", "codex_canary",
-                                     "codex_writer", "claude_key", "codex_key", "claude_passthrough",
+                                     "codex_instructions:z-ai/glm-4.7-flash", "claude_canary", "codex_canary",
+                                     "claude_key", "codex_key", "claude_passthrough",
                                      "codex_passthrough"})
         self.assertTrue(all(p.agent.provider == agents.OPENROUTER for p in plan.values()))
-        self.assertEqual(plan["claude_key"].agent, experiments.DEEPSEEK_WRITER)
+        self.assertEqual(plan["claude_key"].agent, experiments.QWEN_WRITER)
         self.assertEqual(plan["codex_key"].role, agents.REVIEWER)
 
 

@@ -103,11 +103,11 @@ class DecisionTest(unittest.TestCase):
 
 class CostTest(unittest.TestCase):
     def test_codex_counts_cached_inside_input_claude_apart(self):
-        price = openrouter.PRICES["z-ai/glm-5.3-flash"]
-        codex = replicated.session_cost("z-ai/glm-5.3-flash",
+        price = openrouter.PRICES["z-ai/glm-4.7-flash"]
+        codex = replicated.session_cost("z-ai/glm-4.7-flash",
                                         {"input_tokens": 1_000_000, "cached_input_tokens": 400_000, "output_tokens": 0})
         self.assertAlmostEqual(codex, 0.6 * price.input + 0.4 * price.cache_read)
-        claude = replicated.session_cost("z-ai/glm-5.3-flash", {"input_tokens": 600_000, "cache_read_input_tokens":
+        claude = replicated.session_cost("z-ai/glm-4.7-flash", {"input_tokens": 600_000, "cache_read_input_tokens":
                                                                 400_000, "output_tokens": 1_000_000})
         self.assertAlmostEqual(claude, 0.6 * price.input + 0.4 * price.cache_read + price.output)
 

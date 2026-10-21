@@ -12,7 +12,7 @@ from unittest import mock
 from eval.harness import agents, openrouter, procs
 
 KEY = "sk-or-v1-SYNTHETIC0123456789abcdef"
-MODEL = "deepseek/deepseek-v4.1-flash"
+MODEL = "qwen/qwen3-coder-30b-a3b-instruct"
 
 
 class _KeyFile(unittest.TestCase):
@@ -75,7 +75,7 @@ class RoutedSessionTest(_KeyFile):
         self.assertNotIn("apiKeyHelper", agents.claude_settings(agents.WRITER, self.tmp))
 
     def test_codex_holds_the_key_in_its_process_and_excludes_it_from_shells(self):
-        call = self.capture(agents.run_codex, "z-ai/glm-5.3-flash")
+        call = self.capture(agents.run_codex, "z-ai/glm-4.7-flash")
         self.assert_key_nowhere_saved(call)
         self.assertEqual(call["env"]["OPENROUTER_API_KEY"], KEY)
         self.assertNotIn("ANTHROPIC_API_KEY", call["env"])

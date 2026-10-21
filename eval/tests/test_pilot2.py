@@ -38,7 +38,7 @@ class ShapeTest(unittest.TestCase):
         a2, a3 = PILOT2.arm("A2").reviewer, PILOT2.arm("A3").reviewer
         self.assertEqual((a2.cli, a2.provider), (a3.cli, a3.provider))
         self.assertNotEqual(a2.model, a3.model)
-        self.assertEqual({arm.writer for arm in PILOT2.arms}, {experiments.DEEPSEEK_WRITER})
+        self.assertEqual({arm.writer for arm in PILOT2.arms}, {experiments.QWEN_WRITER})
 
 
 class SpendCapTest(unittest.TestCase):
@@ -57,6 +57,12 @@ class SpendCapTest(unittest.TestCase):
         self.assertTrue(self.admit(5.9))  # a new SpendCap: the resumed run keeps the first baseline
         self.assertFalse(self.admit(6.0))
         self.assertAlmostEqual(openrouter.spent(self.ledger, "scored"), 1.0)
+
+    def test_settle_records_the_last_jobs_spend(self):
+        self.assertTrue(self.admit(5.0))
+        with mock.patch.object(openrouter, "credit_used", return_value=5.4):
+            openrouter.SpendCap(self.ledger, "scored", 1.0).settle()
+        self.assertAlmostEqual(openrouter.spent(self.ledger, "scored"), 0.4)
 
     def test_unreadable_usage_refuses(self):
         self.assertFalse(self.admit(None))

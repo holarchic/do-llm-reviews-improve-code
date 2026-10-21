@@ -56,8 +56,8 @@ class Price:
 
 
 PRICES = {
-    "deepseek/deepseek-v4.1-flash": Price(input=0.02394, cache_read=0.000342, output=0.375),
-    "z-ai/glm-5.3-flash": Price(input=0.15, cache_read=0.03, output=0.5),
+    "qwen/qwen3-coder-30b-a3b-instruct": Price(input=0.07, cache_read=0.07, output=0.28),
+    "z-ai/glm-4.7-flash": Price(input=0.0605, cache_read=0.01, output=0.4),
 }
 
 
@@ -164,6 +164,19 @@ class SpendCap:
             self.ledger.parent.mkdir(parents=True, exist_ok=True)
             self.ledger.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
             return used - entry["baseline"] < self.cap_usd
+
+    def settle(self) -> None:
+        """Record a final reading once the jobs are done, so the ledger's spend includes the last ones.
+        (OpenRouter bills a request when it finishes; a reading taken right away can lag slightly.)"""
+        with self._lock:
+            try:
+                used = credit_used()
+            except CreditUnavailable:
+                return
+            entries = self._read()
+            if self.phase in entries:
+                entries[self.phase]["readings"].append(used)
+                self.ledger.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
 
     def _read(self) -> dict:
         try:

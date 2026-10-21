@@ -37,8 +37,9 @@ class Probe:
 
 def probe_plan(experiment) -> list[Probe]:
     """The probes an experiment's agents need: instructions for each distinct session, the canaries
-    on its writer and first Codex reviewer, the reviewer and Codex-writer controls, judges when it
-    judges, and a key probe for each routed CLI."""
+    on its writer and first Codex reviewer, the reviewer control when a Claude session reviews, the
+    Codex-writer control when a Codex session writes, judges when it judges, and the key and
+    pass-through probes for each routed CLI."""
     writer = experiment.arms[0].writer
     reviewers = list(dict.fromkeys(arm.reviewer for arm in experiment.arms if arm.reviewer is not None))
     plan, names = [], set()
@@ -63,9 +64,8 @@ def probe_plan(experiment) -> list[Probe]:
     claude_reviewers = [r for r in reviewers if r.cli == "claude"]
     if claude_reviewers:
         add("claude_reviewer_read_only", "claude_reviewer", claude_reviewers[0], agents.REVIEWER)
-    codex_writer = writer if writer.cli == "codex" else (codex_reviewers or [None])[0]
-    if codex_writer is not None:
-        add("codex_writer", "codex_writer", codex_writer, agents.WRITER)
+    if writer.cli == "codex":
+        add("codex_writer", "codex_writer", writer, agents.WRITER)
     routed = [(writer, agents.WRITER)] + [(r, agents.REVIEWER) for r in reviewers]
     for cli in ("claude", "codex"):
         agent, role = next(((a, role) for a, role in routed if a.cli == cli and a.provider == agents.OPENROUTER),
@@ -329,17 +329,30 @@ print(open("permitted.txt").read().strip())
 """
 
 
+KEY_PROBE_ATTEMPTS = 3
+
+
 def _key_probe(probe: Probe, stamp: Path) -> dict:
     """A routed session's tool shell holds no credential variable and cannot read the key file. The script
     prints variable names and outcomes only, never a value. Whether `ps` could see another process's
-    environment is reported, not failed: the operator accepted the key in the session processes."""
+    environment is reported, not failed: the operator accepted the key in the session processes.
+
+    A weak model sometimes writes its tool call as text instead of making it; that attempt proves
+    nothing either way, so the probe tries again (still failing if no attempt ran the script)."""
+    for attempt in range(1, KEY_PROBE_ATTEMPTS + 1):
+        found = _key_probe_once(probe, stamp / f"{_slug(probe.name)}-{attempt}")
+        if not any("vacuous" in problem for problem in found["problems"]):
+            break
+    return {**found, "attempts": attempt}
+
+
+def _key_probe_once(probe: Probe, out_dir: Path) -> dict:
     run_dir = _run_dir(probe.name)
     permitted_token = f"PERMITTED-{secrets.token_hex(8)}"
     (run_dir / "permitted.txt").write_text(permitted_token + "\n", encoding="utf-8")
     (run_dir / "envcheck.py").write_text(KEY_SCRIPT, encoding="utf-8")
     prompt = (f"Run exactly `python3 envcheck.py {openrouter.KEY_PATH}` with your shell tool, once, and report its "
               "full raw output.")
-    out_dir = stamp / _slug(probe.name)
     try:
         session = agents.run(probe.agent, prompt, role=probe.role, cwd=run_dir, out_dir=out_dir)
     finally:

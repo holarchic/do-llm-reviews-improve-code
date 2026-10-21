@@ -100,6 +100,8 @@ def run_builds(data_root: Path, experiment: Experiment) -> int:
 
     with ThreadPoolExecutor(experiment.parallel) as pool:
         results = list(pool.map(job, jobs))
+    if cap is not None:
+        cap.settle()
     _log(f"builds: {sum(results)}/{len(results)} complete")
     return 0 if all(results) else 1
 
@@ -125,7 +127,10 @@ def run_calibration(data_root: Path, experiment: Experiment, task_ids: list[str]
 
     # One worker per task: a task's replicates run one after another.
     with ThreadPoolExecutor(max(1, len(task_ids))) as pool:
-        return [record for built in pool.map(job, task_ids) if built for record in built]
+        built = [record for records_ in pool.map(job, task_ids) if records_ for record in records_]
+    if cap is not None:
+        cap.settle()
+    return built
 
 
 def run_judging(data_root: Path, experiment: Experiment) -> int:

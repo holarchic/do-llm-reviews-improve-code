@@ -26,9 +26,11 @@ OPUS = Agent("claude", "claude-opus-5-5")
 LUNA = Agent("codex", "gpt-6-luna")
 TERRA = Agent("codex", "gpt-5.6-terra")
 SOL = Agent("codex", "gpt-6.1-sol")
-DEEPSEEK_WRITER = Agent("claude", "deepseek/deepseek-v4.1-flash", OPENROUTER)
-DEEPSEEK_REVIEWER = Agent("codex", "deepseek/deepseek-v4.1-flash", OPENROUTER)
-GLM_REVIEWER = Agent("codex", "z-ai/glm-5.3-flash", OPENROUTER)
+# Pilot 2's writer tier: DeepSeek V4.1 Flash solved the calibrated tasks at 100%, so the writer is a
+# ~30B mixture-of-experts coder, reviewed by itself or by GLM's model of the same size class.
+QWEN_WRITER = Agent("claude", "qwen/qwen3-coder-30b-a3b-instruct", OPENROUTER)
+QWEN_REVIEWER = Agent("codex", "qwen/qwen3-coder-30b-a3b-instruct", OPENROUTER)
+GLM_REVIEWER = Agent("codex", "z-ai/glm-4.7-flash", OPENROUTER)
 
 PILOT_TASKS = ("bill-split", "config-includes", "dep-resolver", "log-windows", "token-bucket")
 PILOT2_TASKS = ("calc-expr", "cron-next", "ignore-match", "json-patch", "semver-range")
@@ -131,8 +133,7 @@ PILOT = _families("pilot", "Eval pilot report", HAIKU, HAIKU, LUNA, 20261021, "P
 PILOT2 = Experiment(
     name="pilot2",
     title="Eval pilot 2 report",
-    arms=(Arm("A1", DEEPSEEK_WRITER), Arm("A2", DEEPSEEK_WRITER, DEEPSEEK_REVIEWER),
-          Arm("A3", DEEPSEEK_WRITER, GLM_REVIEWER)),
+    arms=(Arm("A1", QWEN_WRITER), Arm("A2", QWEN_WRITER, QWEN_REVIEWER), Arm("A3", QWEN_WRITER, GLM_REVIEWER)),
     baseline="A1",
     replicate=None,
     followup_arms=(),
