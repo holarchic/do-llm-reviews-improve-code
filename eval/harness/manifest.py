@@ -16,6 +16,7 @@ import hashlib
 import json
 from pathlib import Path
 
+from . import tasks
 from .prompts import BUILD_LOOP_SKILL, CODEX_REVIEW_SKILL, REPO_ROOT, RUBRIC
 
 EVAL_ROOT = REPO_ROOT / "eval"
@@ -61,6 +62,13 @@ def freeze(experiment) -> str:
     prereg = EVAL_ROOT / experiment.prereg
     if not prereg.is_file():
         raise ManifestMismatch(f"no pre-registration for {experiment.name}: write {prereg.relative_to(REPO_ROOT)}")
+    missing = [problem for task_id in experiment.tasks
+               for problem in tasks.missing_parts(tasks.Task(EVAL_ROOT / "tasks" / task_id),
+                                                  followup=bool(experiment.followup_arms),
+                                                  degraded=bool(experiment.pairs),
+                                                  mutants=experiment.report == "replicated")]
+    if missing:
+        raise ManifestMismatch("tasks lack what the experiment uses (run validate first): " + "; ".join(missing))
     files = compute(experiment)
     payload = {"files": files, "digest": digest(files)}
     if experiment.name != PILOT_NAME:

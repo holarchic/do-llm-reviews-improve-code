@@ -49,6 +49,15 @@ def run_suite(code_dir: Path, suite_dir: Path, work_dir: Path, *, timeout: float
     return SuiteOutcome(outcomes=outcomes, timed_out=results.timed_out)
 
 
+def run_in_place(code_dir: Path, work_dir: Path, *, pattern: str = "test*.py",
+                 timeout: float = SUITE_SECONDS) -> SuiteOutcome:
+    """Run the tests that live in code_dir, from one copy of it that is discovery root, import root
+    and cwd at once — what `python3 -m unittest discover` does there."""
+    results = _execute(code_dir, None, work_dir, timeout=timeout, list_only=False, pattern=pattern)
+    return SuiteOutcome(outcomes={record["id"]: record["outcome"] for record in results.records},
+                        timed_out=results.timed_out)
+
+
 def list_suite(code_dir: Path, suite_dir: Path, work_dir: Path) -> list[str]:
     """Test IDs the suite collects against code_dir (used on references only)."""
     results = _execute(code_dir, suite_dir, work_dir, timeout=SUITE_SECONDS, list_only=True)
@@ -67,18 +76,24 @@ class _RunnerOutput:
     timed_out: bool
 
 
-def _execute(code_dir: Path, suite_dir: Path, work_dir: Path, *, timeout: float, list_only: bool) -> _RunnerOutput:
+def _execute(code_dir: Path, suite_dir: Path | None, work_dir: Path, *, timeout: float, list_only: bool,
+             pattern: str | None = None) -> _RunnerOutput:
+    """Run suite_dir's tests against a copy of code_dir; with no suite_dir, the tests inside code_dir."""
     # Absolute: the runner's cwd is the code copy, where relative paths would not resolve.
     work_dir = work_dir.resolve()
     work_dir.mkdir(parents=True, exist_ok=False)
-    code_copy, suite_copy = work_dir / "code", work_dir / "suite"
+    code_copy = work_dir / "code"
     shutil.copytree(code_dir, code_copy, ignore=_COPY_IGNORE)
-    shutil.copytree(suite_dir, suite_copy, ignore=_COPY_IGNORE)
+    suite_copy = code_copy if suite_dir is None else work_dir / "suite"
+    if suite_dir is not None:
+        shutil.copytree(suite_dir, suite_copy, ignore=_COPY_IGNORE)
     results_path = work_dir / "results.jsonl"
     results_path.touch()
     argv = [sys.executable, "-I", "-B", str(RUNNER), str(suite_copy), str(results_path)]
     if list_only:
         argv.append("--list")
+    if pattern:
+        argv += ["--pattern", pattern]
     proc = procs.run(argv, cwd=code_copy, timeout=timeout, stdout_path=work_dir / "runner.log")
     records = []
     for line in results_path.read_text(encoding="utf-8").splitlines():

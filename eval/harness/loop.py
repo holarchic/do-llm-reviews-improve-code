@@ -19,7 +19,7 @@ import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import agents, audit, openrouter, procs, prompts, records, score
+from . import agents, audit, openrouter, planted, procs, prompts, records, score
 from .tasks import Task
 
 MAX_ATTEMPTS = 3
@@ -154,7 +154,10 @@ def execute_run(task: Task, arm: Arm, runs_root: Path, *, rep: int | None = None
         (_loop if arm.reviewer else _solo)(run)
 
     def scores(artifact: Path) -> dict:
-        return score.score_build(artifact, task, exec_dir / "scoring")
+        result = score.score_build(artifact, task, exec_dir / "scoring")
+        if task.variants("mutants"):
+            result["planted"] = planted.score_build(artifact, task, exec_dir / "scoring" / "planted")
+        return result
 
     _execute(run, record, work, scores)
     record.update(rounds=run.rounds)

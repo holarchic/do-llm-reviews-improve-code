@@ -14,6 +14,7 @@ _STATIC_KEYS = ("ruff_violations", "source_loc", "test_loc", "max_function_branc
 _FOLLOWUP_LISTS = ("regressions", "persistent_failures", "repaired")
 _IDENTITY = ("run_id", "task", "arm")
 _TOKEN_KEYS = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens")
+_OWN_TEST_KEYS = ("collected", "pass_on_reference", "fail_on_reference", "load_errors")
 
 
 def build(path: Path, digest: str) -> dict | None:
@@ -33,8 +34,21 @@ def build(path: Path, digest: str) -> dict | None:
         and _valid_steps(record.get("steps"))
         and isinstance(record.get("flags"), list) and all(isinstance(flag, str) for flag in record["flags"])
         and isinstance(record.get("rounds"), dict) and all(isinstance(v, int) for v in record["rounds"].values())
+        and (record.get("rep") is None or (_count(record["rep"]) and isinstance(record["rep"], int)))
+        and ("planted" not in scores or _planted(scores["planted"]))
     )
     return record if valid else None
+
+
+def _planted(planted) -> bool:
+    return (
+        isinstance(planted, dict)
+        and _fraction(planted.get("fraction"))
+        and all(isinstance(planted.get(key), list) and all(isinstance(name, str) for name in planted[key])
+                for key in ("caught", "missed"))
+        and isinstance(planted.get("own_tests"), dict)
+        and all(isinstance(planted["own_tests"].get(key), int) for key in _OWN_TEST_KEYS)
+    )
 
 
 def followup(path: Path, digest: str) -> dict | None:

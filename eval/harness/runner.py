@@ -1,12 +1,14 @@
 """Standalone hidden-suite runner, executed as a script next to candidate code.
 
-    python3 -I runner.py <suite_dir> <results.jsonl> [--list]
+    python3 -I runner.py <suite_dir> <results.jsonl> [--list] [--pattern GLOB]
 
 The candidate's directory is the working directory and goes first on sys.path.
 Each test's outcome is appended and flushed as it finishes, so a run killed by
 the caller's wall clock still leaves the tests that completed. A test that
 outlives PER_TEST_SECONDS is interrupted by SIGALRM and recorded as an error.
---list records collected test IDs without running them.
+--list records collected test IDs without running them. --pattern is the
+discovery pattern (default test_*.py; a build's own tests use unittest's
+default, test*.py).
 
 This file runs in the candidate's process, so it imports nothing from the
 harness.
@@ -81,10 +83,12 @@ def _iter_tests(suite):
 
 def main(argv):
     suite_dir, results_path = os.path.abspath(argv[0]), argv[1]
-    list_only = "--list" in argv[2:]
+    options = argv[2:]
+    list_only = "--list" in options
+    pattern = options[options.index("--pattern") + 1] if "--pattern" in options else "test_*.py"
     sys.path.insert(0, os.getcwd())
     signal.signal(signal.SIGALRM, _on_alarm)
-    suite = unittest.TestLoader().discover(suite_dir, pattern="test_*.py", top_level_dir=suite_dir)
+    suite = unittest.TestLoader().discover(suite_dir, pattern=pattern, top_level_dir=suite_dir)
     with open(results_path, "a", encoding="utf-8") as sink:
         if list_only:
             for test in _iter_tests(suite):

@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import shutil
 import tempfile
@@ -79,7 +80,8 @@ class ExperimentFreezeTest(unittest.TestCase):
         self.root = Path(tempfile.mkdtemp(prefix="eval-test-"))
         self.addCleanup(shutil.rmtree, self.root)
         eval_root = self.root / "eval"
-        for relative in ("__init__.py", "__main__.py", "harness/loop.py", "tasks/t/TASK.md", "PREREG.md"):
+        for relative in ("__init__.py", "__main__.py", "harness/loop.py", "tasks/t/TASK.md", "tasks/t/expected.json",
+                         "tasks/t/FOLLOWUP.md", "tasks/t/degraded/m.py", "PREREG.md"):
             (eval_root / relative).parent.mkdir(parents=True, exist_ok=True)
             (eval_root / relative).write_text(f"{relative}\n")
         skills = {}
@@ -94,7 +96,9 @@ class ExperimentFreezeTest(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.eval_root = eval_root
-        self.sonnet, self.opus = experiments.EXPERIMENTS["sonnet"], experiments.EXPERIMENTS["opus"]
+        self.sonnet, self.opus = (dataclasses.replace(experiments.EXPERIMENTS[name], tasks=("t",))
+                                  for name in ("sonnet", "opus"))
+        self.pilot = dataclasses.replace(PILOT, tasks=("t",))
 
     def prereg(self, experiment, text="rule\n"):
         path = self.eval_root / experiment.prereg
@@ -127,10 +131,19 @@ class ExperimentFreezeTest(unittest.TestCase):
             manifest.verify(self.opus)
 
     def test_freezing_another_experiment_leaves_the_pilot_frozen(self):
-        pilot_digest = manifest.freeze(PILOT)
+        pilot_digest = manifest.freeze(self.pilot)
         self.prereg(self.sonnet)
         manifest.freeze(self.sonnet)
-        self.assertEqual(manifest.verify(PILOT), pilot_digest)
+        self.assertEqual(manifest.verify(self.pilot), pilot_digest)
+
+    def test_freeze_refuses_tasks_without_the_parts_the_experiment_uses(self):
+        replicated = dataclasses.replace(self.sonnet, report="replicated", followup_arms=(), pairs=())
+        self.prereg(replicated)
+        with self.assertRaisesRegex(manifest.ManifestMismatch, "t: no mutants/"):
+            manifest.freeze(replicated)
+        (self.eval_root / "tasks" / "t" / "FOLLOWUP.md").unlink()
+        with self.assertRaisesRegex(manifest.ManifestMismatch, "t: no follow-up group"):
+            manifest.freeze(self.sonnet)
 
     def test_deleted_prereg_refuses_cleanly(self):
         self.prereg(self.sonnet)
