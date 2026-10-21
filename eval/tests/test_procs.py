@@ -42,3 +42,12 @@ def _alive(pid: int) -> bool:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StdinTest(unittest.TestCase):
+    def test_stdin_from_file(self):
+        tmp = Path(tempfile.mkdtemp(prefix="eval-test-"))
+        self.addCleanup(shutil.rmtree, tmp)
+        (tmp / "in.txt").write_text("hello from stdin\n")
+        procs.run(["cat"], cwd=tmp, timeout=10, stdout_path=tmp / "out", stdin_path=tmp / "in.txt")
+        self.assertEqual((tmp / "out").read_text(), "hello from stdin\n")

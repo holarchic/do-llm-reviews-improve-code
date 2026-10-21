@@ -9,6 +9,7 @@ re-running resumes; failed attempts stay on disk beside the new ones.
 import itertools
 import random
 import sys
+import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -59,8 +60,16 @@ def run_builds(data_root: Path) -> int:
     by_id = {task.id: task for task in pilot_tasks()}
     jobs = [(by_id[task_id], arm) for task_id, arm in build_schedule()]
 
+    task_locks = {task_id: threading.Lock() for task_id in by_id}
+
     @_contained
     def job(item):
+        # One job per task at a time: whatever a session could glimpse of a concurrent one
+        # (process lists, open files) then belongs to a different task.
+        with task_locks[item[0].id]:
+            return build_job(item)
+
+    def build_job(item):
         task, arm = item
         exec_dir = complete_build(runs_root, task.id, arm, digest)
         if exec_dir is None:

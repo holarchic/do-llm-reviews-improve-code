@@ -8,6 +8,7 @@ import os
 import signal
 import subprocess
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,17 +30,18 @@ def run(
     stdout_path: Path,
     stderr_path: Path | None = None,
     env: dict[str, str] | None = None,
+    stdin_path: Path | None = None,
 ) -> ProcResult:
-    """Run argv with stdin closed, stdout (and stderr) to files."""
+    """Run argv with stdin from a file (closed if none), stdout (and stderr) to files."""
     started = time.monotonic()
-    with open(stdout_path, "wb") as out:
+    with open(stdout_path, "wb") as out, (open(stdin_path, "rb") if stdin_path else nullcontext()) as stdin:
         err = open(stderr_path, "wb") if stderr_path else subprocess.STDOUT
         try:
             child = subprocess.Popen(
                 argv,
                 cwd=cwd,
                 env=env,
-                stdin=subprocess.DEVNULL,
+                stdin=stdin if stdin_path else subprocess.DEVNULL,
                 stdout=out,
                 stderr=err,
                 start_new_session=True,

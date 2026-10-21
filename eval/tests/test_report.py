@@ -149,6 +149,31 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(decision.verdict, "INCOMPLETE")
 
 
+class TaskExclusionTest(unittest.TestCase):
+    def test_no_two_jobs_of_one_task_overlap(self):
+        import threading
+        import time
+
+        active, overlaps, lock = {}, [], threading.Lock()
+
+        def fake_execute(task, arm, runs_root, *, manifest_hash):
+            with lock:
+                if active.get(task.id):
+                    overlaps.append(task.id)
+                active[task.id] = active.get(task.id, 0) + 1
+            time.sleep(0.05)
+            with lock:
+                active[task.id] -= 1
+            return {"run_id": f"{task.id}--{arm}", "exec": "exec-1", "status": "invalid"}
+
+        root = Path(tempfile.mkdtemp(prefix="eval-test-"))
+        self.addCleanup(shutil.rmtree, root)
+        with mock.patch.object(manifest, "verify", return_value="d"), \
+             mock.patch.object(pilot.loop, "execute_run", fake_execute):
+            pilot.run_builds(root)
+        self.assertEqual(overlaps, [])
+
+
 class ScheduleTest(unittest.TestCase):
     def test_schedules_are_complete_and_seeded(self):
         builds = pilot.build_schedule()

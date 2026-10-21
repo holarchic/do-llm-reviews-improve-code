@@ -89,10 +89,10 @@ def claude_settings(role: str, cwd: Path) -> dict:
     }
 
 
-def claude_argv(model: str, prompt: str, role: str, settings_path: Path) -> list[str]:
-    # The prompt sits right after -p: --allowedTools is variadic and would swallow a trailing one.
+def claude_argv(model: str, role: str, settings_path: Path) -> list[str]:
+    # The prompt arrives on stdin: argv is visible to every process (`ps`), so it carries no content.
     return [
-        "claude", "-p", prompt,
+        "claude", "-p",
         "--model", model,
         "--setting-sources", "project",
         "--settings", str(settings_path),
@@ -111,11 +111,13 @@ def run_claude(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path) 
     out_dir.mkdir(parents=True, exist_ok=True)
     settings_path = out_dir / "settings.json"
     settings_path.write_text(json.dumps(claude_settings(role, cwd), indent=2), encoding="utf-8")
-    argv = claude_argv(model, prompt, role, settings_path)
+    argv = claude_argv(model, role, settings_path)
+    prompt_path = out_dir / "prompt.md"
+    prompt_path.write_text(prompt, encoding="utf-8")
     (out_dir / "argv.json").write_text(json.dumps(argv, indent=2), encoding="utf-8")
     transcript = out_dir / "transcript.jsonl"
     proc = procs.run(argv, cwd=cwd, timeout=TIMEOUT_SECONDS[role], stdout_path=transcript,
-                     stderr_path=out_dir / "stderr.log")
+                     stderr_path=out_dir / "stderr.log", stdin_path=prompt_path)
     return _finish(classify_claude(transcript, proc, role), cwd)
 
 
@@ -135,11 +137,13 @@ def run_codex(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path) -
         # Every file Codex touches lives in its own home and is copied out after: out_dir is under a
         # read-denied root, and node aborts at start-up if it cannot stat its stdout.
         inner = {name: codex_home / name for name in ("final.txt", "transcript.jsonl", "stderr.log")}
-        argv = ["sandbox-exec", "-f", str(profile), *codex_argv(model, prompt, inner["final.txt"])]
+        prompt_path = codex_home / "prompt.md"
+        prompt_path.write_text(prompt, encoding="utf-8")
+        argv = ["sandbox-exec", "-f", str(profile), *codex_argv(model, inner["final.txt"])]
         (out_dir / "argv.json").write_text(json.dumps(argv, indent=2), encoding="utf-8")
         env = {**os.environ, "CODEX_HOME": str(codex_home)}
         proc = procs.run(argv, cwd=cwd, timeout=TIMEOUT_SECONDS[role], stdout_path=inner["transcript.jsonl"],
-                         stderr_path=inner["stderr.log"], env=env)
+                         stderr_path=inner["stderr.log"], env=env, stdin_path=prompt_path)
         for name, path in inner.items():
             if path.exists():
                 shutil.copy2(path, out_dir / name)
@@ -167,11 +171,12 @@ def codex_seatbelt_profile(cwd: Path, home: Path) -> str:
     )
 
 
-def codex_argv(model: str, prompt: str, final_path: Path) -> list[str]:
+def codex_argv(model: str, final_path: Path) -> list[str]:
+    # "-" reads the prompt from stdin: argv is visible to every process, so it carries no content.
     return [
         "codex", "--dangerously-bypass-approvals-and-sandbox", "-m", model,
         "-c", f"model_reasoning_effort={CODEX_EFFORT}",
-        "exec", "--skip-git-repo-check", "--ephemeral", "--json", "-o", str(final_path), prompt,
+        "exec", "--skip-git-repo-check", "--ephemeral", "--json", "-o", str(final_path), "-",
     ]
 
 
