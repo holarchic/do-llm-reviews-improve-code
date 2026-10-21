@@ -1,7 +1,9 @@
-"""Isolation probes, run through the production session builders before any pilot run.
+"""Isolation probes, run through the production session builders before an experiment's runs.
 
 Each probe states the property it proves and the positive control that keeps it
 from passing vacuously. Settings, argv and raw transcripts stay in the probe dir.
+The probes run on the experiment's own agents (`probe_plan`); a routed experiment
+adds a key probe per routed CLI.
 """
 
 import json
@@ -13,8 +15,9 @@ import sys
 import time
 from pathlib import Path
 
-from . import agents, audit
-from .experiments import HAIKU, LUNA
+from dataclasses import dataclass
+
+from . import agents, audit, openrouter
 
 INSTRUCTION_FILES = (Path.home() / ".claude" / "CLAUDE.md", Path.home() / ".codex" / "AGENTS.md")
 QUOTE_PROMPT = (
@@ -24,29 +27,88 @@ QUOTE_PROMPT = (
 )
 
 
-def run_probes(probe_root: Path) -> list[str]:
-    """Run every probe; return the failures (empty means isolation holds)."""
+@dataclass(frozen=True)
+class Probe:
+    name: str
+    kind: str  # instructions | claude_canary | codex_canary | claude_reviewer | codex_writer | key
+    agent: agents.Agent
+    role: str
+
+
+def probe_plan(experiment) -> list[Probe]:
+    """The probes an experiment's agents need: instructions for each distinct session, the canaries
+    on its writer and first Codex reviewer, the reviewer and Codex-writer controls, judges when it
+    judges, and a key probe for each routed CLI."""
+    writer = experiment.arms[0].writer
+    reviewers = list(dict.fromkeys(arm.reviewer for arm in experiment.arms if arm.reviewer is not None))
+    plan, names = [], set()
+
+    def add(name: str, kind: str, agent: agents.Agent, role: str) -> None:
+        name = name if name not in names else f"{name}:{agent.model}"
+        names.add(name)
+        plan.append(Probe(name, kind, agent, role))
+
+    add(f"{writer.cli}_instructions", "instructions", writer, agents.WRITER)
+    for reviewer in reviewers:
+        if reviewer != writer:
+            add(f"{reviewer.cli}_instructions", "instructions", reviewer, agents.REVIEWER)
+    if experiment.pairs:
+        add("claude_judge_instructions", "instructions", agents.Agent("claude", agents.CLAUDE_JUDGE_MODEL), agents.JUDGE)
+        add("codex_judge_instructions", "instructions", agents.Agent("codex", agents.CODEX_JUDGE_MODEL), agents.JUDGE)
+    codex_reviewers = [r for r in reviewers if r.cli == "codex"]
+    if writer.cli == "claude":
+        add("claude_canary", "claude_canary", writer, agents.WRITER)
+    if codex_reviewers:
+        add("codex_canary", "codex_canary", codex_reviewers[0], agents.REVIEWER)
+    claude_reviewers = [r for r in reviewers if r.cli == "claude"]
+    if claude_reviewers:
+        add("claude_reviewer_read_only", "claude_reviewer", claude_reviewers[0], agents.REVIEWER)
+    codex_writer = writer if writer.cli == "codex" else (codex_reviewers or [None])[0]
+    if codex_writer is not None:
+        add("codex_writer", "codex_writer", codex_writer, agents.WRITER)
+    routed = [(writer, agents.WRITER)] + [(r, agents.REVIEWER) for r in reviewers]
+    for cli in ("claude", "codex"):
+        agent, role = next(((a, role) for a, role in routed if a.cli == cli and a.provider == agents.OPENROUTER),
+                           (None, None))
+        if agent is not None:
+            add(f"{cli}_key", "key", agent, role)
+    return plan
+
+
+def run_probes(probe_root: Path, experiment) -> list[str]:
+    """Run the experiment's probes; return the failures (empty means isolation holds)."""
     stamp = probe_root / time.strftime("%Y%m%dT%H%M%S")
     stamp.mkdir(parents=True)
     canary_token = f"CANARY-{secrets.token_hex(8)}"
     canary = stamp / "canary.txt"
     canary.write_text(canary_token + "\n", encoding="utf-8")
     markers = instruction_markers()
-    results = {
-        "claude_instructions": _instructions_probe("claude", HAIKU.model, agents.WRITER, stamp, markers),
-        "codex_instructions": _instructions_probe("codex", LUNA.model, agents.REVIEWER, stamp,
-                                                  markers),
-        "claude_judge_instructions": _instructions_probe("claude", agents.CLAUDE_JUDGE_MODEL, agents.JUDGE, stamp,
-                                                         markers),
-        "codex_judge_instructions": _instructions_probe("codex", agents.CODEX_JUDGE_MODEL, agents.JUDGE, stamp,
-                                                        markers),
-        "claude_canary": _claude_canary_probe(stamp, canary, canary_token, markers),
-        "codex_canary": _codex_canary_probe(stamp, canary),
-        "claude_reviewer_read_only": _claude_reviewer_probe(stamp),
-        "codex_writer": _codex_writer_probe(stamp, canary),
-    }
+    results = {}
+    for probe in probe_plan(experiment):
+        if probe.kind == "instructions":
+            results[probe.name] = _instructions_probe(probe, stamp, markers)
+        elif probe.kind == "claude_canary":
+            results[probe.name] = _claude_canary_probe(probe, stamp, canary, canary_token, markers)
+        elif probe.kind == "codex_canary":
+            results[probe.name] = _codex_canary_probe(probe, stamp, canary)
+        elif probe.kind == "claude_reviewer":
+            results[probe.name] = _claude_reviewer_probe(probe, stamp)
+        elif probe.kind == "codex_writer":
+            results[probe.name] = _codex_writer_probe(probe, stamp, canary)
+        else:
+            results[probe.name] = _key_probe(probe, stamp)
     (stamp / "summary.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
-    return [f"{name}: {problem}" for name, found in results.items() for problem in found["problems"]]
+    problems = [f"{name}: {problem}" for name, found in results.items() for problem in found["problems"]]
+    if experiment.routed:
+        # After summary.json: every saved file of the probe run is scanned, and the scan must leave none behind.
+        openrouter.scrub(stamp)
+        problems += [f"key still in {path} after scrubbing" for path in _files_holding_key(stamp)]
+    return problems
+
+
+def _files_holding_key(root: Path) -> list[str]:
+    secret = openrouter.api_key().encode()
+    return [str(p.relative_to(root)) for p in root.rglob("*") if p.is_file() and secret in p.read_bytes()]
 
 
 def instruction_markers() -> list[str]:
@@ -67,12 +129,11 @@ def _run_dir(name: str) -> Path:
     return audit.anonymous_workdir()
 
 
-def _instructions_probe(cli: str, model: str, role: str, stamp: Path, markers: list[str]) -> dict:
-    run_dir = _run_dir(f"{cli}-{role}-instructions")
+def _instructions_probe(probe: Probe, stamp: Path, markers: list[str]) -> dict:
+    run_dir = _run_dir(probe.name)
     try:
-        out_dir = stamp / f"{cli}-{role}-instructions"
-        run = agents.run_claude if cli == "claude" else agents.run_codex
-        session = run(model, QUOTE_PROMPT, role=role, cwd=run_dir, out_dir=out_dir)
+        out_dir = stamp / _slug(probe.name)
+        session = agents.run(probe.agent, QUOTE_PROMPT, role=probe.role, cwd=run_dir, out_dir=out_dir)
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)
     problems = []
@@ -83,10 +144,23 @@ def _instructions_probe(cli: str, model: str, role: str, stamp: Path, markers: l
     leaked = [marker for marker in markers if marker.lower() in session.final_text.lower()]
     if leaked:
         problems.append(f"global instructions visible: {leaked[:5]}")
+    problems += _routing_problems(probe, session)
     return {"answer": session.final_text[:2000], "markers": len(markers), "problems": problems}
 
 
-def _claude_canary_probe(stamp: Path, canary: Path, canary_token: str, markers: list[str]) -> dict:
+def _routing_problems(probe: Probe, session: agents.Session) -> list[str]:
+    """A routed session must report only its own model (Codex reports the requested one by construction)."""
+    if probe.agent.provider != agents.OPENROUTER:
+        return []
+    others = [model for model in session.reported_models if model != probe.agent.model]
+    return [f"routed session reported other models: {others}"] if others else []
+
+
+def _slug(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", name)
+
+
+def _claude_canary_probe(probe: Probe, stamp: Path, canary: Path, canary_token: str, markers: list[str]) -> dict:
     sibling = _run_dir("sibling")
     run_dir = _run_dir("claude-canary")
     permitted_token = f"PERMITTED-{secrets.token_hex(8)}"
@@ -101,8 +175,7 @@ def _claude_canary_probe(stamp: Path, canary: Path, canary_token: str, markers: 
         "6. With the Bash tool run: ls .."
     )
     try:
-        session = agents.run_claude(HAIKU.model, prompt, role=agents.WRITER, cwd=run_dir,
-                                    out_dir=stamp / "claude-canary")
+        session = agents.run(probe.agent, prompt, role=probe.role, cwd=run_dir, out_dir=stamp / "claude-canary")
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)
         shutil.rmtree(sibling, ignore_errors=True)
@@ -131,7 +204,7 @@ def _claude_canary_probe(stamp: Path, canary: Path, canary_token: str, markers: 
     return {"calls": calls, "audit_hits": session.audit_hits, "problems": problems}
 
 
-def _claude_reviewer_probe(stamp: Path) -> dict:
+def _claude_reviewer_probe(probe: Probe, stamp: Path) -> dict:
     """The Claude reviewer runs commands like the Codex reviewer but cannot write to the repo."""
     run_dir = _run_dir("claude-reviewer")
     token = f"RAN-{secrets.token_hex(6)}"
@@ -141,8 +214,7 @@ def _claude_reviewer_probe(stamp: Path) -> dict:
         "2. touch written.txt"
     )
     try:
-        session = agents.run_claude(HAIKU.model, prompt, role=agents.REVIEWER, cwd=run_dir,
-                                    out_dir=stamp / "claude-reviewer")
+        session = agents.run(probe.agent, prompt, role=probe.role, cwd=run_dir, out_dir=stamp / "claude-reviewer")
         wrote = (run_dir / "written.txt").exists()
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)
@@ -157,7 +229,7 @@ def _claude_reviewer_probe(stamp: Path) -> dict:
     return {"calls": calls, "problems": problems}
 
 
-def _codex_canary_probe(stamp: Path, canary: Path) -> dict:
+def _codex_canary_probe(probe: Probe, stamp: Path, canary: Path) -> dict:
     """Codex's outer Seatbelt profile: its own dir readable, not writable; private roots and
     other runs unreadable, the runs root unlistable."""
     sibling = _run_dir("sibling")
@@ -176,8 +248,7 @@ def _codex_canary_probe(stamp: Path, canary: Path) -> dict:
         "5. touch written.txt"
     )
     try:
-        session = agents.run_codex(LUNA.model, prompt, role=agents.REVIEWER, cwd=run_dir,
-                                   out_dir=stamp / "codex-canary")
+        session = agents.run(probe.agent, prompt, role=probe.role, cwd=run_dir, out_dir=stamp / "codex-canary")
         wrote = (run_dir / "written.txt").exists()
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)
@@ -195,7 +266,7 @@ def _codex_canary_probe(stamp: Path, canary: Path) -> dict:
     return {"audit_hits": session.audit_hits, "terminal": session.terminal, "problems": problems}
 
 
-def _codex_writer_probe(stamp: Path, canary: Path) -> dict:
+def _codex_writer_probe(probe: Probe, stamp: Path, canary: Path) -> dict:
     """A Codex writer builds and tests code in its own dir, and is refused on private reads and writes."""
     run_dir = _run_dir("codex-writer")
     canary_token = canary.read_text(encoding="utf-8").strip()
@@ -208,8 +279,7 @@ def _codex_writer_probe(stamp: Path, canary: Path) -> dict:
         f"4. Run: touch {forbidden}"
     )
     try:
-        session = agents.run(LUNA, prompt, role=agents.WRITER,
-                             cwd=run_dir, out_dir=stamp / "codex-writer")
+        session = agents.run(probe.agent, prompt, role=probe.role, cwd=run_dir, out_dir=stamp / "codex-writer")
         built = (run_dir / "m.py").exists() and (run_dir / "test_m.py").exists()
         # Positive control owned by the probe: the generated code really works, whatever its own tests did.
         check = subprocess.run([sys.executable, "-B", "-c", "import m; assert m.add(2, 3) == 5"], cwd=run_dir,
@@ -235,6 +305,61 @@ def _codex_writer_probe(stamp: Path, canary: Path) -> dict:
     if forbidden.exists():
         problems.append("private write was not refused")
     return {"problems": problems}
+
+
+# The markers are joined at run time, so a session that prints the script's source puts none of them
+# in the transcript.
+KEY_SCRIPT = """import os, subprocess, sys
+print("ENV-" + "NAMES:", " ".join(sorted(os.environ)))
+try:
+    with open(sys.argv[1], "rb") as handle:
+        handle.read()
+    print("KEY-READ-" + "OK")
+except OSError:
+    print("KEY-READ-" + "DENIED")
+try:
+    listing = subprocess.run(["ps", "eww", "-ax", "-o", "pid,command"], capture_output=True, text=True).stdout
+    print("PS-" + "RAN lines:", len(listing.splitlines()))
+except OSError:
+    print("PS-" + "DENIED")
+print(open("permitted.txt").read().strip())
+"""
+
+
+def _key_probe(probe: Probe, stamp: Path) -> dict:
+    """A routed session's tool shell holds no credential variable and cannot read the key file. The script
+    prints variable names and outcomes only, never a value. Whether `ps` could see another process's
+    environment is reported, not failed: the operator accepted the key in the session processes."""
+    run_dir = _run_dir(probe.name)
+    permitted_token = f"PERMITTED-{secrets.token_hex(8)}"
+    (run_dir / "permitted.txt").write_text(permitted_token + "\n", encoding="utf-8")
+    (run_dir / "envcheck.py").write_text(KEY_SCRIPT, encoding="utf-8")
+    prompt = (f"Run exactly `python3 envcheck.py {openrouter.KEY_PATH}` with your shell tool, once, and report its "
+              "full raw output.")
+    out_dir = stamp / _slug(probe.name)
+    try:
+        session = agents.run(probe.agent, prompt, role=probe.role, cwd=run_dir, out_dir=out_dir)
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+    return key_problems(session.transcript.read_text(encoding="utf-8", errors="replace"), permitted_token,
+                        _routing_problems(probe, session))
+
+
+def key_problems(transcript_text: str, permitted_token: str, routing: list[str]) -> dict:
+    problems = list(routing)
+    names = re.search(r"ENV-NAMES: ([A-Za-z0-9_ ]*)", transcript_text)
+    if names is None or permitted_token not in transcript_text:
+        problems.append("the check script's output never reached the transcript; the probe is vacuous")
+    else:
+        visible = sorted(set(names.group(1).split()) & set(openrouter.KEY_VARIABLES))
+        if visible:
+            problems.append(f"credential variables visible to the tool shell: {visible}")
+    if "KEY-READ-OK" in transcript_text:
+        problems.append("the key file was readable")
+    elif "KEY-READ-DENIED" not in transcript_text:
+        problems.append("key-file read never attempted")
+    ps = "denied" if "PS-DENIED" in transcript_text else "ran" if "PS-RAN" in transcript_text else "not run"
+    return {"ps": ps, "problems": problems}
 
 
 def tests_ran(unittest_output: str) -> bool:

@@ -15,7 +15,7 @@ COMMANDS = {
     "judge": "run judge calibration and pairwise judging",
     "report": "regenerate the experiment's report from raw run records",
 }
-EXPERIMENT_COMMANDS = ("freeze", "run", "judge", "report")
+EXPERIMENT_COMMANDS = ("probe", "freeze", "run", "judge", "report")
 
 
 def main(argv: list[str]) -> int:
@@ -62,7 +62,7 @@ def _validate(args) -> int:
 def _probe(args) -> int:
     from .harness import probe
 
-    problems = probe.run_probes(DATA_ROOT / "probes")
+    problems = probe.run_probes(_data_root(args.experiment) / "probes", args.experiment)
     for problem in problems:
         print(problem, file=sys.stderr)
     print("probe: FAIL" if problems else "probe: ok")
