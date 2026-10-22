@@ -34,6 +34,7 @@ GLM_REVIEWER = Agent("codex", "z-ai/glm-4.7-flash", OPENROUTER)
 
 PILOT_TASKS = ("bill-split", "config-includes", "dep-resolver", "log-windows", "token-bucket")
 PILOT2_TASKS = ("calc-expr", "cron-next", "ignore-match", "json-patch", "semver-range")
+REPLAY_TASKS: tuple[str, ...] = ()  # filled as each task is authored, audited and validated
 
 
 @dataclass(frozen=True)
@@ -48,12 +49,12 @@ class Experiment:
     seed: int
     data_dir: str  # under eval/data; the pilot's data sits at the root
     prereg: str  # relative to eval/
-    decision_rule: str | None  # whose pre-registered rule applies: "pilot", "pilot2" or none (descriptive)
+    decision_rule: str | None  # whose pre-registered rule applies: "pilot", "pilot2", "replay" or none (descriptive)
     tasks: tuple[str, ...] = PILOT_TASKS
     reps: int = 1  # replicates per task × arm; above 1, run ids end in --r<n>
     parallel: int = 3
     budget_usd: float | None = None  # OpenRouter spend cap for the scored runs
-    report: str = "judged"  # "judged" (report.py) | "replicated" (replicated.py)
+    report: str = "judged"  # "judged" (report.py) | "replicated" (replicated.py) | "replay" (replay.py)
 
     def arm(self, name: str) -> Arm:
         return next(arm for arm in self.arms if arm.name == name)
@@ -149,9 +150,29 @@ PILOT2 = Experiment(
     report="replicated",
 )
 
+# Real phases of a loop-built repo, rebuilt from their starting tree (tasks with a source.json): the shipped
+# configuration (A3) against solo (A1) and against the writer reviewing itself (A2).
+REPLAY = Experiment(
+    name="replay",
+    title="Eval replay report",
+    arms=(Arm("A1", OPUS), Arm("A2", OPUS, OPUS), Arm("A3", OPUS, SOL)),
+    baseline="A1",
+    replicate=None,
+    followup_arms=(),
+    pairs=(),
+    seed=20261022,
+    data_dir="replay",
+    prereg="prereg/replay.md",
+    decision_rule="replay",
+    tasks=REPLAY_TASKS,
+    reps=2,
+    report="replay",
+)
+
 EXPERIMENTS = {experiment.name: experiment for experiment in (
     PILOT,
     PILOT2,
+    REPLAY,
     tier("sonnet", SONNET, TERRA, seed=20261101),
     tier("opus", OPUS, SOL, seed=20261102),
     reverse("reverse-sonnet", TERRA, SONNET, seed=20261103),

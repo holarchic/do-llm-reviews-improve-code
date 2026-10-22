@@ -1,9 +1,10 @@
+import dataclasses
 import json
 import shutil
 import unittest
 from unittest import mock
 
-from eval.harness import agents, experiments, loop, prompts, records, tasks
+from eval.harness import agents, experiments, loop, manifest, pilot, prompts, records, replay, tasks
 from eval.tests.test_source import PRE_REVIEW_CALC, REFERENCE_CALC, FixtureCase
 
 OPUS = experiments.OPUS
@@ -33,9 +34,8 @@ class PromptTest(unittest.TestCase):
         self.assertEqual(swapped, prompts.loop_build_writer())
 
 
-class RunTest(FixtureCase):
-    """A stub-agent replay run on the fixture: seeded from base, built, scored on the replay groups, saved and
-    read back by the records loader every consumer uses."""
+class StubAgentCase(FixtureCase):
+    """The fixture task with stub agents: the writer writes `self.calc` and drops the repo's tests."""
 
     def setUp(self):
         super().setUp()
@@ -59,6 +59,12 @@ class RunTest(FixtureCase):
     def execute(self, arm: loop.Arm) -> dict:
         with mock.patch.object(agents, "run_claude", self.agent), mock.patch.object(agents, "run_codex", self.agent):
             return loop.execute_run(self.task, arm, self.tmp / "runs", rep=1, manifest_hash="d")
+
+
+
+class RunTest(StubAgentCase):
+    """A replay run: seeded from base, built, scored on the replay groups, saved and read back by the records
+    loader every consumer uses."""
 
     def test_a_solo_replay_run_is_seeded_scored_and_reloadable(self):
         record = self.execute(SOLO)
@@ -86,6 +92,103 @@ class RunTest(FixtureCase):
         data["scores"]["replay"]["defects"] = []  # a control: no defects, review None
         saved.write_text(json.dumps(data))
         self.assertIsNotNone(records.build(saved, "d"))
+
+
+CAUGHT = [f"c{n}" for n in range(6)]
+CONTROLS = ["k0", "k1"]
+
+
+def replay_record(arm: str, review, feature: float, regressions: float) -> dict:
+    defects = [] if review is None else [{"id": "d", "avoided": review == 1.0}]
+    return {"run_id": "x", "task": "t", "arm": arm, "rep": 1, "exec": "exec-1", "status": "complete", "manifest": "d",
+            "flags": [], "rounds": {"plan": 1, "phase": 1},
+            "steps": [{"name": "build", "attempts": [{"seconds": 60.0, "usage": {}}]}],
+            "scores": {"replay": {"review": review, "feature": feature, "regressions": regressions,
+                                  "defects": defects, "outcomes": {}}}}
+
+
+def results(review: dict[str, list[float]], feature=None, regressions=None) -> replay.Results:
+    """review: arm -> per-caught-task review fraction (the same for both replicates); controls get None."""
+    built = replay.Results(digest="d", caught=list(CAUGHT), controls=list(CONTROLS), arms=["A1", "A2", "A3"])
+    for arm, values in review.items():
+        for index, task in enumerate(CAUGHT + CONTROLS):
+            value = values[index] if index < len(CAUGHT) else None
+            built.builds.setdefault(arm, {})[task] = [
+                replay_record(arm, value, (feature or {}).get(arm, 1.0), (regressions or {}).get(arm, 0.0))
+                for _ in range(2)]
+    return built
+
+
+class DecisionTest(unittest.TestCase):
+    def outcomes(self, built: replay.Results) -> dict[str, str]:
+        decision = replay.decide(built, experiments.REPLAY)
+        return {c.name: c.outcome for c in decision.comparisons}
+
+    def test_a_loop_effect_needs_fifteen_points_and_four_of_six_tasks(self):
+        built = results({"A1": [0.5] * 6, "A2": [0.6] * 6, "A3": [0.7, 0.7, 0.7, 0.7, 0.5, 0.5]})
+        # A3 − A1 = +13.3 on four tasks: short of +15.
+        self.assertEqual(self.outcomes(built)["loop"], "no effect")
+        built = results({"A1": [0.5] * 6, "A2": [0.6] * 6, "A3": [0.8, 0.8, 0.8, 0.7, 0.5, 0.5]})
+        self.assertEqual(self.outcomes(built), {"loop": "effect", "cross-family": "no effect"})
+
+    def test_cross_family_compares_against_self_review(self):
+        built = results({"A1": [0.2] * 6, "A2": [0.4] * 6, "A3": [0.6] * 6})
+        self.assertEqual(self.outcomes(built), {"loop": "effect", "cross-family": "effect"})
+
+    def test_headroom_on_the_mean_and_on_reachable_wins(self):
+        self.assertEqual(self.outcomes(results({"A1": [0.9] * 6, "A2": [0.5] * 6, "A3": [1.0] * 6}))["loop"],
+                         "uninformative")
+        # Mean exactly 85 but one task below 100: four wins are out of reach.
+        self.assertEqual(self.outcomes(results({"A1": [0.1, 1, 1, 1, 1, 1], "A2": [0.5] * 6, "A3": [1.0] * 6}))["loop"],
+                         "uninformative")
+        # Mean exactly 85 with four tasks below 100: still informative, and +15 on four tasks fires.
+        self.assertEqual(self.outcomes(results({"A1": [0.775] * 4 + [1, 1], "A2": [0.5] * 6,
+                                                "A3": [1.0] * 6}))["loop"], "effect")
+
+    def test_feature_loss_and_regressions_block_an_effect(self):
+        review = {"A1": [0.2] * 6, "A2": [0.2] * 6, "A3": [0.8] * 6}
+        self.assertEqual(self.outcomes(results(review, feature={"A3": 0.9}))["loop"], "no effect")
+        self.assertEqual(self.outcomes(results(review, regressions={"A3": 0.01}))["loop"], "no effect")
+
+    def test_a_missing_build_is_incomplete(self):
+        built = results({"A1": [0.5] * 6, "A2": [0.5] * 6, "A3": [0.5] * 6})
+        built.missing.append("build c0--A3--r2")
+        decision = replay.decide(built, experiments.REPLAY)
+        self.assertEqual(decision.verdict, "INCOMPLETE")
+        self.assertIn("INCOMPLETE", replay.render(built, decision, experiments.REPLAY))
+
+    def test_render_keeps_controls_out_of_the_review_table(self):
+        built = results({"A1": [0.5] * 6, "A2": [0.5] * 6, "A3": [0.8] * 6})
+        text = replay.render(built, replay.decide(built, experiments.REPLAY), experiments.REPLAY)
+        review_table = text.split("## Review-caught defects avoided (%)")[1].split("##")[0]
+        self.assertNotIn("k0", review_table)
+        self.assertIn("| A3 | 80.0 ± 0.0 |", review_table)
+        self.assertIn("**Loop (A3 vs A1):** effect", text)
+
+
+class EndToEndTest(StubAgentCase):
+    """Stub agents through the real schedule, run, resume, collect, decide and render."""
+
+    def run_builds(self, experiment) -> int:
+        with mock.patch.object(pilot, "scored_tasks", lambda e: [self.task]), \
+                mock.patch.object(manifest, "verify", return_value="d"), \
+                mock.patch.object(agents, "run_claude", self.agent), mock.patch.object(agents, "run_codex", self.agent):
+            return pilot.run_builds(self.tmp / "data", experiment)
+
+    def test_runs_resume_and_report(self):
+        experiment = dataclasses.replace(experiments.REPLAY, tasks=("fixture",), parallel=1)
+        self.assertEqual(self.run_builds(experiment), 0)
+        execs = sorted(p.name for p in (self.tmp / "data" / "runs").glob("*/exec-*"))
+        self.assertEqual(len(execs), 6)
+        self.assertEqual(self.run_builds(experiment), 0)  # resume: nothing rebuilt
+        self.assertEqual(len(list((self.tmp / "data" / "runs").glob("*/exec-*"))), 6)
+        with mock.patch.object(pilot, "scored_tasks", lambda e: [self.task]), \
+                mock.patch.object(manifest, "verify", return_value="d"):
+            built = replay.collect(self.tmp / "data", experiment)
+        self.assertEqual((built.missing, built.caught), ([], ["fixture"]))
+        decision = replay.decide(built, experiment)
+        self.assertEqual({c.outcome for c in decision.comparisons}, {"uninformative"})  # every arm avoids the defect
+        self.assertIn("| A1 | 100.0 ± 0.0 | 100.0 |", replay.render(built, decision, experiment))
 
 
 if __name__ == "__main__":
