@@ -18,7 +18,7 @@ import shutil
 from pathlib import Path
 
 from . import score
-from .tasks import PLACEHOLDER_PREFIX, Task
+from .tasks import Task
 
 
 def score_build(artifact: Path, task: Task, work_dir: Path) -> dict:
@@ -29,7 +29,7 @@ def score_build(artifact: Path, task: Task, work_dir: Path) -> dict:
         outcome = _run(artifact, mutant, work_dir / "mutants" / mutant.name)
         found = any(outcome.outcomes.get(test_id) != "pass" for test_id in eligible)
         (caught if found else missed).append(mutant.name)
-    load_errors = sum(1 for test_id in reference.outcomes if test_id.startswith(PLACEHOLDER_PREFIX))
+    load_errors = sum(1 for test_id in reference.outcomes if test_id.startswith(score.PLACEHOLDER_PREFIX))
     return {
         "fraction": len(caught) / (len(caught) + len(missed)),
         "caught": caught,

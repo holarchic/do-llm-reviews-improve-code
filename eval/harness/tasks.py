@@ -5,6 +5,7 @@ Layout of tasks/<id>/:
     traps.md                    private: each trap and assertion group -> TASK.md clause
     hidden/, reference/, wrong/<variant>/
     expected.json               written by validate: collected test IDs per suite
+A replay task (source.json present) has its own layout and checks: see source.py.
 Optional parts, each checked when present and required by the experiments that use it:
     FOLLOWUP.md, hidden_followup/, reference_followup/, wrong_followup/<variant>/
                                 the follow-up group, all or nothing (follow-up arms)
@@ -17,10 +18,9 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import score
+from . import score, source
 
 TASKS_ROOT = Path(__file__).resolve().parent.parent / "tasks"
-PLACEHOLDER_PREFIX = "unittest.loader._FailedTest"
 FOLLOWUP_PARTS = ("FOLLOWUP.md", "hidden_followup", "reference_followup", "wrong_followup")
 MIN_MUTANTS = 8
 # A planted bug must be subtle: caught by the hidden suite, but not by most of it.
@@ -53,6 +53,11 @@ class Task:
     def has_followup(self) -> bool:
         return self.path("FOLLOWUP.md").exists()
 
+    @property
+    def source(self) -> source.Source | None:
+        path = self.path("source.json")
+        return source.Source.load(path) if path.exists() else None
+
 
 def missing_parts(task: Task, *, followup: bool, degraded: bool, mutants: bool) -> list[str]:
     """The optional parts an experiment needs that this task lacks."""
@@ -67,6 +72,8 @@ def load_tasks(root: Path = TASKS_ROOT) -> list[Task]:
 
 def validate(task: Task) -> list[str]:
     """Return the task's problems; when there are none, write expected.json."""
+    if task.source is not None:
+        return source.validate(task)
     missing = [name for name in ("TASK.md", "traps.md", "hidden", "reference") if not task.path(name).exists()]
     followup = [name for name in FOLLOWUP_PARTS if task.path(name).exists()]
     if followup and len(followup) != len(FOLLOWUP_PARTS):
@@ -98,7 +105,7 @@ def _validate_in(task: Task, work: _WorkDirs) -> list[str]:
         expected["hidden_followup"] = score.list_suite(reference_followup, followup, work.next())
     problems = [f"{task.id}: {suite} collected no tests or a load failure"
                 for suite, ids in expected.items()
-                if not ids or any(i.startswith(PLACEHOLDER_PREFIX) for i in ids)]
+                if not ids or any(i.startswith(score.PLACEHOLDER_PREFIX) for i in ids)]
     if problems:
         return problems
 

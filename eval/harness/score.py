@@ -11,12 +11,14 @@ import json
 import shutil
 import subprocess
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from . import procs
 
 RUNNER = Path(__file__).with_name("runner.py")
+# unittest collects a module that fails to import as one test with this id prefix.
+PLACEHOLDER_PREFIX = "unittest.loader._FailedTest"
 SUITE_SECONDS = 120
 RUFF_RULES = "E,F,W,B,C90,SIM,UP"
 _COPY_IGNORE = shutil.ignore_patterns(".git", "__pycache__", "*.pyc")
@@ -27,6 +29,8 @@ _BRANCH_NODES = (ast.If, ast.For, ast.AsyncFor, ast.While, ast.IfExp, ast.Except
 class SuiteOutcome:
     outcomes: dict[str, str]
     timed_out: bool
+    # Per failing test with --detail: exception type, stage (import | setup | call) and traceback.
+    details: dict[str, dict] = field(default_factory=dict)
 
     def passed(self) -> frozenset[str]:
         return frozenset(test_id for test_id, outcome in self.outcomes.items() if outcome == "pass")
@@ -58,6 +62,24 @@ def run_in_place(code_dir: Path, work_dir: Path, *, pattern: str = "test*.py",
                         timed_out=results.timed_out)
 
 
+def run_package(code_dir: Path, package: str, work_dir: Path, *, ids: list[str] | None = None,
+                detail: bool = False, timeout: float = SUITE_SECONDS) -> SuiteOutcome:
+    """Run the test package inside code_dir (e.g. `tests/`) from the code root, as `python3 -m unittest`
+    does in a repo whose tests are a package; `ids` limits the run to those test IDs."""
+    results = _execute(code_dir, None, work_dir, timeout=timeout, list_only=False, pattern="test*.py",
+                       package=package, ids=ids, detail=detail)
+    outcomes = {record["id"]: record["outcome"] for record in results.records}
+    details = {record["id"]: {key: record[key] for key in ("exc", "stage", "trace")}
+               for record in results.records if "exc" in record}
+    return SuiteOutcome(outcomes=outcomes, timed_out=results.timed_out, details=details)
+
+
+def list_package(code_dir: Path, package: str, work_dir: Path) -> list[str]:
+    results = _execute(code_dir, None, work_dir, timeout=SUITE_SECONDS, list_only=True, pattern="test*.py",
+                       package=package)
+    return sorted(record["id"] for record in results.records)
+
+
 def list_suite(code_dir: Path, suite_dir: Path, work_dir: Path) -> list[str]:
     """Test IDs the suite collects against code_dir (used on references only)."""
     results = _execute(code_dir, suite_dir, work_dir, timeout=SUITE_SECONDS, list_only=True)
@@ -77,8 +99,10 @@ class _RunnerOutput:
 
 
 def _execute(code_dir: Path, suite_dir: Path | None, work_dir: Path, *, timeout: float, list_only: bool,
-             pattern: str | None = None) -> _RunnerOutput:
-    """Run suite_dir's tests against a copy of code_dir; with no suite_dir, the tests inside code_dir."""
+             pattern: str | None = None, package: str | None = None, ids: list[str] | None = None,
+             detail: bool = False) -> _RunnerOutput:
+    """Run suite_dir's tests against a copy of code_dir; with no suite_dir, the tests inside code_dir
+    (only its `package` subdirectory, imported from the code root, when one is named)."""
     # Absolute: the runner's cwd is the code copy, where relative paths would not resolve.
     work_dir = work_dir.resolve()
     work_dir.mkdir(parents=True, exist_ok=False)
@@ -89,11 +113,20 @@ def _execute(code_dir: Path, suite_dir: Path | None, work_dir: Path, *, timeout:
         shutil.copytree(suite_dir, suite_copy, ignore=_COPY_IGNORE)
     results_path = work_dir / "results.jsonl"
     results_path.touch()
-    argv = [sys.executable, "-I", "-B", str(RUNNER), str(suite_copy), str(results_path)]
+    start = suite_copy / package if package else suite_copy
+    argv = [sys.executable, "-I", "-B", str(RUNNER), str(start), str(results_path)]
     if list_only:
         argv.append("--list")
     if pattern:
         argv += ["--pattern", pattern]
+    if package:
+        argv += ["--top-level", str(code_copy)]
+    if ids is not None:
+        ids_path = work_dir / "ids.txt"
+        ids_path.write_text("".join(f"{test_id}\n" for test_id in ids), encoding="utf-8")
+        argv += ["--only", str(ids_path)]
+    if detail:
+        argv.append("--detail")
     proc = procs.run(argv, cwd=code_copy, timeout=timeout, stdout_path=work_dir / "runner.log")
     records = []
     for line in results_path.read_text(encoding="utf-8").splitlines():
