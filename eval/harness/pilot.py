@@ -20,7 +20,7 @@ from . import judge, loop, manifest, openrouter, records, tasks
 from .experiments import Experiment
 
 SPEND_LEDGER = "spend.json"
-CALIBRATION_CAP_USD = 3.0
+CALIBRATION_CAP_USD = 5.0
 
 
 def scored_tasks(experiment: Experiment) -> list[tasks.Task]:
