@@ -1,0 +1,18 @@
+fb606d0989	2026-10-15	Company lookups: drop unfit websites, trust only expected page titles
+9db7ee950a	2026-10-18	phase review: a redirect's Location is percent-encoded as urllib does
+1285c84c77	2026-10-18	phase review: IPv6 default ports, a failed read's socket closed, one URL parse
+65a67f6749	2026-10-18	phase review LOWs: the lane test can't pass on one shared pool; region tables are frozen
+5dfb26caef	2026-10-18	phase review: set-up examples and suggestions name the country, regions are named records
+b9670adb94	2026-10-19	phase review: the agency run test takes each path; eval builds its definitions as a profile does
+2e5563a7d8	2026-10-19	phase review: a required answer is printable, so the page's select returns it unchanged
+c1d7e6a172	2026-10-19	phase review: an answer to hide by is held to the page's length and size rules
+8eb3250ad5	2026-10-19	phase review: a left-out row is one line; one flagged rule; the page's tag text; preview checks require
+ca4c09793d	2026-10-20	phase review: each fetch pass closed before its connections; version text that drifts removed
+4bab0cff47	2026-10-20	phase review: the breaker counts in finishing order; every valid spend round-trips
+c30edf523f	2026-10-21	phase review: pay_range prints no -0 and says what it can't raise on; INTERVALS read-only
+c9001d1646	2026-10-21	phase review: the backup test finds the column by name
+0ce2e09aeb	2026-10-21	phase review: a watch name repeated with spaces around it is refused too
+f5ae4efd03	2026-10-21	phase review: one way to write a Lever instance's API; a checkout's commit only from its own repository
+fc8b6b3c38	2026-10-21	phase review: unknown in any case never hides a posting; built-in names read once
+a93c944367	2026-10-21	phase review: the tags step's ticks as Requirement records; built-in offers by can_require
+fb45f88d0c	2026-10-21	phase review: a custom row keeps its own ticks; only requirable answers offered

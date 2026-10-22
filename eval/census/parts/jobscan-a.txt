@@ -1,0 +1,19 @@
+f9cfff6b1a	2026-10-11	Phase review r5 fixes: nested-JSON isolation, stricter base_url, eval reasoning field
+348027fec2	2026-10-11	Phase review r4 fixes: transport billing, oversized JSON, URL scheme, case folding
+7fce1913bc	2026-10-11	Phase review r3 fixes: billing truth on cut-off replies, posting isolation
+81285eae17	2026-10-11	Phase review r2 fixes: no authenticated redirects, typed tag outcomes, billing evidence
+04b0be79b3	2026-10-11	Phase review r1 fixes: strict boundaries, ATS-aware records, usage evidence
+71318e975d	2026-10-12	Review round 4: escaped <br>/<p> layers; parser retry without declarations
+47b66d8a14	2026-10-12	Review round 3: HTML parser fallback; escaped layers found by closing tags
+fb18526a07	2026-10-12	Review round 2: one URL router, a real HTML parser, known-tag unescaping
+028d445442	2026-10-12	Greenhouse review round 1: literal escaped text, id and URL edge cases
+b9e6423bb3	2026-10-12	Review round 3: rollback reconciles what launchd has loaded
+2f533ce33e	2026-10-12	Review round 2: Ctrl-C restores the schedule; init names leftovers
+4501636456	2026-10-12	Phase review fixes: schedule rollback, key always saved, padded values
+ccc76aec88	2026-10-13	Review round 2: Gem Remote marker by whole word; Greenhouse folds before checking
+7fb6834e1e	2026-10-13	Review round 1: decoded /j/ links aren't boards; locations once within an entry
+0300dcdd7a	2026-10-13	Review round 3: generic SMTP errors report their type only
+6f1866708f	2026-10-13	Review round 2: mask the decoded server reply, not its repr
+d0027c2fa0	2026-10-13	Review round 1: strict mailbox, masked errors, typed failures, delivery in mail
+8b1af24dff	2026-10-15	Review fixes: boards add holds a writer lock; an empty flag is a flag given; one encodability rule
+b8a61c1e18	2026-10-15	Review fixes: preview counts only boards the next run reads; boards-file writes refuse unwritable text and name leftovers
