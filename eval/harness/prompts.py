@@ -28,6 +28,18 @@ _WRITER_PREAMBLE = """You are working alone in a git repository (the current dir
 - Work only inside this directory. Do not commit: the harness commits when you finish.
 """
 
+# A replay run: the repository already holds a project, and TASK.md is one change to it.
+_BROWNFIELD_PREAMBLE = """You are working alone in an existing repository (git, the current directory). TASK.md describes a change to it.
+
+- Hidden tests will call the names TASK.md lists and the repository's existing interfaces; match them exactly.
+- Use the `python3` on PATH and the standard library only. Write tests with `unittest` and run them with `python3 -m unittest`.
+- Work only inside this directory. Do not commit: the harness commits when you finish.
+"""
+
+
+def _preamble(brownfield: bool) -> str:
+    return _BROWNFIELD_PREAMBLE if brownfield else _WRITER_PREAMBLE
+
 
 CODE_SECTION = "## Prompt assembly — code review"
 PLAN_SECTION = "## Prompt assembly — plan review"
@@ -75,8 +87,8 @@ def _with_rules(prompt: str) -> str:
     )
 
 
-def solo_writer() -> str:
-    return _WRITER_PREAMBLE + "\nImplement TASK.md, with tests.\n"
+def solo_writer(*, brownfield: bool = False) -> str:
+    return _preamble(brownfield) + "\nImplement TASK.md, with tests.\n"
 
 
 def _without_rules(prompt: str) -> str:
@@ -84,9 +96,9 @@ def _without_rules(prompt: str) -> str:
     return prompt
 
 
-def loop_plan_writer(*, rules: bool = True) -> str:
+def loop_plan_writer(*, rules: bool = True, brownfield: bool = False) -> str:
     return (_with_rules if rules else _without_rules)(
-        _WRITER_PREAMBLE
+        _preamble(brownfield)
         + f"""
 This step is planning only — write no code yet.
 
@@ -115,9 +127,10 @@ def _targets(severities: str, noun: str) -> str:
     return f"{noun} whose effective severity above is HIGH or MEDIUM (LOW {noun}s are optional)"
 
 
-def loop_plan_revision_writer(verdict: str, severities: str = "", *, rules: bool = True) -> str:
+def loop_plan_revision_writer(verdict: str, severities: str = "", *, rules: bool = True,
+                              brownfield: bool = False) -> str:
     return (_with_rules if rules else _without_rules)(
-        _WRITER_PREAMBLE
+        _preamble(brownfield)
         + f"""
 This step is planning only — write no code yet. A reviewer reviewed `{PLAN_PATH}` and SPEC.md:
 
@@ -131,9 +144,9 @@ your design and record the reason under Open questions in the plan. TASK.md stay
     )
 
 
-def loop_build_writer(*, rules: bool = True) -> str:
+def loop_build_writer(*, rules: bool = True, brownfield: bool = False) -> str:
     return (_with_rules if rules else _without_rules)(
-        _WRITER_PREAMBLE
+        _preamble(brownfield)
         + f"""
 Build the plan in `{PLAN_PATH}`, chunk by chunk, to SPEC.md and TASK.md. Write tests for each chunk and run them.
 Tick each chunk in the plan as it passes its check.
@@ -141,10 +154,11 @@ Tick each chunk in the plan as it passes its check.
     )
 
 
-def loop_fix_writer(verdicts: dict[str, str], severities: str = "", *, rules: bool = True) -> str:
+def loop_fix_writer(verdicts: dict[str, str], severities: str = "", *, rules: bool = True,
+                    brownfield: bool = False) -> str:
     reviews = "\n\n".join(f"<{name}-review>\n{text.strip()}\n</{name}-review>" for name, text in verdicts.items())
     return (_with_rules if rules else _without_rules)(
-        _WRITER_PREAMBLE
+        _preamble(brownfield)
         + f"""
 Reviewers reviewed your build:
 
@@ -165,13 +179,14 @@ def followup_writer() -> str:
     )
 
 
-def plan_review() -> str:
+def plan_review(*, brownfield: bool = False) -> str:
     skill = _skill()
     header = fenced_block(skill, "### 1. Header", within=PLAN_SECTION)
     header = header.replace("<plan file path>", PLAN_PATH).replace("<path/to/plan.md>", PLAN_PATH)
     header = header.replace(
         "<1-3 sentences: what the plan is for, what triggered it, what phase it follows.>",
-        "Plan for building the task in TASK.md in an empty repository (first phase).",
+        "Plan for the change TASK.md describes, in an existing repository." if brownfield
+        else "Plan for building the task in TASK.md in an empty repository (first phase).",
     )
     context = (
         "## Context\n\n- **What this plan changes:** see the plan's Goal and Approach.\n"
@@ -186,7 +201,7 @@ def plan_review() -> str:
     ])
 
 
-def code_review(pass_name: str, base: str, *, commits: str, final_state: str) -> str:
+def code_review(pass_name: str, base: str, *, commits: str, final_state: str, brownfield: bool = False) -> str:
     """Correctness ("correctness") or architecture ("architecture") pass over base..HEAD."""
     skill = _skill()
     commands = f"git diff {base}..HEAD\ngit log --oneline {base}..HEAD"
@@ -200,8 +215,12 @@ def code_review(pass_name: str, base: str, *, commits: str, final_state: str) ->
     header = fenced_block(skill, "### 1. Header", within=CODE_SECTION)
     header = header.replace("<feature/phase/chunk name>", "the TASK.md build").replace(
         "<1-3 sentences: what was implemented, plan reference, prior plan-review verdict if any.>",
-        f"The task in TASK.md, built to SPEC.md and `{PLAN_PATH}`.",
+        f"The change TASK.md describes, made to an existing repository, built to SPEC.md and `{PLAN_PATH}`."
+        if brownfield else f"The task in TASK.md, built to SPEC.md and `{PLAN_PATH}`.",
     )
+    constraints = "- Every TASK.md interface name and behaviour holds.\n"
+    if brownfield:
+        constraints += "- The repository's existing behaviour and tests keep working.\n"
     sections = [
         what,
         header,
@@ -209,7 +228,7 @@ def code_review(pass_name: str, base: str, *, commits: str, final_state: str) ->
         f"## Final state\n\n{final_state.strip()}\n",
         "## Load-bearing claims to verify\n\nN/A\n",
         "## Specific concerns (fresh-eye spots)\n\nN/A\n",
-        "## Hard constraints\n\n- Every TASK.md interface name and behaviour holds.\n",
+        f"## Hard constraints\n\n{constraints}",
         CONTRACT_NOTE,
         rubric(),
         fenced_block(skill, profile_heading),

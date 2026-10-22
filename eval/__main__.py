@@ -115,14 +115,25 @@ def _calibrate(args) -> int:
     data_root = _data_root(experiment)
     built = pilot.run_calibration(data_root, experiment, task_ids, arm, args.reps)
     for record in built:
-        scores = record.get("scores") or {}
-        planted = (scores.get("planted") or {}).get("fraction")
-        print(f"{record['run_id']} {record['exec']}: {record['status']}"
-              f" primary={scores.get('primary', float('nan')) * 100:.1f}"
-              f" planted={'n/a' if planted is None else f'{planted * 100:.1f}'}"
-              f" est=${replicated.build_cost(record, experiment):.3f} flags={record.get('flags')}")
-    print(f"calibration spend so far: {openrouter.spent(data_root / pilot.SPEND_LEDGER, 'calibration')}")
+        cost = f" est=${replicated.build_cost(record, experiment):.3f}" if experiment.routed else ""
+        print(f"{record['run_id']} {record['exec']}: {record['status']} {_score_line(record.get('scores') or {})}"
+              f"{cost} flags={record.get('flags')}")
+    if experiment.routed:
+        print(f"calibration spend so far: {openrouter.spent(data_root / pilot.SPEND_LEDGER, 'calibration')}")
     return 0 if built and all(record["status"] == "complete" for record in built) else 1
+
+
+def _percent(value) -> str:
+    return "n/a" if value is None else f"{value * 100:.1f}"
+
+
+def _score_line(scores: dict) -> str:
+    if "replay" in scores:
+        replay = scores["replay"]
+        return (f"review={_percent(replay['review'])} feature={_percent(replay['feature'])}"
+                f" regressions={_percent(replay['regressions'])}")
+    return (f"primary={_percent(scores.get('primary'))}"
+            f" planted={_percent((scores.get('planted') or {}).get('fraction'))}")
 
 
 def _judge(args) -> int:

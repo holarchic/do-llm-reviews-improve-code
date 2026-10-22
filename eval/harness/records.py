@@ -26,18 +26,41 @@ def build(path: Path, digest: str) -> dict | None:
     valid = (
         _identity(record)
         and isinstance(scores, dict)
-        and _fraction(scores.get("primary"))
-        and isinstance(scores.get("hidden_outcomes"), dict)
-        and all(isinstance(v, str) for v in scores["hidden_outcomes"].values())
-        and isinstance(scores.get("static"), dict)
-        and all(isinstance(scores["static"].get(key), int) for key in _STATIC_KEYS)
+        and (_replay(scores["replay"]) if "replay" in scores else _hidden(scores))
         and _valid_steps(record.get("steps"))
         and isinstance(record.get("flags"), list) and all(isinstance(flag, str) for flag in record["flags"])
         and isinstance(record.get("rounds"), dict) and all(isinstance(v, int) for v in record["rounds"].values())
         and (record.get("rep") is None or (_count(record["rep"]) and isinstance(record["rep"], int)))
-        and ("planted" not in scores or _planted(scores["planted"]))
     )
     return record if valid else None
+
+
+def _hidden(scores: dict) -> bool:
+    """A build scored on a task's hidden suite (and, when it has planted bugs, on them)."""
+    return (
+        _fraction(scores.get("primary"))
+        and isinstance(scores.get("hidden_outcomes"), dict)
+        and all(isinstance(v, str) for v in scores["hidden_outcomes"].values())
+        and isinstance(scores.get("static"), dict)
+        and all(isinstance(scores["static"].get(key), int) for key in _STATIC_KEYS)
+        and ("planted" not in scores or _planted(scores["planted"]))
+    )
+
+
+def _replay(replay) -> bool:
+    """A build scored on a replay task: `review` is None exactly when the task has no defects (a control)."""
+    if not isinstance(replay, dict) or not isinstance(replay.get("defects"), list):
+        return False
+    defects = replay["defects"]
+    return (
+        all(isinstance(d, dict) and isinstance(d.get("id"), str) and isinstance(d.get("avoided"), bool)
+            for d in defects)
+        and (replay.get("review") is None if not defects else _fraction(replay.get("review")))
+        and _fraction(replay.get("feature"))
+        and _fraction(replay.get("regressions"))
+        and isinstance(replay.get("outcomes"), dict)
+        and all(isinstance(k, str) and isinstance(v, str) for k, v in replay["outcomes"].items())
+    )
 
 
 def _planted(planted) -> bool:

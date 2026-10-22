@@ -19,7 +19,7 @@ import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import agents, audit, openrouter, planted, procs, prompts, records, score
+from . import agents, audit, openrouter, planted, procs, prompts, records, score, source
 from .tasks import Task
 
 MAX_ATTEMPTS = 3
@@ -81,6 +81,9 @@ class _Run:
     flags: list[str] = field(default_factory=list)
     rounds: dict[str, int] = field(default_factory=dict)
     basis_rule: bool = False
+    # A replay run starts from an existing repository, whose own suite runs for minutes.
+    brownfield: bool = False
+    suite_seconds: float = score.SUITE_SECONDS
 
 
 _ISSUE_START = re.compile(r"^\s*(\d+)\.\s*\[(HIGH|MEDIUM|LOW)\]", re.MULTILINE)
@@ -144,8 +147,10 @@ def execute_run(task: Task, arm: Arm, runs_root: Path, *, rep: int | None = None
                 manifest_hash: str | None) -> dict:
     run_id_ = run_id(task.id, arm.name, rep)
     exec_dir = _next_exec_dir(runs_root.resolve() / run_id_)
+    brownfield = task.source is not None
     run = _Run(repo=audit.anonymous_workdir() / "repo", exec_dir=exec_dir, arm=arm,
-               basis_rule=prompts.basis_required())
+               basis_rule=prompts.basis_required(), brownfield=brownfield,
+               suite_seconds=source.SUITE_SECONDS if brownfield else score.SUITE_SECONDS)
     record = {"run_id": run_id_, "task": task.id, "arm": arm.name, "rep": rep, "exec": exec_dir.name,
               "manifest": manifest_hash, "cli_versions": _cli_versions(), "started": _now()}
 
@@ -154,6 +159,8 @@ def execute_run(task: Task, arm: Arm, runs_root: Path, *, rep: int | None = None
         (_loop if arm.reviewer else _solo)(run)
 
     def scores(artifact: Path) -> dict:
+        if brownfield:
+            return source.score_build(artifact, task, exec_dir / "scoring")
         result = score.score_build(artifact, task, exec_dir / "scoring")
         if task.variants("mutants"):
             result["planted"] = planted.score_build(artifact, task, exec_dir / "scoring" / "planted")
@@ -289,32 +296,34 @@ def latest_complete_exec(runs_root: Path, run_id: str) -> Path:
 
 
 def _solo(run: _Run) -> None:
-    _writer(run, "build", prompts.solo_writer())
+    _writer(run, "build", prompts.solo_writer(brownfield=run.brownfield))
 
 
 def _loop(run: _Run) -> None:
-    rules = run.arm.writer_rules
-    _writer(run, "plan", prompts.loop_plan_writer(rules=rules))
+    rules, brownfield = run.arm.writer_rules, run.brownfield
+    _writer(run, "plan", prompts.loop_plan_writer(rules=rules, brownfield=brownfield))
     for round_no in range(1, MAX_ROUNDS + 1 if run.arm.plan_review else 1):
         run.rounds["plan"] = round_no
-        verdict = _review(run, f"plan-review-{round_no}", prompts.plan_review())
+        verdict = _review(run, f"plan-review-{round_no}", prompts.plan_review(brownfield=brownfield))
         if not verdict.blocking:
             break
         if round_no == MAX_ROUNDS:
             run.flags.append("plan_capped")
             break
         _writer(run, f"plan-revise-{round_no}", prompts.loop_plan_revision_writer(
-            verdict.text, severity_note({"plan": verdict}) if run.basis_rule else "", rules=rules))
+            verdict.text, severity_note({"plan": verdict}) if run.basis_rule else "", rules=rules,
+            brownfield=brownfield))
 
     base = run.last_commit
-    _writer(run, "build", prompts.loop_build_writer(rules=rules))
+    _writer(run, "build", prompts.loop_build_writer(rules=rules, brownfield=brownfield))
     for round_no in range(1, MAX_ROUNDS + 1):
         run.rounds["phase"] = round_no
         commits = _git(run.repo, "log", "--oneline", f"{base}..HEAD")
         final_state = _own_tests_summary(run)
         verdicts = {
             name: _review(run, f"{name}-review-{round_no}",
-                          prompts.code_review(name, base, commits=commits, final_state=final_state))
+                          prompts.code_review(name, base, commits=commits, final_state=final_state,
+                                              brownfield=brownfield))
             for name in run.arm.passes
         }
         if not any(v.blocking for v in verdicts.values()):
@@ -324,7 +333,7 @@ def _loop(run: _Run) -> None:
             break
         _writer(run, f"fix-{round_no}", prompts.loop_fix_writer(
             {n: v.text for n, v in verdicts.items()}, severity_note(verdicts) if run.basis_rule else "",
-            rules=rules))
+            rules=rules, brownfield=brownfield))
 
 
 def _writer(run: _Run, name: str, prompt: str) -> None:
@@ -392,7 +401,7 @@ def _own_tests_summary(run: _Run) -> str:
     """The builder's own test run, reported to reviewers the way a builder reports Final state."""
     log = run.exec_dir / "own-tests.log"
     result = procs.run([sys.executable, "-B", "-m", "unittest", "discover"], cwd=run.repo,
-                       timeout=score.SUITE_SECONDS, stdout_path=log)
+                       timeout=run.suite_seconds, stdout_path=log)
     tail = [line for line in log.read_text(encoding="utf-8", errors="replace").splitlines()
             if line.startswith(("Ran ", "OK", "FAILED"))]
     outcome = "timed out" if result.timed_out else " / ".join(tail) or f"exit {result.exit_code}, no summary"
@@ -400,9 +409,15 @@ def _own_tests_summary(run: _Run) -> str:
 
 
 def _init_repo(run: _Run, task: Task) -> None:
-    run.repo.mkdir(parents=True)
-    shutil.copy2(task.path("TASK.md"), run.repo / "TASK.md")
-    (run.repo / ".gitignore").write_text(_REPO_GITIGNORE, encoding="utf-8")
+    if task.source is not None:
+        source.seed(task, run.repo)
+        ignore = run.repo / ".gitignore"
+        if not ignore.exists():
+            ignore.write_text(_REPO_GITIGNORE, encoding="utf-8")
+    else:
+        run.repo.mkdir(parents=True)
+        shutil.copy2(task.path("TASK.md"), run.repo / "TASK.md")
+        (run.repo / ".gitignore").write_text(_REPO_GITIGNORE, encoding="utf-8")
     _git(run.repo, "init", "-q")
     run.last_commit = _commit(run.repo, "task")
 
