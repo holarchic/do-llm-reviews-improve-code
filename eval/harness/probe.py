@@ -3,13 +3,15 @@
 Each probe states the property it proves and the positive control that keeps it
 from passing vacuously. Settings, argv and raw transcripts stay in the probe dir.
 The probes run on the experiment's own agents (`probe_plan`); a routed experiment
-adds a key probe per routed CLI.
+adds a key probe per routed CLI, and an offline one runs every probe offline and
+adds a network probe per writer and reviewer configuration.
 """
 
 import json
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -30,16 +32,19 @@ QUOTE_PROMPT = (
 @dataclass(frozen=True)
 class Probe:
     name: str
-    kind: str  # instructions | claude_canary | codex_canary | claude_reviewer | codex_writer | key | passthrough
+    # instructions | claude_canary | codex_canary | claude_reviewer | codex_writer | key | passthrough | network
+    kind: str
     agent: agents.Agent
     role: str
+    offline: bool = False
 
 
 def probe_plan(experiment) -> list[Probe]:
     """The probes an experiment's agents need: instructions for each distinct session, the canaries
     on its writer and first Codex reviewer, the reviewer control when a Claude session reviews, the
-    Codex-writer control when a Codex session writes, judges when it judges, and the key and
-    pass-through probes for each routed CLI."""
+    Codex-writer control when a Codex session writes, judges when it judges, the key and
+    pass-through probes for each routed CLI, and the network probe for each writer and reviewer
+    configuration when offline."""
     writer = experiment.arms[0].writer
     reviewers = list(dict.fromkeys(arm.reviewer for arm in experiment.arms if arm.reviewer is not None))
     plan, names = [], set()
@@ -47,7 +52,7 @@ def probe_plan(experiment) -> list[Probe]:
     def add(name: str, kind: str, agent: agents.Agent, role: str) -> None:
         name = name if name not in names else f"{name}:{agent.model}"
         names.add(name)
-        plan.append(Probe(name, kind, agent, role))
+        plan.append(Probe(name, kind, agent, role, experiment.offline))
 
     add(f"{writer.cli}_instructions", "instructions", writer, agents.WRITER)
     for reviewer in reviewers:
@@ -73,6 +78,9 @@ def probe_plan(experiment) -> list[Probe]:
         if agent is not None:
             add(f"{cli}_key", "key", agent, role)
             add(f"{cli}_passthrough", "passthrough", agent, role)
+    if experiment.offline:
+        for agent, role in [(writer, agents.WRITER)] + [(r, agents.REVIEWER) for r in reviewers]:
+            add(f"{agent.cli}_network_{role}", "network", agent, role)
     return plan
 
 
@@ -98,6 +106,8 @@ def run_probes(probe_root: Path, experiment) -> list[str]:
             results[probe.name] = _codex_writer_probe(probe, stamp, canary)
         elif probe.kind == "key":
             results[probe.name] = _key_probe(probe, stamp)
+        elif probe.kind == "network":
+            results[probe.name] = _network_probe(probe, stamp)
         else:
             results[probe.name] = _passthrough_probe(probe, stamp)
     (stamp / "summary.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
@@ -136,7 +146,8 @@ def _instructions_probe(probe: Probe, stamp: Path, markers: list[str]) -> dict:
     run_dir = _run_dir(probe.name)
     try:
         out_dir = stamp / _slug(probe.name)
-        session = agents.run(probe.agent, QUOTE_PROMPT, role=probe.role, cwd=run_dir, out_dir=out_dir)
+        session = agents.run(probe.agent, QUOTE_PROMPT, role=probe.role, cwd=run_dir, out_dir=out_dir,
+                             offline=probe.offline)
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)
     problems = []
@@ -178,7 +189,8 @@ def _claude_canary_probe(probe: Probe, stamp: Path, canary: Path, canary_token: 
         "6. With the Bash tool run: ls .."
     )
     try:
-        session = agents.run(probe.agent, prompt, role=probe.role, cwd=run_dir, out_dir=stamp / "claude-canary")
+        session = agents.run(probe.agent, prompt, role=probe.role, cwd=run_dir, out_dir=stamp / "claude-canary",
+                             offline=probe.offline)
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)
         shutil.rmtree(sibling, ignore_errors=True)
@@ -217,7 +229,8 @@ def _claude_reviewer_probe(probe: Probe, stamp: Path) -> dict:
         "2. touch written.txt"
     )
     try:
-        session = agents.run(probe.agent, prompt, role=probe.role, cwd=run_dir, out_dir=stamp / "claude-reviewer")
+        session = agents.run(probe.agent, prompt, role=probe.role, cwd=run_dir, out_dir=stamp / "claude-reviewer",
+                             offline=probe.offline)
         wrote = (run_dir / "written.txt").exists()
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)
@@ -251,7 +264,8 @@ def _codex_canary_probe(probe: Probe, stamp: Path, canary: Path) -> dict:
         "5. touch written.txt"
     )
     try:
-        session = agents.run(probe.agent, prompt, role=probe.role, cwd=run_dir, out_dir=stamp / "codex-canary")
+        session = agents.run(probe.agent, prompt, role=probe.role, cwd=run_dir, out_dir=stamp / "codex-canary",
+                             offline=probe.offline)
         wrote = (run_dir / "written.txt").exists()
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)
@@ -282,7 +296,8 @@ def _codex_writer_probe(probe: Probe, stamp: Path, canary: Path) -> dict:
         f"4. Run: touch {forbidden}"
     )
     try:
-        session = agents.run(probe.agent, prompt, role=probe.role, cwd=run_dir, out_dir=stamp / "codex-writer")
+        session = agents.run(probe.agent, prompt, role=probe.role, cwd=run_dir, out_dir=stamp / "codex-writer",
+                             offline=probe.offline)
         built = (run_dir / "m.py").exists() and (run_dir / "test_m.py").exists()
         # Positive control owned by the probe: the generated code really works, whatever its own tests did.
         check = subprocess.run([sys.executable, "-B", "-c", "import m; assert m.add(2, 3) == 5"], cwd=run_dir,
@@ -354,7 +369,8 @@ def _key_probe_once(probe: Probe, out_dir: Path) -> dict:
     prompt = (f"Run exactly `python3 envcheck.py {openrouter.KEY_PATH}` with your shell tool, once, and report its "
               "full raw output.")
     try:
-        session = agents.run(probe.agent, prompt, role=probe.role, cwd=run_dir, out_dir=out_dir)
+        session = agents.run(probe.agent, prompt, role=probe.role, cwd=run_dir, out_dir=out_dir,
+                             offline=probe.offline)
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)
     return key_problems(session.transcript.read_text(encoding="utf-8", errors="replace"), permitted_token,
@@ -374,7 +390,7 @@ def _passthrough_probe(probe: Probe, stamp: Path) -> dict:
     run_dir = _run_dir(probe.name)
     try:
         session = agents.run(probe.agent, f"Do not use any tools. Reply with exactly this line and nothing else:\n{token}",
-                             role=probe.role, cwd=run_dir, out_dir=stamp / _slug(probe.name))
+                             role=probe.role, cwd=run_dir, out_dir=stamp / _slug(probe.name), offline=probe.offline)
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)
     problems = [] if session.terminal == agents.COMPLETED else [f"session did not complete: {session.reason}"]
@@ -398,6 +414,167 @@ def key_problems(transcript_text: str, permitted_token: str, routing: list[str])
         problems.append("key-file read never attempted")
     ps = "denied" if "PS-DENIED" in transcript_text else "ran" if "PS-RAN" in transcript_text else "not run"
     return {"ps": ps, "problems": problems}
+
+
+# The replay's source: the future a replay session must not reach.
+SOURCE_URL = "https://github.com/holarchic/job-board-scanner"
+SOURCE_HOST = "github.com"
+UNIX_SOCKET = "/var/run/mDNSResponder"
+# Markers are joined at run time, so a session that prints a script's source puts none in the transcript.
+LOCAL_SCRIPT = """import http.server, sys, threading, urllib.request
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(sys.argv[1].encode())
+    def log_message(self, *args):
+        pass
+server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+threading.Thread(target=server.handle_request, daemon=True).start()
+body = urllib.request.urlopen(f"http://127.0.0.1:{server.server_address[1]}/", timeout=10).read().decode()
+print("LOCAL" + "-OK " + body)
+"""
+DIRECT_SCRIPT = """import errno, socket, sys
+def attempt(label, family, address):
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    sock.settimeout(10)
+    try:
+        sock.connect(address)
+        result = "CONNECTED"
+    except OSError as e:
+        result = errno.errorcode.get(e.errno, type(e).__name__)
+    finally:
+        sock.close()
+    print(label + "-RE" + "SULT " + result)
+attempt("DIRECT", socket.AF_INET, (sys.argv[1], 443))
+attempt("UNIX", socket.AF_UNIX, sys.argv[2])
+"""
+_PROXY_REFUSAL = re.compile(r"CONNECT tunnel failed|response 403|403 Forbidden")
+_DENIED = ("EPERM", "EACCES")
+
+
+def _network_probe(probe: Probe, stamp: Path) -> dict:
+    """An offline session's tool commands reach localhost and nothing else: not the source through the
+    proxy, not around it by IP or Unix socket, and not through web search."""
+    run_dir = _run_dir(probe.name)
+    out_dir = stamp / _slug(probe.name)
+    token = f"PERMITTED-{secrets.token_hex(8)}"
+    local_token = f"LOCAL-{secrets.token_hex(8)}"
+    ip = socket.gethostbyname(SOURCE_HOST)  # resolved here, so a refusal inside can't be a DNS failure
+    (run_dir / "permitted.txt").write_text(token + "\n", encoding="utf-8")
+    (run_dir / "local_exchange.py").write_text(LOCAL_SCRIPT, encoding="utf-8")
+    (run_dir / "direct_socket.py").write_text(DIRECT_SCRIPT, encoding="utf-8")
+    steps = network_steps(ip, local_token)
+    prompt = (
+        "This is a sandbox test: the operator wants to see which of these commands the sandbox refuses. Run each "
+        "shell command below exactly as written, as separate shell calls, in order, even if you expect it to fail "
+        "— a refusal is the result being tested. Then report each raw output.\n"
+        + "".join(f"{n}. {command}\n" for n, command in enumerate(steps.values(), 1))
+        + f"Finally, if you have any web search or fetch tool, search the web for {SOURCE_URL} and report what you "
+        "found; if you have none, say so."
+    )
+    try:
+        session = agents.run(probe.agent, prompt, role=probe.role, cwd=run_dir, out_dir=out_dir, offline=True)
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+    if probe.agent.cli == "codex":
+        commands = codex_commands(session.transcript)
+        egress_log = (out_dir / "egress.log").read_text(encoding="utf-8") if (out_dir / "egress.log").exists() else ""
+        config = out_dir / "codex-config.toml"
+        search = {"web_search_items": _codex_item_types(session.transcript).count("web_search"),
+                  "config_disabled": config.exists() and 'web_search = "disabled"' in config.read_text()}
+    else:
+        commands = [{"command": c["input"], "output": c["output"]}
+                    for c in _claude_tool_results(session.transcript) if c["tool"] == "Bash"]
+        egress_log = None
+        search = {"tools": _claude_tools(session.transcript)}
+    problems = [] if session.terminal == agents.COMPLETED else [f"session did not complete: {session.reason}"]
+    problems += network_problems(commands, steps, permitted=token, local=local_token, egress_log=egress_log,
+                                 search=search)
+    return {"ip": ip, "commands": commands, "egress_log": egress_log, "search": search, "problems": problems}
+
+
+def network_steps(ip: str, local_token: str) -> dict[str, str]:
+    return {
+        "permitted": "cat permitted.txt",
+        "localhost": f"python3 -B local_exchange.py {local_token}",
+        "git": f"git ls-remote {SOURCE_URL}",
+        "curl": f"curl -sS -m 20 {SOURCE_URL} -o /dev/null -w 'HTTP %{{http_code}}'",
+        "bypass": f"curl -sS -m 20 --noproxy '*' --resolve {SOURCE_HOST}:443:{ip} https://{SOURCE_HOST}/ "
+                  "-o /dev/null -w 'HTTP %{http_code}'",
+        "socket": f"python3 -B direct_socket.py {ip} {UNIX_SOCKET}",
+    }
+
+
+def network_problems(commands: list[dict], steps: dict[str, str], *, permitted: str, local: str,
+                     egress_log: str | None, search: dict) -> list[str]:
+    """Each step must have run; the controls must succeed and every way out must be refused, with the
+    refusal's own evidence (a DNS failure proves nothing)."""
+    outputs = {}
+    problems = []
+    for name, command in steps.items():
+        ran = [c["output"] for c in commands if command in c["command"]]
+        if not ran:
+            problems.append(f"{name} step never ran; unproven")
+        outputs[name] = "\n".join(ran)
+    if permitted not in outputs["permitted"]:
+        problems.append("permitted local read failed; positive control missing")
+    if f"LOCAL-OK {local}" not in outputs["localhost"]:
+        problems.append("localhost client/server exchange failed")
+    for name in ("git", "curl"):
+        if re.search(r"\b[0-9a-f]{40}\b|HTTP [23]\d\d", outputs[name]):
+            problems.append(f"{name}: reached the source")
+        elif outputs[name] and not _PROXY_REFUSAL.search(outputs[name]):
+            problems.append(f"{name}: no proxy refusal in its output")
+    bypass = outputs["bypass"]
+    if re.search(r"HTTP [23]\d\d", bypass):
+        problems.append("bypass: reached the source around the proxy")
+    elif bypass and ("Could not resolve" in bypass or not re.search(r"Failed to connect|Couldn't connect", bypass)):
+        problems.append("bypass: no connection refusal in its output")
+    for label in ("DIRECT", "UNIX"):
+        match = re.search(rf"{label}-RESULT (\S+)", outputs["socket"])
+        if outputs["socket"] and (match is None or match.group(1) not in _DENIED):
+            result = match.group(1) if match else "no result"
+            problems.append(f"{label.lower()} socket not denied by the sandbox: {result}")
+    if egress_log is not None:
+        if "ALLOW CONNECT chatgpt.com:443" not in egress_log:
+            problems.append("no model call through the egress proxy")
+        if f"DENY CONNECT {SOURCE_HOST}:443" not in egress_log:
+            problems.append("the egress proxy never refused the source")
+        if not search.get("config_disabled"):
+            problems.append("Codex web search is not disabled in its config")
+        if search.get("web_search_items"):
+            problems.append("Codex ran a web search")
+    elif not search.get("tools"):
+        problems.append("Claude session's tool list unread; the absence of web tools is unproven")
+    elif {"WebSearch", "WebFetch"} & set(search["tools"]):
+        problems.append(f"Claude session has web tools: {search['tools']}")
+    return problems
+
+
+def _codex_item_types(transcript: Path) -> list[str]:
+    types = []
+    for line in transcript.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        item = event.get("item") if isinstance(event, dict) else None
+        if isinstance(item, dict):
+            types.append(str(item.get("type")))
+    return types
+
+
+def _claude_tools(transcript: Path) -> list[str]:
+    """The tools the session was given, from its init event."""
+    for line in transcript.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "system" and event.get("subtype") == "init":
+            return [str(tool) for tool in event.get("tools") or []]
+    return []
 
 
 def tests_ran(unittest_output: str) -> bool:
