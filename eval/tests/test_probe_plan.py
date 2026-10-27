@@ -105,6 +105,12 @@ class NetworkProblemsTest(unittest.TestCase):
         for expected in ("direct socket not denied", "unix socket not denied", "git: no proxy refusal"):
             self.assertTrue(any(p.startswith(expected) for p in found), (expected, found))
 
+    def test_a_denial_then_a_connection_in_one_output_is_caught(self):
+        found = self.problems({"socket": "DIRECT-RESULT EPERM\nUNIX-RESULT EPERM\nDIRECT-RESULT CONNECTED\n"
+                                         "UNIX-RESULT CONNECTED"})
+        self.assertTrue(any(p.startswith("direct socket not denied") for p in found), found)
+        self.assertTrue(any(p.startswith("unix socket not denied") for p in found), found)
+
     def test_a_step_that_never_ran_is_unproven(self):
         self.assertIn("bypass step never ran; unproven", self.problems(drop=("bypass",)))
 
