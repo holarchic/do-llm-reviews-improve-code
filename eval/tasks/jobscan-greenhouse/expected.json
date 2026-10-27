@@ -1,0 +1,251 @@
+{
+  "feature": [
+    "tests.test_hidden_feature_greenhouse.BoardTest.test_api_url_on_another_host_is_kept",
+    "tests.test_hidden_feature_greenhouse.BoardTest.test_encoded_tokens_are_one_board_and_encoded_again_for_the_api",
+    "tests.test_hidden_feature_greenhouse.BoardTest.test_every_url_form_is_one_board",
+    "tests.test_hidden_feature_greenhouse.BoardTest.test_other_urls_are_not_greenhouse",
+    "tests.test_hidden_feature_greenhouse.GreenhouseRunTest.test_ashby_and_greenhouse_boards_in_one_digest",
+    "tests.test_hidden_feature_greenhouse.ParseTest.test_a_malformed_job_fails_the_board",
+    "tests.test_hidden_feature_greenhouse.ParseTest.test_escaped_once_or_twice_gives_the_same_text",
+    "tests.test_hidden_feature_greenhouse.ParseTest.test_ids_may_be_numbers_or_strings",
+    "tests.test_hidden_feature_greenhouse.ParseTest.test_missing_location_and_offices_are_empty",
+    "tests.test_hidden_feature_greenhouse.ParseTest.test_posting_fields"
+  ],
+  "review": [
+    "tests.test_hidden_review_greenhouse.BoardUrlTest.test_a_semicolon_stays_in_the_token_written_or_encoded",
+    "tests.test_hidden_review_greenhouse.BoardUrlTest.test_host_case_and_the_default_port_are_one_board",
+    "tests.test_hidden_review_greenhouse.LiteralTextTest.test_escaped_text_in_the_posting_survives_any_number_of_escapings",
+    "tests.test_hidden_review_greenhouse.MalformedJobTest.test_an_id_with_a_lone_surrogate_fails_the_board",
+    "tests.test_hidden_review_greenhouse.MalformedJobTest.test_an_office_that_is_not_an_object_fails_the_board"
+  ],
+  "defects": [
+    {
+      "id": "semicolon-cuts-the-token",
+      "tests": [
+        "tests.test_hidden_review_greenhouse.BoardUrlTest.test_a_semicolon_stays_in_the_token_written_or_encoded"
+      ],
+      "pre_review": {
+        "tests.test_hidden_review_greenhouse.BoardUrlTest.test_a_semicolon_stays_in_the_token_written_or_encoded": {
+          "outcome": "fail",
+          "exc": "AssertionError",
+          "stage": "call",
+          "trace": "Traceback (most recent call last):\n  File \"/opt/homebrew/Cellar/python@3.15/3.15.0/Frameworks/Python.framework/Versions/3.15/lib/python3.15/unittest/case.py\", line 58, in testPartExecutor\n    yield\n  File \"/opt/homebrew/Cellar/python@3.15/3.15.0/Frameworks/Python.framework/Versions/3.15/lib/python3.15/unittest/case.py\", line 691, in run\n    self._callTestMethod(testMethod)\n    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^\n  File \"/opt/homebrew/Cellar/python@3.15/3.15.0/Frameworks/Python.framework/Versions/3.15/lib/python3.15/unittest/case.py\", line 637, in _callTestMethod\n    result = method()\n  File \"/private/var/folders/23/_fx5zrts7hvb_j_6m144_hcr0000gn/T/eval-validate-hk52a335/runs/pre_review-1/code/tests/test_hidden_review_greenhouse.py\", line 44, in test_a_semicolon_stays_in_the_token_written_or_encoded\n    self.assertEqual(getattr(board_for(url), \"id\", None), \"greenhouse:x;y\", url)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: 'greenhouse:x' != 'greenhouse:x;y'\n- greenhouse:x\n+ greenhouse:x;y\n?             ++\n : https://job-boards.greenhouse.io/x;y\n"
+        }
+      }
+    },
+    {
+      "id": "host-case-or-port-not-a-board",
+      "tests": [
+        "tests.test_hidden_review_greenhouse.BoardUrlTest.test_host_case_and_the_default_port_are_one_board"
+      ],
+      "pre_review": {
+        "tests.test_hidden_review_greenhouse.BoardUrlTest.test_host_case_and_the_default_port_are_one_board": {
+          "outcome": "fail",
+          "exc": "AssertionError",
+          "stage": "call",
+          "trace": "Traceback (most recent call last):\n  File \"/opt/homebrew/Cellar/python@3.15/3.15.0/Frameworks/Python.framework/Versions/3.15/lib/python3.15/unittest/case.py\", line 58, in testPartExecutor\n    yield\n  File \"/opt/homebrew/Cellar/python@3.15/3.15.0/Frameworks/Python.framework/Versions/3.15/lib/python3.15/unittest/case.py\", line 691, in run\n    self._callTestMethod(testMethod)\n    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^\n  File \"/opt/homebrew/Cellar/python@3.15/3.15.0/Frameworks/Python.framework/Versions/3.15/lib/python3.15/unittest/case.py\", line 637, in _callTestMethod\n    result = method()\n  File \"/private/var/folders/23/_fx5zrts7hvb_j_6m144_hcr0000gn/T/eval-validate-hk52a335/runs/pre_review-1/code/tests/test_hidden_review_greenhouse.py\", line 48, in test_host_case_and_the_default_port_are_one_board\n    self.assertEqual(getattr(board_for(url), \"id\", None), \"greenhouse:acme\", url)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: None != 'greenhouse:acme' : https://Job-Boards.Greenhouse.io/acme\n"
+        }
+      }
+    },
+    {
+      "id": "posting-text-lost-to-over-unescaping",
+      "tests": [
+        "tests.test_hidden_review_greenhouse.LiteralTextTest.test_escaped_text_in_the_posting_survives_any_number_of_escapings"
+      ],
+      "pre_review": {
+        "tests.test_hidden_review_greenhouse.LiteralTextTest.test_escaped_text_in_the_posting_survives_any_number_of_escapings": {
+          "outcome": "fail",
+          "exc": "AssertionError",
+          "stage": "call",
+          "trace": "Traceback (most recent call last):\n  File \"/opt/homebrew/Cellar/python@3.15/3.15.0/Frameworks/Python.framework/Versions/3.15/lib/python3.15/unittest/case.py\", line 58, in testPartExecutor\n    yield\n  File \"/opt/homebrew/Cellar/python@3.15/3.15.0/Frameworks/Python.framework/Versions/3.15/lib/python3.15/unittest/case.py\", line 691, in run\n    self._callTestMethod(testMethod)\n    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^\n  File \"/opt/homebrew/Cellar/python@3.15/3.15.0/Frameworks/Python.framework/Versions/3.15/lib/python3.15/unittest/case.py\", line 637, in _callTestMethod\n    result = method()\n  File \"/private/var/folders/23/_fx5zrts7hvb_j_6m144_hcr0000gn/T/eval-validate-hk52a335/runs/pre_review-1/code/tests/test_hidden_review_greenhouse.py\", line 55, in test_escaped_text_in_the_posting_survives_any_number_of_escapings\n    self.assertEqual(description(content), \"Use <customer> APIs.\", content)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: 'Use APIs.' != 'Use <customer> APIs.'\n- Use APIs.\n+ Use <customer> APIs.\n : <p>Use &lt;customer&gt; APIs.</p>\n"
+        }
+      }
+    },
+    {
+      "id": "office-that-is-not-an-object-accepted",
+      "tests": [
+        "tests.test_hidden_review_greenhouse.MalformedJobTest.test_an_office_that_is_not_an_object_fails_the_board"
+      ],
+      "pre_review": {
+        "tests.test_hidden_review_greenhouse.MalformedJobTest.test_an_office_that_is_not_an_object_fails_the_board": {
+          "outcome": "fail",
+          "exc": "AssertionError",
+          "stage": "call",
+          "trace": "Traceback (most recent call last):\n  File \"/opt/homebrew/Cellar/python@3.15/3.15.0/Frameworks/Python.framework/Versions/3.15/lib/python3.15/unittest/case.py\", line 58, in testPartExecutor\n    yield\n  File \"/opt/homebrew/Cellar/python@3.15/3.15.0/Frameworks/Python.framework/Versions/3.15/lib/python3.15/unittest/case.py\", line 691, in run\n    self._callTestMethod(testMethod)\n    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^\n  File \"/opt/homebrew/Cellar/python@3.15/3.15.0/Frameworks/Python.framework/Versions/3.15/lib/python3.15/unittest/case.py\", line 637, in _callTestMethod\n    result = method()\n  File \"/private/var/folders/23/_fx5zrts7hvb_j_6m144_hcr0000gn/T/eval-validate-hk52a335/runs/pre_review-1/code/tests/test_hidden_review_greenhouse.py\", line 60, in test_an_office_that_is_not_an_object_fails_the_board\n    with self.assertRaises(BoardError):\n         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^\nAssertionError: BoardError not raised\n"
+        }
+      }
+    },
+    {
+      "id": "id-with-a-lone-surrogate-accepted",
+      "tests": [
+        "tests.test_hidden_review_greenhouse.MalformedJobTest.test_an_id_with_a_lone_surrogate_fails_the_board"
+      ],
+      "pre_review": {
+        "tests.test_hidden_review_greenhouse.MalformedJobTest.test_an_id_with_a_lone_surrogate_fails_the_board": {
+          "outcome": "fail",
+          "exc": "AssertionError",
+          "stage": "call",
+          "trace": "Traceback (most recent call last):\n  File \"/opt/homebrew/Cellar/python@3.15/3.15.0/Frameworks/Python.framework/Versions/3.15/lib/python3.15/unittest/case.py\", line 58, in testPartExecutor\n    yield\n  File \"/opt/homebrew/Cellar/python@3.15/3.15.0/Frameworks/Python.framework/Versions/3.15/lib/python3.15/unittest/case.py\", line 691, in run\n    self._callTestMethod(testMethod)\n    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^\n  File \"/opt/homebrew/Cellar/python@3.15/3.15.0/Frameworks/Python.framework/Versions/3.15/lib/python3.15/unittest/case.py\", line 637, in _callTestMethod\n    result = method()\n  File \"/private/var/folders/23/_fx5zrts7hvb_j_6m144_hcr0000gn/T/eval-validate-hk52a335/runs/pre_review-1/code/tests/test_hidden_review_greenhouse.py\", line 64, in test_an_id_with_a_lone_surrogate_fails_the_board\n    with self.assertRaises(BoardError):\n         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^\nAssertionError: BoardError not raised\n"
+        }
+      }
+    }
+  ],
+  "regression": [
+    "tests.test_config.ConfigTest.test_bad_base_url",
+    "tests.test_config.ConfigTest.test_bad_custom_tags_rejected",
+    "tests.test_config.ConfigTest.test_boards_file_is_optional_and_resolves_against_home",
+    "tests.test_config.ConfigTest.test_custom_tags_alone_need_no_builtins",
+    "tests.test_config.ConfigTest.test_custom_tags_in_file_order_with_defaults",
+    "tests.test_config.ConfigTest.test_duplicate_tags_rejected",
+    "tests.test_config.ConfigTest.test_empty_exclusions_allowed",
+    "tests.test_config.ConfigTest.test_key_file_when_the_environment_has_none",
+    "tests.test_config.ConfigTest.test_key_never_sent_to_other_endpoints",
+    "tests.test_config.ConfigTest.test_openrouter_needs_pinned_provider_and_a_clean_key",
+    "tests.test_config.ConfigTest.test_unreadable_toml_is_a_config_error",
+    "tests.test_crawl.CapturesTest.test_bad_content_range_is_an_error",
+    "tests.test_crawl.CapturesTest.test_binary_search_reads_a_fraction_of_a_large_index",
+    "tests.test_crawl.CapturesTest.test_block_past_end_of_file_is_an_error",
+    "tests.test_crawl.CapturesTest.test_captures_inside_the_last_block_that_starts_before_the_host",
+    "tests.test_crawl.CapturesTest.test_cdx_line_with_a_bad_timestamp_or_a_surrogate_url_is_an_error",
+    "tests.test_crawl.CapturesTest.test_corrupt_block_is_an_error",
+    "tests.test_crawl.CapturesTest.test_finds_every_capture_wherever_the_host_starts_and_ends",
+    "tests.test_crawl.CapturesTest.test_index_line_without_a_timestamp_is_an_error",
+    "tests.test_crawl.CapturesTest.test_keeps_only_status_200_html",
+    "tests.test_crawl.CapturesTest.test_malformed_cdx_record_is_an_error",
+    "tests.test_crawl.CapturesTest.test_malformed_index_line_is_an_error",
+    "tests.test_crawl.CapturesTest.test_no_captures_is_an_error",
+    "tests.test_crawl.CapturesTest.test_non_ascii_index_line_is_an_error",
+    "tests.test_crawl.CapturesTest.test_persistent_failure_is_an_error",
+    "tests.test_crawl.CapturesTest.test_record_with_a_non_string_field_is_an_error",
+    "tests.test_crawl.CapturesTest.test_retries_then_reads",
+    "tests.test_crawl.CapturesTest.test_server_ignoring_range_is_an_error",
+    "tests.test_crawl.LatestCrawlsTest.test_newest_distinct_crawls",
+    "tests.test_crawl.LatestCrawlsTest.test_too_few_crawls_is_an_error",
+    "tests.test_crawl.LatestCrawlsTest.test_undecodable_crawl_list_is_an_error",
+    "tests.test_crawl.SurtTest.test_host_prefix",
+    "tests.test_digest.PublishTest.test_file_appearing_after_name_choice_survives",
+    "tests.test_digest.PublishTest.test_same_day_digests_get_suffixes_and_nothing_is_overwritten",
+    "tests.test_digest.PublishTest.test_unwritable_directory_raises",
+    "tests.test_digest.RenderTest.test_header_and_entry",
+    "tests.test_digest.RenderTest.test_header_counts_carry_over",
+    "tests.test_digest.RenderTest.test_no_legend_without_unvalidated_tags_shown",
+    "tests.test_digest.RenderTest.test_tag_lines",
+    "tests.test_digest.RenderTest.test_unvalidated_tags_marked_with_one_legend",
+    "tests.test_discover.DiscoverTest.test_missing_home_is_a_usage_error",
+    "tests.test_discover.DiscoverTest.test_refused_while_a_run_holds_the_lock",
+    "tests.test_eval.EvalCommandTest.test_eval_calls_the_model_through_tag_posting",
+    "tests.test_eval.EvalCommandTest.test_malformed_set_is_a_usage_error_before_any_model_call",
+    "tests.test_eval.ScoreTest.test_absent_minority_and_absent_quotes_fail_the_gate",
+    "tests.test_eval.ScoreTest.test_minority_miss_and_language_loose_match",
+    "tests.test_eval.ScoreTest.test_missing_predictions_count_wrong_and_coverage_is_reported",
+    "tests.test_eval.ScoreTest.test_passes_when_every_bar_is_cleared",
+    "tests.test_fetch.AshbyBoardTest.test_load_boards_rejects_bad_file",
+    "tests.test_fetch.AshbyBoardTest.test_load_boards_rejects_lone_surrogates",
+    "tests.test_fetch.FetchBoardTest.test_duplicate_listed_ids_fail_the_board",
+    "tests.test_fetch.FetchBoardTest.test_every_429_response_is_logged",
+    "tests.test_fetch.FetchBoardTest.test_failure_carries_the_http_status",
+    "tests.test_fetch.FetchBoardTest.test_html_only_description_keeps_block_breaks_and_entities",
+    "tests.test_fetch.FetchBoardTest.test_lone_surrogate_fails_only_its_board",
+    "tests.test_fetch.FetchBoardTest.test_one_malformed_listed_job_fails_the_whole_board",
+    "tests.test_fetch.FetchBoardTest.test_parses_listed_jobs_with_all_locations",
+    "tests.test_fetch.FetchBoardTest.test_retries_server_errors_then_gives_up",
+    "tests.test_fetch.FetchBoardTest.test_slow_consumer_bounds_boards_in_flight",
+    "tests.test_fetch.FetchBoardTest.test_success_rules",
+    "tests.test_fetch.FetchBoardTest.test_unreachable_board_is_a_failure",
+    "tests.test_init.InitTest.test_a_failed_cleanup_names_what_is_left",
+    "tests.test_init.InitTest.test_a_failed_write_keeps_nothing",
+    "tests.test_init.InitTest.test_a_key_is_required",
+    "tests.test_init.InitTest.test_answers_become_a_loadable_install",
+    "tests.test_init.InitTest.test_awkward_text_round_trips",
+    "tests.test_init.InitTest.test_cancelling_writes_nothing",
+    "tests.test_init.InitTest.test_enter_saves_the_environment_key_for_scheduled_runs",
+    "tests.test_init.InitTest.test_existing_install_is_refused_before_asking",
+    "tests.test_init.InitTest.test_invalid_answers_are_asked_again",
+    "tests.test_init.InitTest.test_through_the_cli",
+    "tests.test_prefilter.PrefilterTest.test_locations_are_word_adjacent",
+    "tests.test_prefilter.PrefilterTest.test_near_misses_and_excludes_dropped",
+    "tests.test_prefilter.PrefilterTest.test_punctuation_ended_term_matches_itself",
+    "tests.test_prefilter.PrefilterTest.test_titles_kept",
+    "tests.test_prefilter.PrefilterTest.test_unicode_case_folding",
+    "tests.test_run.DiscoveryRefreshTest.test_no_list_and_no_crawl_is_a_usage_error",
+    "tests.test_run.DiscoveryRefreshTest.test_unreadable_crawl_keeps_the_old_list_and_the_run_goes_on",
+    "tests.test_run.NotifyTest.test_config_error",
+    "tests.test_run.NotifyTest.test_crash",
+    "tests.test_run.RunTest.test_missing_openrouter_key_is_a_config_error",
+    "tests.test_run.RunTest.test_second_run_while_locked_is_refused",
+    "tests.test_schedule.NotifyTest.test_failures_are_logged_not_raised",
+    "tests.test_schedule.NotifyTest.test_silent_off_macos",
+    "tests.test_schedule.NotifyTest.test_text_goes_as_arguments",
+    "tests.test_schedule.ScheduleCliTest.test_bad_times_are_usage_errors",
+    "tests.test_schedule.ScheduleCliTest.test_elsewhere_prints_the_cron_line",
+    "tests.test_schedule.ScheduleCliTest.test_key_only_in_the_shell_is_refused",
+    "tests.test_schedule.ScheduleCliTest.test_launchctl_refusal_is_exit_1",
+    "tests.test_schedule.ScheduleCliTest.test_schedule_and_unschedule",
+    "tests.test_schedule.ScheduleTest.test_cron_escapes_percent",
+    "tests.test_schedule.ScheduleTest.test_cron_line_elsewhere",
+    "tests.test_schedule.ScheduleTest.test_ctrl_c_after_bootout_puts_the_previous_job_back",
+    "tests.test_schedule.ScheduleTest.test_ctrl_c_after_launchd_acted_leaves_the_previous_job_loaded",
+    "tests.test_schedule.ScheduleTest.test_ctrl_c_on_a_first_install_leaves_nothing_loaded",
+    "tests.test_schedule.ScheduleTest.test_failed_first_install_leaves_no_plist",
+    "tests.test_schedule.ScheduleTest.test_failed_replacement_restores_the_previous_job",
+    "tests.test_schedule.ScheduleTest.test_failed_restore_is_reported",
+    "tests.test_schedule.ScheduleTest.test_first_install_and_replacement",
+    "tests.test_schedule.ScheduleTest.test_one_label_per_install",
+    "tests.test_schedule.ScheduleTest.test_plist_runs_this_jobscan_daily_with_its_home",
+    "tests.test_schedule.ScheduleTest.test_remove_is_idempotent",
+    "tests.test_schedule.ScheduleTest.test_unexpected_bootout_failure_touches_nothing",
+    "tests.test_schedule.ScheduleTest.test_unwritable_plist_puts_the_untouched_previous_job_back",
+    "tests.test_store.ApplyFetchTest.test_absent_postings_close_and_reseen_reopen",
+    "tests.test_store.ApplyFetchTest.test_closure_does_not_depend_on_clock_order",
+    "tests.test_store.ApplyFetchTest.test_first_seen_survives_updates_and_input_hash_tracks_location",
+    "tests.test_store.ApplyFetchTest.test_open_counts_every_open_role_per_board",
+    "tests.test_store.ApplyFetchTest.test_unopenable_database_is_a_config_error",
+    "tests.test_store.ApplyFetchTest.test_unreadable_board_list_is_a_config_error",
+    "tests.test_store.ApplyFetchTest.test_valid_empty_board_closes_all_and_other_boards_untouched",
+    "tests.test_store.BoardsTest.test_dead_boards_are_not_live_and_replacing_keeps_counts",
+    "tests.test_store.BoardsTest.test_outcomes_reset_increment_or_leave_the_404_count",
+    "tests.test_store.BoardsTest.test_pending_reads_only_the_given_boards",
+    "tests.test_store.MigrationTest.test_collision_rolls_back_and_is_a_config_error",
+    "tests.test_store.MigrationTest.test_keys_boards_deliveries_and_cache_fold_together",
+    "tests.test_store.MigrationTest.test_reopening_is_a_no_op",
+    "tests.test_store.NewerSchemaTest.test_database_from_a_newer_jobscan_is_refused",
+    "tests.test_tag.CacheIdentityTest.test_hit_on_same_identity",
+    "tests.test_tag.CacheIdentityTest.test_miss_on_location_change_and_provider_change",
+    "tests.test_tag.DefinitionsTest.test_builtin_questions_and_prompt_unchanged_by_custom_tags",
+    "tests.test_tag.DefinitionsTest.test_custom_tag_using_a_builtin_name_or_question_is_refused",
+    "tests.test_tag.DefinitionsTest.test_custom_tags_follow_builtins_with_their_default_stated",
+    "tests.test_tag.DefinitionsTest.test_eligible_where_substituted_and_hashed",
+    "tests.test_tag.DefinitionsTest.test_hash_covers_every_behaviour_field",
+    "tests.test_tag.DefinitionsTest.test_location_eligible_validated_only_for_the_uk",
+    "tests.test_tag.DefinitionsTest.test_schema_types_per_tag",
+    "tests.test_tag.DefinitionsTest.test_unknown_tag_is_a_config_error",
+    "tests.test_tag.ParseReplyTest.test_defaults_unknowns_and_empty_lists_need_no_quote",
+    "tests.test_tag.ParseReplyTest.test_expected_quote_missing_or_blank_warns",
+    "tests.test_tag.ParseReplyTest.test_fabricated_quote_warns_but_keeps_value",
+    "tests.test_tag.ParseReplyTest.test_free_text_default_is_normalised",
+    "tests.test_tag.ParseReplyTest.test_invalid_replies_raise",
+    "tests.test_tag.ParseReplyTest.test_multi_value_canonical_order_without_duplicates",
+    "tests.test_tag.ParseReplyTest.test_verified_affirmative",
+    "tests.test_tag.QuoteTest.test_exact_and_normalised_quotes_verify",
+    "tests.test_tag.QuoteTest.test_fabricated_and_blank_quotes_fail",
+    "tests.test_tag.QuoteTest.test_quote_spanning_two_fields_fails",
+    "tests.test_tag.TagPostingTest.test_billed_invalid_reply_then_valid_retry_counts_both_costs",
+    "tests.test_tag.TagPostingTest.test_deeply_nested_reply_is_an_invalid_reply",
+    "tests.test_tag.TagPostingTest.test_dropped_connection_then_success_marks_billing_unknown",
+    "tests.test_tag.TagPostingTest.test_huge_integer_in_reply_is_an_invalid_reply",
+    "tests.test_tag.TagPostingTest.test_invalid_usage_values_count_as_unreported",
+    "tests.test_tag.TagPostingTest.test_overflowing_cost_is_unreported_not_a_crash",
+    "tests.test_tag.TagPostingTest.test_persistent_rate_limit_gives_up_after_five_tries",
+    "tests.test_tag.TagPostingTest.test_rate_limits_get_the_longer_schedule",
+    "tests.test_tag.TagPostingTest.test_reasoning_tokens_and_missing_cost_are_recorded",
+    "tests.test_tag.TagPostingTest.test_redirects_are_not_followed",
+    "tests.test_tag.TagPostingTest.test_rejected_value_is_not_echoed_in_the_error",
+    "tests.test_tag.TagPostingTest.test_request_pins_provider_and_strict_schema",
+    "tests.test_tag.TagPostingTest.test_success_reports_the_accepted_replys_reasoning",
+    "tests.test_tag.TagPostingTest.test_three_consecutive_failures_stop_unstarted_postings",
+    "tests.test_tag.TagPostingTest.test_truncated_200_body_marks_billing_unknown",
+    "tests.test_tag.TagPostingTest.test_unavailable_model_fails_after_three_tries",
+    "tests.test_tag.TagPostingTest.test_unreadable_200_reply_marks_billing_unknown"
+  ],
+  "flaky_excluded": []
+}
