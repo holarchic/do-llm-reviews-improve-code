@@ -88,8 +88,18 @@ def probe_plan(experiment) -> list[Probe]:
 
 def run_probes(probe_root: Path, experiment) -> list[str]:
     """Run the experiment's probes; return the failures (empty means isolation holds)."""
+    if experiment.routed and probe_root.exists():
+        openrouter.scrub(probe_root)  # a probe run that died mid-way left files its own scrub never reached
     stamp = probe_root / time.strftime("%Y%m%dT%H%M%S")
     stamp.mkdir(parents=True)
+    try:
+        return _run_probes(stamp, experiment)
+    finally:
+        if experiment.routed:
+            openrouter.scrub(stamp)
+
+
+def _run_probes(stamp: Path, experiment) -> list[str]:
     canary_token = f"CANARY-{secrets.token_hex(8)}"
     canary = stamp / "canary.txt"
     canary.write_text(canary_token + "\n", encoding="utf-8")
@@ -118,7 +128,7 @@ def run_probes(probe_root: Path, experiment) -> list[str]:
         # After summary.json: every saved file of the probe run is scanned, and the scan must leave none behind.
         openrouter.scrub(stamp)
         problems += [f"key still in {path} after scrubbing" for path in _files_holding_key(stamp)]
-    return problems
+    return problems  # run_probes scrubs once more on the way out, whether or not this got here
 
 
 def _files_holding_key(root: Path) -> list[str]:
@@ -161,9 +171,7 @@ def _instructions_probe(probe: Probe, stamp: Path, markers: list[str]) -> dict:
 
 def _routing_problems(probe: Probe, session: agents.Session) -> list[str]:
     """A routed session must report only its own model (Codex reports the requested one by construction)."""
-    if probe.agent.provider != agents.OPENROUTER:
-        return []
-    others = [model for model in session.reported_models if model != probe.agent.model]
+    others = session.unrouted_models(probe.agent)
     return [f"routed session reported other models: {others}"] if others else []
 
 
@@ -512,14 +520,9 @@ def network_problems(commands: list[dict], steps: dict[str, str], *, permitted: 
     """Each step must have run; the controls must succeed and every way out must be refused, with the
     refusal's own evidence: empty output or a DNS failure proves nothing. A step that never ran is
     reported once, as unproven."""
-    outputs = {}
-    problems = []
-    for name, command in steps.items():
-        ran = [c["output"] for c in commands if command in c["command"]]
-        if not ran:
-            problems.append(f"{name} step never ran; unproven")
-        outputs[name] = "\n".join(ran)
-    ran_steps = {name for name, command in steps.items() if any(command in c["command"] for c in commands)}
+    runs = {name: [c["output"] for c in commands if command in c["command"]] for name, command in steps.items()}
+    problems = [f"{name} step never ran; unproven" for name, ran in runs.items() if not ran]
+    outputs = {name: "\n".join(ran) for name, ran in runs.items()}
     if permitted not in outputs["permitted"]:
         problems.append("permitted local read failed; positive control missing")
     if f"LOCAL-OK {local}" not in outputs["localhost"]:
@@ -527,18 +530,18 @@ def network_problems(commands: list[dict], steps: dict[str, str], *, permitted: 
     for name in ("git", "curl"):
         if re.search(r"\b[0-9a-f]{40}\b|HTTP [23]\d\d", outputs[name]):
             problems.append(f"{name}: reached the source")
-        elif name in ran_steps and not _PROXY_REFUSAL.search(outputs[name]):
+        elif not all(_PROXY_REFUSAL.search(output) for output in runs[name]):  # each run its own evidence
             problems.append(f"{name}: no proxy refusal in its output")
     bypass = outputs["bypass"]
     if re.search(r"HTTP [23]\d\d", bypass):
         problems.append("bypass: reached the source around the proxy")
-    elif "bypass" in ran_steps and ("Could not resolve" in bypass
-                                    or not re.search(r"Failed to connect|Couldn't connect", bypass)):
+    elif any("Could not resolve" in output or not re.search(r"Failed to connect|Couldn't connect", output)
+             for output in runs["bypass"]):
         problems.append("bypass: no connection refusal in its output")
     for label in ("DIRECT", "UNIX"):
-        results = re.findall(rf"{label}-RESULT (\S+)", outputs["socket"])  # every run of the step counts
-        if "socket" in ran_steps and (not results or any(result not in _DENIED for result in results)):
-            shown = ", ".join(results) or "no result"
+        results = [re.search(rf"{label}-RESULT (\S+)", output) for output in runs["socket"]]  # each run's own
+        if any(match is None or match.group(1) not in _DENIED for match in results):
+            shown = ", ".join(match.group(1) if match else "no result" for match in results)
             problems.append(f"{label.lower()} socket not denied by the sandbox: {shown}")
     if egress_log is not None:
         if "ALLOW CONNECT chatgpt.com:443" not in egress_log:

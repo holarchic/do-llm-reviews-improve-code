@@ -348,9 +348,8 @@ def _loop(run: _Run) -> None:
 
 
 def _writer(run: _Run, name: str, prompt: str) -> None:
-    session = _step(run, name, lambda out: agents.run(
+    session = _step(run, name, run.arm.writer, lambda out: agents.run(
         run.arm.writer, prompt, role=agents.WRITER, cwd=run.repo, out_dir=out, offline=run.offline))
-    _check_routing(run, run.arm.writer, session, name)
     run.last_commit = _commit(run.repo, name)
     if session.terminal == agents.TIMEOUT:
         run.flags.append(f"timeout:{name}")
@@ -358,9 +357,8 @@ def _writer(run: _Run, name: str, prompt: str) -> None:
 
 
 def _review(run: _Run, name: str, prompt: str) -> Verdict:
-    session = _step(run, name, lambda out: agents.run(
+    session = _step(run, name, run.arm.reviewer, lambda out: agents.run(
         run.arm.reviewer, prompt, role=agents.REVIEWER, cwd=run.repo, out_dir=out, offline=run.offline))
-    _check_routing(run, run.arm.reviewer, session, name)
     if _git(run.repo, "status", "--porcelain"):
         run.flags.append(f"reviewer_wrote:{name}")
         _reset(run.repo, run.last_commit)
@@ -374,22 +372,15 @@ def _review(run: _Run, name: str, prompt: str) -> Verdict:
     return verdict
 
 
-def _check_routing(run: _Run, agent: agents.Agent, session: agents.Session, name: str) -> None:
-    """A routed session that reports any model but its own ran something it shouldn't (e.g. a
-    background call to an Anthropic model): flagged, and the report withholds its verdict."""
-    if agent.provider != agents.OPENROUTER:
-        return
-    for model in session.reported_models:
-        if model != agent.model:
-            run.flags.append(f"unrouted_model:{name}:{model}")
-
-
-def _step(run: _Run, name: str, call) -> agents.Session:
+def _step(run: _Run, name: str, agent: agents.Agent, call) -> agents.Session:
+    """Run one step, retrying infrastructure failures. Every attempt, retried ones included, is checked for
+    routing: a routed session that reports another model is flagged, and the report withholds its verdict."""
     step_dir = run.exec_dir / "steps" / f"{len(run.steps):02d}-{name}"
     attempts = []
     for attempt in range(1, MAX_ATTEMPTS + 1):
         session = guarded_call(call, step_dir / f"attempt-{attempt}")
         attempts.append(session.to_record())
+        run.flags += [f"unrouted_model:{name}:{model}" for model in session.unrouted_models(agent)]
         if session.terminal != agents.INFRA:
             run.steps.append({"name": name, "attempts": attempts})
             return session

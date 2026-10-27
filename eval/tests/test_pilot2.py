@@ -109,6 +109,24 @@ class RoutedRunTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def test_an_unrouted_model_on_a_retried_attempt_is_flagged(self):
+        calls = []
+
+        def writer(model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE, offline=False):
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / "transcript.jsonl").touch()
+            calls.append(model)
+            if len(calls) == 1:  # an infrastructure failure that still reported a stray model
+                return agents.Session(agents.INFRA, "overloaded", "", out_dir / "transcript.jsonl", 0.1,
+                                      reported_models=["claude-haiku-5-5"])
+            shutil.copy(DEV.path("reference") / "intervals.py", cwd / "intervals.py")
+            return agents.Session(agents.COMPLETED, "ok", "done", out_dir / "transcript.jsonl", 0.1,
+                                  reported_models=[model])
+
+        with mock.patch.object(agents, "run_claude", writer):
+            record = loop.execute_run(DEV, PILOT2.arm("A1"), self.tmp, rep=1, manifest_hash=None)
+        self.assertIn("unrouted_model:build:claude-haiku-5-5", record["flags"])
+
     def test_unrouted_model_and_leaked_key_are_flagged(self):
         def writer(model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE, offline=False):
             out_dir.mkdir(parents=True, exist_ok=True)

@@ -208,6 +208,8 @@ def _shape_problems(task, listed: list[str], feature: list[str], review: list[st
         problems.append(f"{task.id}: empty feature group")
     if not task.source.control and not review:
         problems.append(f"{task.id}: a caught task needs review tests")
+    if task.source.control and (review or defects):
+        problems.append(f"{task.id}: a control has no review tests or defects")
     claimed = [t for d in defects for t in d["tests"]]
     if sorted(claimed) != sorted(review) or len(set(claimed)) != len(claimed):
         problems.append(f"{task.id}: defects.json must claim each review test exactly once")

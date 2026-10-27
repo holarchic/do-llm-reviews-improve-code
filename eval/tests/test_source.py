@@ -172,6 +172,11 @@ class ValidateTest(FixtureCase):
             for failures in ((crash, other), (other, crash)):
                 self.assertIn("does not reach the defect", source._attribution_problem(run(*failures), test_id, True))
 
+    def test_a_control_with_review_tests_is_refused(self):
+        data = json.loads(self.task.path("source.json").read_text())
+        self.task.path("source.json").write_text(json.dumps({**data, "control": True}))
+        self.assertIn("a control has no review tests or defects", "\n".join(tasks.validate(self.task)))
+
     def test_a_control_flag_must_be_a_boolean(self):
         data = json.loads(self.task.path("source.json").read_text())
         self.task.path("source.json").write_text(json.dumps({**data, "control": "false"}))

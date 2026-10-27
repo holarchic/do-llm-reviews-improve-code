@@ -13,7 +13,8 @@ from pathlib import Path
 _STATIC_KEYS = ("ruff_violations", "source_loc", "test_loc", "max_function_branches")
 _FOLLOWUP_LISTS = ("regressions", "persistent_failures", "repaired")
 _IDENTITY = ("run_id", "task", "arm")
-_TOKEN_KEYS = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens")
+_TOKEN_KEYS = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens",
+               "cached_input_tokens")
 _OWN_TEST_KEYS = ("collected", "pass_on_reference", "fail_on_reference", "load_errors")
 
 
@@ -120,7 +121,7 @@ def _valid_steps(steps) -> bool:
     if not isinstance(steps, list):
         return False
     for step in steps:
-        if not isinstance(step, dict) or not isinstance(step.get("attempts"), list):
+        if not (isinstance(step, dict) and isinstance(step.get("name"), str) and isinstance(step.get("attempts"), list)):
             return False
         for attempt in step["attempts"]:
             if not (isinstance(attempt, dict) and _count(attempt.get("seconds"))

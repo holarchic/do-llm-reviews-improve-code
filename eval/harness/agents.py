@@ -77,6 +77,12 @@ class Session:
     reported_models: list[str] = field(default_factory=list)
     audit_hits: list[str] = field(default_factory=list)
 
+    def unrouted_models(self, agent: "Agent") -> list[str]:
+        """Models a routed session reported besides its own (e.g. a background call to an Anthropic model)."""
+        if agent.provider != OPENROUTER:
+            return []
+        return [model for model in self.reported_models if model != agent.model]
+
     def to_record(self) -> dict:
         return {
             "terminal": self.terminal,

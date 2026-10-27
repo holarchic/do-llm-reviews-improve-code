@@ -96,6 +96,15 @@ class NetworkProblemsTest(unittest.TestCase):
         self.assertTrue(any(p.startswith("direct socket not denied") for p in found), found)
         self.assertTrue(any(p.startswith("unix socket not denied") for p in found), found)
 
+    def test_every_run_of_a_way_out_needs_its_own_evidence(self):
+        commands = [{"command": f"bash -lc '{self.STEPS[name]}'", "output": self.CLEAN[name]} for name in self.STEPS]
+        commands += [{"command": self.STEPS["socket"], "output": "Traceback: killed"},
+                     {"command": self.STEPS["git"], "output": ""}]
+        found = probe.network_problems(commands, self.STEPS, permitted="PERMITTED-1", local="LOCAL-1",
+                                       egress_log=self.EGRESS, search={"config_disabled": True, "web_search_items": 0})
+        for expected in ("direct socket not denied", "unix socket not denied", "git: no proxy refusal"):
+            self.assertTrue(any(p.startswith(expected) for p in found), (expected, found))
+
     def test_a_step_that_never_ran_is_unproven(self):
         self.assertIn("bypass step never ran; unproven", self.problems(drop=("bypass",)))
 
