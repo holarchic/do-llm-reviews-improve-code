@@ -1,0 +1,32 @@
+{
+  "defects": [
+    {
+      "id": "preview-counts-boards-the-run-wont-read",
+      "fix_commit": "b8a61c1",
+      "basis": "TASK.md: preview says what the next run would do for a profile, from the postings already stored; norm: a preview counts only what the action it previews reads, so a board on neither the discovered list nor the boards file is left out",
+      "tests": ["tests.test_hidden_review_setup_commands.PreviewTest.test_preview_counts_only_boards_the_next_run_reads"],
+      "crash_is_defect": false
+    },
+    {
+      "id": "init-empty-flag-falls-back-to-questions",
+      "fix_commit": "8b1af24",
+      "basis": "TASK.md: init given any flag sets up from flags alone and asks nothing, refusing a missing or invalid value with exit 2; norm: a flag given an empty value was given, so it is invalid, not absent",
+      "tests": ["tests.test_hidden_review_setup_commands.EmptyFlagTest.test_init_with_a_flag_given_empty_asks_nothing_and_refuses"],
+      "crash_is_defect": false
+    },
+    {
+      "id": "email-empty-sender-taken-as-default",
+      "fix_commit": "8b1af24",
+      "basis": "TASK.md: --from is the sender's address, the --to address when --from is left out, and an invalid address is refused with exit 2 before anything is sent or saved; norm: a flag given an empty value was given, so it is invalid, not a request for the default",
+      "tests": ["tests.test_hidden_review_setup_commands.EmptyFlagTest.test_email_with_an_empty_sender_is_refused_sending_and_saving_nothing"],
+      "crash_is_defect": false
+    },
+    {
+      "id": "boards-add-crashes-on-unwritable-text",
+      "fix_commit": "b8a61c1",
+      "basis": "TASK.md: boards add keeps everything else in the file, and refuses a boards file it can't use with exit 2, leaving it unchanged; norm: a CLI never answers input with a traceback, and a file read as JSON may hold a lone surrogate escape that can't be written as UTF-8, so it is written back escaped or refused",
+      "tests": ["tests.test_hidden_review_setup_commands.BoardsFileTest.test_a_boards_file_holding_a_lone_surrogate_is_kept_or_refused_never_crashed_on"],
+      "crash_is_defect": true
+    }
+  ]
+}

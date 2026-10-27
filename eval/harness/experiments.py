@@ -35,7 +35,7 @@ GLM_REVIEWER = Agent("codex", "z-ai/glm-4.7-flash", OPENROUTER)
 PILOT_TASKS = ("bill-split", "config-includes", "dep-resolver", "log-windows", "token-bucket")
 PILOT2_TASKS = ("calc-expr", "cron-next", "ignore-match", "json-patch", "semver-range")
 # Filled as each task is authored, audited and validated.
-REPLAY_TASKS: tuple[str, ...] = ("jobscan-email", "jobscan-greenhouse", "jobscan-workable-gem",
+REPLAY_TASKS: tuple[str, ...] = ("jobscan-email", "jobscan-greenhouse", "jobscan-workable-gem", "jobscan-setup-commands",
                                  "jobscan-watchlist", "jobscan-company-notes")
 
 
