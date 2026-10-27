@@ -63,11 +63,11 @@ class Source:
         return {"base": self.base, "pre_review": self.pre_review, "reference": self.reference}[anchor]
 
 
-def mirror(source: Source, root: Path = SOURCES_ROOT) -> Path:
+def mirror(source: Source) -> Path:
     """The bare mirror holding every anchor commit; fetched once, refreshed only when a commit is missing."""
-    git_dir = root / (hashlib.sha256(source.url.encode()).hexdigest()[:16] + ".git")
+    git_dir = SOURCES_ROOT / (hashlib.sha256(source.url.encode()).hexdigest()[:16] + ".git")
     if not git_dir.exists():
-        root.mkdir(parents=True, exist_ok=True)
+        SOURCES_ROOT.mkdir(parents=True, exist_ok=True)
         _git(None, "clone", "--quiet", "--bare", source.url, str(git_dir))
     if _missing(git_dir, source):
         _git(git_dir, "fetch", "--quiet", "origin", "+refs/heads/*:refs/heads/*")
