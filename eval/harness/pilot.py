@@ -57,12 +57,13 @@ def complete_followup(exec_dir: Path, digest: str) -> bool:
     return records.followup(exec_dir / "followup" / "record.json", digest) is not None
 
 
-def run_builds(data_root: Path, experiment: Experiment) -> int:
-    """data_root is the experiment's own data dir."""
+def run_builds(data_root: Path, experiment: Experiment, only_arm: str | None = None) -> int:
+    """data_root is the experiment's own data dir; `only_arm` runs one arm's builds (a staged experiment)."""
     digest = manifest.verify(experiment)
     runs_root = data_root / "runs"
     by_id = {task.id: task for task in scored_tasks(experiment)}
-    jobs = [(by_id[task_id], arm, rep) for task_id, arm, rep in build_schedule(experiment)]
+    jobs = [(by_id[task_id], arm, rep) for task_id, arm, rep in build_schedule(experiment)
+            if only_arm is None or arm == only_arm]
     cap = None
     if experiment.routed:
         # A run killed mid-way leaves files the end-of-run scrub never reached.

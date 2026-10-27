@@ -1,4 +1,6 @@
+import contextlib
 import dataclasses
+import io
 import json
 import shutil
 import unittest
@@ -161,12 +163,44 @@ class DecisionTest(unittest.TestCase):
         self.assertEqual(self.outcomes(results(review, feature={"A3": 0.9}))["loop"], "no effect")
         self.assertEqual(self.outcomes(results(review, regressions={"A3": 0.01}))["loop"], "no effect")
 
-    def test_a_missing_build_is_incomplete(self):
-        built = results({"A1": [0.5] * 6, "A2": [0.5] * 6, "A3": [0.5] * 6})
-        built.missing.append("build c0--A3--r2")
-        decision = replay.decide(built, experiments.REPLAY)
-        self.assertEqual(decision.verdict, "INCOMPLETE")
-        self.assertIn("INCOMPLETE", replay.render(built, decision, experiments.REPLAY))
+    def test_a_missing_a1_or_a3_build_is_incomplete(self):
+        for arm in ("A1", "A3"):
+            built = results({"A1": [0.5] * 6, "A2": [0.5] * 6, "A3": [0.5] * 6})
+            built.missing[arm] = [f"c0--{arm}--r2"]
+            decision = replay.decide(built, experiments.REPLAY)
+            self.assertEqual(decision.verdict, "INCOMPLETE")
+            text = replay.render(built, decision, experiments.REPLAY)
+            self.assertIn("INCOMPLETE", text)
+            self.assertIn(f"- build c0--{arm}--r2", text)
+
+    def staged(self, review: dict[str, list[float]], a2_missing: int) -> replay.Results:
+        """A2's builds staged out: none, or some, of its 16 builds missing."""
+        built = results(review)
+        a2_runs = [f"{task}--A2--r{rep}" for task in CAUGHT + CONTROLS for rep in (1, 2)]
+        if a2_missing:
+            built.missing["A2"] = a2_runs[:a2_missing]
+        if a2_missing == len(a2_runs):
+            built.builds.pop("A2", None)
+        return built
+
+    def test_without_a_loop_effect_a_run_without_a2_is_complete(self):
+        for review in ({"A1": [0.5] * 6, "A3": [0.5] * 6},  # no effect
+                       {"A1": [0.9] * 6, "A3": [1.0] * 6}):  # headroom
+            built = self.staged(review, a2_missing=16)
+            decision = replay.decide(built, experiments.REPLAY)
+            self.assertEqual(decision.verdict, "DECIDED")
+            self.assertEqual(self.outcomes(built)["cross-family"], "not run")
+            text = replay.render(built, decision, experiments.REPLAY)
+            self.assertIn("A2 not run", text)
+            self.assertNotIn("| A2 |", text)
+
+    def test_a_loop_effect_requires_every_a2_build(self):
+        for a2_missing in (16, 3):
+            built = self.staged({"A1": [0.2] * 6, "A2": [0.4] * 6, "A3": [0.6] * 6}, a2_missing)
+            decision = replay.decide(built, experiments.REPLAY)
+            self.assertEqual(decision.verdict, "INCOMPLETE", a2_missing)
+            self.assertEqual([c.outcome for c in decision.comparisons], ["effect"])
+            self.assertIn("**Loop (A3 vs A1):** effect", replay.render(built, decision, experiments.REPLAY))
 
     def test_render_keeps_controls_out_of_the_review_table(self):
         built = results({"A1": [0.5] * 6, "A2": [0.5] * 6, "A3": [0.8] * 6})
@@ -180,11 +214,30 @@ class DecisionTest(unittest.TestCase):
 class EndToEndTest(StubAgentCase):
     """Stub agents through the real schedule, run, resume, collect, decide and render."""
 
-    def run_builds(self, experiment) -> int:
+    def run_builds(self, experiment, only_arm=None) -> int:
         with mock.patch.object(pilot, "scored_tasks", lambda e: [self.task]), \
                 mock.patch.object(manifest, "verify", return_value="d"), \
                 mock.patch.object(agents, "run_claude", self.agent), mock.patch.object(agents, "run_codex", self.agent):
-            return pilot.run_builds(self.tmp / "data", experiment)
+            return pilot.run_builds(self.tmp / "data", experiment, only_arm=only_arm)
+
+    def test_a_staged_run_builds_one_arm_and_reports_without_a2(self):
+        experiment = dataclasses.replace(experiments.REPLAY, tasks=("fixture",), parallel=1)
+        for arm in ("A1", "A3"):
+            self.assertEqual(self.run_builds(experiment, only_arm=arm), 0)
+        runs = sorted(p.parent.name for p in (self.tmp / "data" / "runs").glob("*/exec-*"))
+        self.assertEqual(runs, ["fixture--A1--r1", "fixture--A1--r2", "fixture--A3--r1", "fixture--A3--r2"])
+        with mock.patch.object(pilot, "scored_tasks", lambda e: [self.task]), \
+                mock.patch.object(manifest, "verify", return_value="d"):
+            built = replay.collect(self.tmp / "data", experiment)
+        decision = replay.decide(built, experiment)
+        self.assertEqual((decision.verdict, built.missing), ("DECIDED", {"A2": ["fixture--A2--r1", "fixture--A2--r2"]}))
+        self.assertIn("A2 not run", replay.render(built, decision, experiment))
+
+    def test_run_refuses_an_unknown_arm(self):
+        from eval.__main__ import main
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(main(["run", "--experiment", "replay", "--arm", "A9"]), 2)
+        self.assertIn("--arm must be one of A1, A2, A3", err.getvalue())
 
     def test_runs_resume_and_report(self):
         experiment = dataclasses.replace(experiments.REPLAY, tasks=("fixture",), parallel=1)
@@ -196,9 +249,10 @@ class EndToEndTest(StubAgentCase):
         with mock.patch.object(pilot, "scored_tasks", lambda e: [self.task]), \
                 mock.patch.object(manifest, "verify", return_value="d"):
             built = replay.collect(self.tmp / "data", experiment)
-        self.assertEqual((built.missing, built.caught), ([], ["fixture"]))
+        self.assertEqual((built.missing, built.caught), ({}, ["fixture"]))
         decision = replay.decide(built, experiment)
-        self.assertEqual({c.outcome for c in decision.comparisons}, {"uninformative"})  # every arm avoids the defect
+        # Every arm avoids the defect: the loop effect is out of reach, so A2 is never compared.
+        self.assertEqual([c.outcome for c in decision.comparisons], ["uninformative", "not run"])
         self.assertIn("| A1 | 100.0 ± 0.0 | 100.0 |", replay.render(built, decision, experiment))
 
 

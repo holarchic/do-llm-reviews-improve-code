@@ -26,7 +26,7 @@ def main(argv: list[str]) -> int:
     for name in EXPERIMENT_COMMANDS:
         parsers[name].add_argument("--experiment", default="pilot", help="a name from eval/harness/experiments.py")
     parsers["run"].add_argument("--task", help="run one task (a dev task, or a pilot task after freeze)")
-    parsers["run"].add_argument("--arm", help="with --task: one of the experiment's arms")
+    parsers["run"].add_argument("--arm", help="one of the experiment's arms; without --task, that arm's builds only")
     parsers["calibrate"].add_argument("--task", action="append", help="one of the experiment's tasks, repeatable "
                                       "(default: all); one process, so one writer of the spend ledger")
     parsers["calibrate"].add_argument("--arm", help="default: the baseline arm; a loop arm gives a cost sample")
@@ -81,7 +81,10 @@ def _run(args) -> int:
 
     experiment = args.experiment
     if not args.task:
-        return _guarded(lambda: pilot.run_builds(_data_root(experiment), experiment))
+        if args.arm is not None and args.arm not in experiment.arm_names:
+            print(f"run: --arm must be one of {', '.join(experiment.arm_names)}", file=sys.stderr)
+            return 2
+        return _guarded(lambda: pilot.run_builds(_data_root(experiment), experiment, only_arm=args.arm))
     if args.arm not in experiment.arm_names:
         print(f"run: --task needs --arm, one of {', '.join(experiment.arm_names)}", file=sys.stderr)
         return 2
