@@ -61,7 +61,9 @@ class Task:
 
 def missing_parts(task: Task, *, followup: bool, degraded: bool, mutants: bool) -> list[str]:
     """The optional parts an experiment needs that this task lacks."""
-    needs = {"follow-up group": (followup, task.has_followup), "degraded/": (degraded, task.path("degraded").is_dir()),
+    # A task replayed from a source repository is judged uncalibrated: it has no degraded reference.
+    calibrated = degraded and task.source is None
+    needs = {"follow-up group": (followup, task.has_followup), "degraded/": (calibrated, task.path("degraded").is_dir()),
              "mutants/": (mutants, bool(task.variants("mutants"))), "expected.json": (True, task.path("expected.json").exists())}
     return [f"{task.id}: no {name}" for name, (needed, present) in needs.items() if needed and not present]
 

@@ -6,9 +6,10 @@ import shutil
 import unittest
 from unittest import mock
 
-from eval.harness import agents, experiments, loop, manifest, pilot, prompts, records, replay, tasks
-from eval.tests.test_source import PRE_REVIEW_CALC, REFERENCE_CALC, FixtureCase
+from eval.harness import agents, experiments, judge, loop, manifest, pilot, prompts, records, replay, source, tasks
+from eval.tests.test_source import BASE_TEST, PRE_REVIEW_CALC, REFERENCE_CALC, FixtureCase
 
+PLANNED = "\n# built from a plan\n"
 OPUS = experiments.OPUS
 SOLO = loop.Arm("A1", OPUS)
 LOOP = loop.Arm("A3", OPUS, experiments.SOL)
@@ -37,13 +38,15 @@ class PromptTest(unittest.TestCase):
 
 
 class StubAgentCase(FixtureCase):
-    """The fixture task with stub agents: the writer writes `self.calc` and drops the repo's tests."""
+    """The fixture task with stub agents: the writer writes `self.calc`, marked when it built a plan, and drops
+    the repo's tests; a judge picks the version whose patch carries the mark."""
 
     def setUp(self):
         super().setUp()
         self.assertEqual(tasks.validate(self.task), [])
         self.seen_task_md = []
         self.offline_flags = []
+        self.judge_prompts = []
         self.calc = REFERENCE_CALC
 
     def agent(self, model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE, offline=False):
@@ -53,9 +56,14 @@ class StubAgentCase(FixtureCase):
         if role == agents.REVIEWER:
             return agents.Session(agents.COMPLETED, "ok", "VERDICT: GREEN\nISSUES:\nNone\n",
                                   out_dir / "transcript.jsonl", 0.1, reported_models=[model])
+        if role == agents.JUDGE:
+            self.judge_prompts.append(prompt)
+            winner = "X" if PLANNED.strip() in prompt.split("# Version Y")[0] else "Y"
+            return agents.Session(agents.COMPLETED, "ok", json.dumps({"winner": winner, "reasons": ["r"]}),
+                                  out_dir / "transcript.jsonl", 0.1, reported_models=[model])
         self.seen_task_md.append((cwd / "TASK.md").read_text())
         if "existing repository" in prompt and ("Implement TASK.md" in prompt or "Build the plan" in prompt):
-            (cwd / "calc.py").write_text(self.calc)
+            (cwd / "calc.py").write_text(self.calc + (PLANNED if "Build the plan" in prompt else ""))
             shutil.rmtree(cwd / "tests")  # a build that drops the repo's tests gains nothing
         return agents.Session(agents.COMPLETED, "ok", "done", out_dir / "transcript.jsonl", 0.1,
                               reported_models=[model])
@@ -254,6 +262,105 @@ class EndToEndTest(StubAgentCase):
         # Every arm avoids the defect: the loop effect is out of reach, so A2 is never compared.
         self.assertEqual([c.outcome for c in decision.comparisons], ["uninformative", "not run"])
         self.assertIn("| A1 | 100.0 ± 0.0 | 100.0 |", replay.render(built, decision, experiment))
+
+
+class PatchExportTest(FixtureCase):
+    """What a judge sees of a replayed build: its patch from the starting tree."""
+
+    def build(self):
+        build = self.tmp / "build"
+        source.seed(self.task, build)
+        (build / "calc.py").write_text(PRE_REVIEW_CALC)
+        (build / "tests" / "test_calc.py").unlink()
+        (build / "extra.py").write_text("NEW = 1\n")
+        (build / "notes.md").write_text("review notes\n")
+        (build / "plans").mkdir()
+        (build / "plans" / "plan.py").write_text("PLAN = 1\n")
+        return build
+
+    def test_the_patch_shows_each_changed_file_whole_and_nothing_else(self):
+        changed = judge.export_patch(self.task, self.build(), self.tmp / "export")
+        self.assertEqual(sorted(changed), ["calc.py", "extra.py", "tests/test_calc.py"])
+        patch = (self.tmp / "export" / judge.PATCH).read_text()
+        self.assertIn(" def add(a, b):", patch)  # unchanged lines of a changed file, as context
+        self.assertIn("+def div(a, b):", patch)
+        self.assertIn("+NEW = 1", patch)
+        for line in BASE_TEST.strip().splitlines():  # a deleted file, in full
+            self.assertIn("-" + line, patch)
+        for absent in ("review notes", "PLAN", "TASK.md", "tests/__init__.py"):
+            self.assertNotIn(absent, patch)
+
+    def test_a_pair_over_the_prompt_budget_is_judged_on_its_source(self):
+        build = self.build()
+        prompts_seen = []
+
+        def fake(model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE, offline=False):
+            prompts_seen.append(prompt)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            return agents.Session(agents.COMPLETED, "ok", '{"winner": "TIE", "reasons": []}',
+                                  out_dir / "transcript.jsonl", 0.1, reported_models=[model])
+
+        with mock.patch.object(agents, "run_claude", fake), mock.patch.object(judge, "PROMPT_CHARS", 0):
+            result = judge.judge_pair("fable", self.task, build, build, self.tmp / "judged")
+        self.assertEqual(result["scope"], judge.SOURCE_SCOPE)
+        self.assertEqual(len(prompts_seen), 2)
+        self.assertTrue(all(judge.SOURCE_ONLY_NOTE in p and "test_calc" not in p for p in prompts_seen))
+        self.assertIn("+def div(a, b):", prompts_seen[0])
+
+
+class ReplayJudgingTest(StubAgentCase):
+    """The design judgment: scheduled per caught task and replicate, run on stub builds, reported apart."""
+
+    def test_the_replay_schedule_judges_caught_tasks_per_replicate_without_calibration(self):
+        caught = [t.id for t in pilot.scored_tasks(experiments.REPLAY) if not t.source.control]
+        schedule = pilot.judge_schedule(experiments.REPLAY)
+        self.assertEqual(sorted((t, rep) for name, t, pair, rep in schedule if name == "fable"),
+                         sorted((t, rep) for t in caught for rep in (1, 2)))
+        self.assertTrue(all(pair == ("A1", "A3") for _, _, pair, _ in schedule))
+        for task in pilot.scored_tasks(experiments.REPLAY):  # freeze asks for no degraded reference
+            self.assertEqual(tasks.missing_parts(task, followup=False, degraded=True, mutants=False), [])
+
+    def judging(self, experiment) -> int:
+        with mock.patch.object(pilot, "scored_tasks", lambda e: [self.task]), \
+                mock.patch.object(manifest, "verify", return_value="d"), \
+                mock.patch.object(agents, "run_claude", self.agent), mock.patch.object(agents, "run_codex", self.agent):
+            return pilot.run_judging(self.tmp / "data", experiment)
+
+    def report(self, experiment):
+        with mock.patch.object(pilot, "scored_tasks", lambda e: [self.task]), \
+                mock.patch.object(manifest, "verify", return_value="d"):
+            built = replay.collect(self.tmp / "data", experiment)
+        decision = replay.decide(built, experiment)
+        return decision, replay.render(built, decision, experiment)
+
+    def test_replicates_are_judged_both_ways_by_both_judges_and_a_rebuild_makes_a_judgment_stale(self):
+        experiment = dataclasses.replace(experiments.REPLAY, tasks=("fixture",), parallel=1)
+        self.assertEqual(self.judging(experiment), 1)  # no builds yet: judging waits for them
+        for arm in ("A1", "A3"):
+            self.assertEqual(EndToEndTest.run_builds(self, experiment, only_arm=arm), 0)
+        self.offline_flags.clear()
+        self.assertEqual(self.judging(experiment), 0)
+        self.assertEqual(len(self.judge_prompts), 2 * 2 * 2)  # judges × replicates × orders
+        self.assertEqual(self.offline_flags, [True] * 8)
+        prompt = self.judge_prompts[0]
+        self.assertTrue(prompt.startswith(judge.PATCH_JUDGE_PROMPT))
+        self.assertIn("-    def test_add(self):", prompt)
+        self.assertNotIn("diff --git a/TASK.md", prompt)
+        judged = sorted(p.parent.name + "/" + p.name for p in (self.tmp / "data" / "judging").glob("*/fixture/*"))
+        self.assertEqual(judged, [f"fixture/A1-vs-A3--r{r}" for r in (1, 1, 2, 2)])
+        decision, text = self.report(experiment)
+        self.assertIn("| fixture | A3 | A3 | A3 | A3 | +4 |", text)
+        self.assertIn("Uncalibrated", text)
+
+        artifact = pilot.complete_build(self.tmp / "data" / "runs", "fixture", "A3", "d", 1) / "artifact"
+        (artifact / "calc.py").write_text(REFERENCE_CALC)  # as if rebuilt: the r1 judgments no longer apply
+        stale_decision, text = self.report(experiment)
+        self.assertIn("| fixture | unavailable | A3 | unavailable | A3 | unavailable |", text)
+        self.assertEqual(stale_decision, decision)
+        self.judge_prompts.clear()
+        self.assertEqual(self.judging(experiment), 0)
+        self.assertEqual(len(self.judge_prompts), 2 * 2)  # only the stale judgments are redone
+        self.assertIn("| fixture | tie | A3 | tie | A3 | +2 |", self.report(experiment)[1])
 
 
 if __name__ == "__main__":

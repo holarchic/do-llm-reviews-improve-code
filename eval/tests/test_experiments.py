@@ -32,7 +32,9 @@ class PilotUnchangedTest(unittest.TestCase):
         builds = pilot.build_schedule(PILOT)
         self.assertTrue(all(rep is None for _, _, rep in builds))
         self.assertEqual([[task, arm] for task, arm, _ in builds], golden["builds"])
-        self.assertEqual([[n, t, list(p) if p else None] for n, t, p in pilot.judge_schedule(PILOT)], golden["judging"])
+        judging = pilot.judge_schedule(PILOT)
+        self.assertTrue(all(rep is None for *_, rep in judging))
+        self.assertEqual([[n, t, list(p) if p else None] for n, t, p, _ in judging], golden["judging"])
 
     def test_report_matches_the_frozen_pilot(self):
         root = Path(tempfile.mkdtemp(prefix="eval-test-"))

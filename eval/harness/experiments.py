@@ -34,8 +34,9 @@ GLM_REVIEWER = Agent("codex", "z-ai/glm-4.7-flash", OPENROUTER)
 
 PILOT_TASKS = ("bill-split", "config-includes", "dep-resolver", "log-windows", "token-bucket")
 PILOT2_TASKS = ("calc-expr", "cron-next", "ignore-match", "json-patch", "semver-range")
+# Filled as each task is authored, audited and validated.
 REPLAY_TASKS: tuple[str, ...] = ("jobscan-email", "jobscan-greenhouse", "jobscan-workable-gem",
-                                 "jobscan-watchlist", "jobscan-company-notes")  # filled as each task is authored, audited and validated
+                                 "jobscan-watchlist", "jobscan-company-notes")
 
 
 @dataclass(frozen=True)
@@ -161,7 +162,7 @@ REPLAY = Experiment(
     baseline="A1",
     replicate=None,
     followup_arms=(),
-    pairs=(),
+    pairs=(("A1", "A3"),),  # the design judgment: descriptive, never in the decision rule
     seed=20261022,
     data_dir="replay",
     prereg="prereg/replay.md",

@@ -3,8 +3,10 @@
 Each task × arm cell holds `reps` builds; the unit of comparison is the task mean over them. Caught tasks
 carry defects review caught historically; control tasks carry none and count only towards the regression
 guard and the descriptive tables. The arms are staged: A1 and A3 always run, A2 only once the loop effect
-(A3 vs A1) passes, so a run without A2 is complete when the loop effect does not pass. `collect` reads records into plain values, `decide` applies the
-pre-registered rule (eval/prereg/replay.md), and `render` is the only place numbers become text.
+(A3 vs A1) passes, so a run without A2 is complete when the loop effect does not pass. The design judgment of
+the experiment's pairs is shown apart and never enters the verdict. `collect` reads records into plain values,
+`decide` applies the pre-registered rule (eval/prereg/replay.md), and `render` is the only place numbers
+become text.
 """
 
 import math
@@ -12,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from statistics import mean, stdev
 
-from . import loop, manifest, pilot, records
+from . import judge, loop, manifest, pilot, records
 from .experiments import Experiment
 
 REVIEW_THRESHOLD = 15.0
@@ -34,6 +36,8 @@ class Results:
     arms: list[str]
     missing: dict[str, list[str]] = field(default_factory=dict)  # arm -> run ids without a complete build
     builds: dict[str, dict[str, list[dict]]] = field(default_factory=dict)  # arm -> task -> records
+    # pair -> caught task -> (judge, rep) -> a judgement of the builds now on record
+    judgments: dict[tuple[str, str], dict[str, dict[tuple[str, int | None], dict]]] = field(default_factory=dict)
 
     @property
     def tasks(self) -> list[str]:
@@ -74,6 +78,13 @@ def collect(data_root: Path, experiment: Experiment) -> Results:
                     results.missing.setdefault(arm, []).append(loop.run_id(task.id, arm, rep))
                     continue
                 results.builds.setdefault(arm, {}).setdefault(task.id, []).append(record)
+    for pair in experiment.pairs:
+        for task_id in results.caught:
+            for name in judge.JUDGES:
+                for rep in experiment.rep_ids:
+                    judgement = pilot.current_judgement(data_root, digest, name, task_id, pair, rep)
+                    if judgement is not None:
+                        results.judgments.setdefault(pair, {}).setdefault(task_id, {})[(name, rep)] = judgement
     return results
 
 
@@ -157,6 +168,8 @@ def render(results: Results, decision: Decision, experiment: Experiment) -> str:
         lines += [f"- A2 − A1 review (descriptive): {a2_gain:+.1f}", ""]
     else:
         lines += ["- A2 not run: the loop effect did not pass.", ""]
+    for pair in experiment.pairs:
+        lines += _judgment_lines(results, experiment, pair)
     lines += ["## Diagnostics", ""]
     lines += _table(["Arm", "Plan rounds", "Phase rounds", "Capped", "Timeouts", "Model minutes"],
                     [_diagnostics_row(results, arm) for arm in arms]) + [""]
@@ -167,6 +180,31 @@ def render(results: Results, decision: Decision, experiment: Experiment) -> str:
               " the reviewer configuration, its CLI included.",
               "- A few tasks with two replicates each is an exploratory continuation rule, not a significance test.", ""]
     return "\n".join(lines)
+
+
+def _judgment_lines(results: Results, experiment: Experiment, pair: tuple[str, str]) -> list[str]:
+    a, b = pair
+    keys = [(name, rep) for name in judge.JUDGES for rep in experiment.rep_ids]
+    by_task = results.judgments.get(pair, {})
+    lines = [f"## Design judgment: {b} vs {a} (descriptive)", "",
+             f"Each caught task's builds, as patches from base: replicate r of {a} against replicate r of {b}, each "
+             f"pair judged blind by each judge in both orders; a pick counts only when it survives the swap. Net is "
+             f"{b}'s wins minus {a}'s over the {len(keys)} judgments. Uncalibrated: a replayed phase has no degraded "
+             "reference to check the judges against. It never enters the verdict.", ""]
+    rows = []
+    for task in results.caught:
+        judged = by_task.get(task, {})
+        picks = [judged[key]["result"] if key in judged else None for key in keys]
+        net = sum({"a": -1, "b": 1, "tie": 0}[pick] for pick in picks if pick is not None)
+        rows.append([task, *[{"a": a, "b": b, "tie": "tie", None: "unavailable"}[pick] for pick in picks],
+                     f"{net:+d}" if None not in picks else "unavailable"])
+    header = ["Task", *[name if rep is None else f"{name} r{rep}" for name, rep in keys], f"Net {b}"]
+    lines += _table(header, rows) + [""]
+    trimmed = sorted(task for task, judged in by_task.items()
+                     if any(judgement.get("scope") == judge.SOURCE_SCOPE for judgement in judged.values()))
+    if trimmed:
+        lines += [f"- Judged on the source patch alone, tests/ left out for length: {', '.join(trimmed)}.", ""]
+    return lines
 
 
 def _diagnostics_row(results: Results, arm: str) -> list[str]:

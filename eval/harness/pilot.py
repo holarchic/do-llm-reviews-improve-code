@@ -36,10 +36,17 @@ def build_schedule(experiment: Experiment) -> list[tuple[str, str, int | None]]:
     return jobs
 
 
-def judge_schedule(experiment: Experiment) -> list[tuple[str, str, tuple[str, str] | None]]:
-    """(judge, task, pair); a None pair is that task's calibration."""
-    jobs = [(name, task.id, pair) for name in judge.JUDGES for task in scored_tasks(experiment)
-            for pair in (None, *experiment.pairs)]
+def judged_tasks(experiment: Experiment) -> list[tasks.Task]:
+    """The scored tasks whose builds are judged: all of them but a replay's controls."""
+    return [task for task in scored_tasks(experiment) if task.source is None or not task.source.control]
+
+
+def judge_schedule(experiment: Experiment) -> list[tuple[str, str, tuple[str, str] | None, int | None]]:
+    """(judge, task, pair, rep): replicate rep of each arm of the pair. A None pair is that task's calibration,
+    which a task replayed from a source repository lacks: a degraded reference has no brownfield counterpart."""
+    jobs = [(name, task.id, pair, rep) for name in judge.JUDGES for task in judged_tasks(experiment)
+            for pair in (None, *experiment.pairs) if pair is not None or task.source is None
+            for rep in (experiment.rep_ids if pair else (None,))]
     random.Random(experiment.seed + 1).shuffle(jobs)
     return jobs
 
@@ -139,20 +146,20 @@ def run_calibration(data_root: Path, experiment: Experiment, task_ids: list[str]
 def run_judging(data_root: Path, experiment: Experiment) -> int:
     digest = manifest.verify(experiment)
     runs_root = data_root / "runs"
-    by_id = {task.id: task for task in scored_tasks(experiment)}
-    judged_arms = sorted({arm for pair in experiment.pairs for arm in pair})
-    builds = {(task_id, arm): complete_build(runs_root, task_id, arm, digest)
-              for task_id in by_id for arm in judged_arms}
-    missing = sorted(f"{t}--{a}" for (t, a), path in builds.items() if path is None)
+    by_id = {task.id: task for task in judged_tasks(experiment)}
+    schedule = judge_schedule(experiment)
+    builds = {(task_id, arm, rep): complete_build(runs_root, task_id, arm, digest, rep)
+              for _, task_id, pair, rep in schedule if pair for arm in pair}
+    missing = sorted(loop.run_id(t, a, r) for (t, a, r), path in builds.items() if path is None)
     if missing:
         _log(f"judge: builds incomplete, {experiment.name} INCOMPLETE: {missing}")
         return 1
 
     @_contained
     def job(item):
-        name, task_id, pair = item
-        out_dir = judging_dir(data_root, name, task_id, pair)
-        identity = None if pair is None else {side: build_identity(builds[(task_id, arm)])
+        name, task_id, pair, rep = item
+        out_dir = judging_dir(data_root, name, task_id, pair, rep)
+        identity = None if pair is None else {side: build_identity(builds[(task_id, arm, rep)])
                                               for side, arm in zip(("a", "b"), pair)}
         existing = records.judgement(out_dir / "judgement.json", digest)
         if existing is not None and existing.get("builds") == identity:
@@ -163,16 +170,17 @@ def run_judging(data_root: Path, experiment: Experiment) -> int:
             if pair is None:
                 result = judge.calibrate(name, task, out_dir, manifest_hash=digest)
             else:
-                a, b = (builds[(task_id, arm)] / "artifact" for arm in pair)
-                result = judge.judge_pair(name, task, a, b, out_dir, manifest_hash=digest, builds=identity)
+                a, b = (builds[(task_id, arm, rep)] / "artifact" for arm in pair)
+                result = judge.judge_pair(name, task, a, b, out_dir, manifest_hash=digest, builds=identity,
+                                          offline=experiment.offline)
         except loop.InfraExhausted as exc:
-            _log(f"judge {name} {task_id} {pair}: infrastructure failure: {exc}")
+            _log(f"judge {name} {out_dir.relative_to(data_root)}: infrastructure failure: {exc}")
             return False
-        _log(f"judge {name} {task_id} {pair or 'calibration'}: {result['result']}")
+        _log(f"judge {name} {out_dir.relative_to(data_root)}: {result['result']}")
         return True
 
     with ThreadPoolExecutor(experiment.parallel) as pool:
-        results = list(pool.map(job, judge_schedule(experiment)))
+        results = list(pool.map(job, schedule))
     _log(f"judgements: {sum(results)}/{len(results)} complete")
     return 0 if all(results) else 1
 
@@ -181,9 +189,21 @@ def build_identity(exec_dir: Path) -> dict:
     return {"exec": exec_dir.name, "artifact": loop.artifact_digest(exec_dir / "artifact")}
 
 
-def judging_dir(data_root: Path, name: str, task_id: str, pair: tuple[str, str] | None) -> Path:
-    leaf = "calibration" if pair is None else f"{pair[0]}-vs-{pair[1]}"
+def judging_dir(data_root: Path, name: str, task_id: str, pair: tuple[str, str] | None,
+                rep: int | None = None) -> Path:
+    leaf = "calibration" if pair is None else f"{pair[0]}-vs-{pair[1]}" + ("" if rep is None else f"--r{rep}")
     return data_root / "judging" / name / task_id / leaf
+
+
+def current_judgement(data_root: Path, digest: str, name: str, task_id: str, pair: tuple[str, str] | None,
+                      rep: int | None = None) -> dict | None:
+    """The judgement on record, if it judged the builds now on record: a rebuilt build makes it stale."""
+    judgement = records.judgement(judging_dir(data_root, name, task_id, pair, rep) / "judgement.json", digest)
+    if judgement is None or pair is None:
+        return judgement
+    execs = [complete_build(data_root / "runs", task_id, arm, digest, rep) for arm in pair]
+    current = None if None in execs else {side: build_identity(e) for side, e in zip(("a", "b"), execs)}
+    return judgement if judgement.get("builds") == current else None
 
 
 def _contained(job):
