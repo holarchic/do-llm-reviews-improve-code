@@ -184,7 +184,7 @@ def run_judging(data_root: Path, experiment: Experiment) -> int:
         task = by_id[task_id]
         try:
             if pair is None:
-                result = judge.calibrate(name, task, out_dir, manifest_hash=digest)
+                result = judge.calibrate(name, task, out_dir, manifest_hash=digest, offline=experiment.offline)
             else:
                 a, b = (builds[(task_id, arm, rep)] / "artifact" for arm in pair)
                 result = judge.judge_pair(name, task, a, b, out_dir, manifest_hash=digest, builds=identity,

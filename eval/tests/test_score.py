@@ -30,6 +30,15 @@ class ScoreTest(unittest.TestCase):
         outcome = score.run_suite(code, DEV.path("hidden"), self.work(), timeout=timeout)
         return score.pass_fraction(outcome, self.expected)
 
+    def test_a_test_with_failed_subtests_is_its_most_severe_failure(self):
+        records = [{"id": "t", "outcome": "fail", "exc": "AssertionError"},
+                   {"id": "t", "outcome": "error", "exc": "AttributeError"},
+                   {"id": "t", "outcome": "fail", "exc": "AssertionError"},
+                   {"id": "u", "outcome": "pass"}]
+        chosen = score._by_test(records)
+        self.assertEqual((chosen["t"]["outcome"], chosen["t"]["exc"], chosen["u"]["outcome"]),
+                         ("error", "AttributeError", "pass"))
+
     def test_reference_scores_full(self):
         self.assertEqual(self.fraction(DEV.path("reference")), 1.0)
 

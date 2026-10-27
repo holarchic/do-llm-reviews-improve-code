@@ -131,6 +131,22 @@ class ScrubTest(_KeyFile):
         self.assertNotIn(KEY, json.dumps(record))
         self.assertEqual(json.loads(saved)["flags"], ["key_exposed:record.json"])
 
+    def test_a_file_that_cant_be_read_is_removed_and_reported(self):
+        (self.tmp / "locked.txt").write_text(KEY)
+        (self.tmp / "later.txt").write_text(KEY)
+        real = Path.read_bytes
+
+        def read_bytes(path):
+            if path.name == "locked.txt":
+                raise PermissionError(13, "denied")
+            return real(path)
+
+        with mock.patch.object(Path, "read_bytes", read_bytes):
+            hits = openrouter.scrub(self.tmp)
+        self.assertEqual(sorted(hits), ["later.txt", "locked.txt"])
+        self.assertFalse((self.tmp / "locked.txt").exists())
+        self.assertNotIn(KEY, (self.tmp / "later.txt").read_text())
+
     def test_a_clean_tree_is_untouched(self):
         (self.tmp / "a.txt").write_text("plain")
         self.assertEqual(openrouter.scrub(self.tmp), [])

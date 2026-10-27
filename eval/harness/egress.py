@@ -24,8 +24,9 @@ _CONNECT_SECONDS = 30
 
 class Proxy:
     """One session's proxy: `with Proxy(log) as proxy:` serves on an ephemeral loopback port until exit.
-    Exit owns every connection: from acceptance on, each socket is registered, a connection that arrives
-    or completes while closing is refused, open ones are shut down, and every handler is joined."""
+    Exit owns every connection without waiting on any: from acceptance on, each socket is registered, open
+    ones are shut down, and a connection that arrives or completes (a slow DNS lookup) while closing is
+    refused, so no tunnel outlives the session."""
 
     def __init__(self, log_path: Path, allowed: frozenset[str] = ALLOWED_TARGETS):
         self._log_path = log_path
@@ -45,12 +46,13 @@ class Proxy:
         self._log = open(self._log_path, "a", encoding="utf-8", buffering=1)
         try:
             self._server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
-        except OSError:
+            self._server.daemon_threads = True
+            threading.Thread(target=self._server.serve_forever, daemon=True).start()
+        except BaseException:
+            if self._server is not None:
+                self._server.server_close()
             self._log.close()
             raise
-        self._server.daemon_threads = False
-        self._server.block_on_close = True  # server_close joins the handlers
-        threading.Thread(target=self._server.serve_forever, daemon=True).start()
         return self
 
     def __exit__(self, *exc) -> None:

@@ -449,7 +449,8 @@ def attempt(label, family, address):
 attempt("DIRECT", socket.AF_INET, (sys.argv[1], 443))
 attempt("UNIX", socket.AF_UNIX, sys.argv[2])
 """
-_PROXY_REFUSAL = re.compile(r"CONNECT tunnel failed|response 403|403 Forbidden")
+# The proxy's own policy refusal; a 502 (the upstream unreachable) or a DNS failure proves nothing.
+_PROXY_REFUSAL = re.compile(r"response 403|403 Forbidden")
 _DENIED = ("EPERM", "EACCES")
 
 

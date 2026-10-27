@@ -121,7 +121,12 @@ def scrub(root: Path, key: str | None = None) -> list[str]:
     for path in sorted(root.rglob("*")):
         if path.is_symlink() or not path.is_file() or ".git" in path.relative_to(root).parts:
             continue
-        data = path.read_bytes()
+        try:
+            data = path.read_bytes()
+        except OSError:  # a file that can't be checked can't be kept
+            path.unlink(missing_ok=True)
+            hits.append(str(path.relative_to(root)))
+            continue
         if secret in data:
             path.write_bytes(data.replace(secret, REDACTED))
             hits.append(str(path.relative_to(root)))
@@ -133,8 +138,12 @@ def scrub(root: Path, key: str | None = None) -> list[str]:
 
 
 def _git_dir_holds(git_dir: Path, secret: bytes) -> bool:
-    """The key in any metadata file (config, logs, hooks) or object; a repo git can't read is assumed to hold it."""
-    if any(secret in p.read_bytes() for p in git_dir.rglob("*") if p.is_file() and not p.is_symlink()):
+    """The key in any metadata file (config, logs, hooks) or object; a repo whose files or objects can't be read is
+    assumed to hold it."""
+    try:
+        if any(secret in p.read_bytes() for p in git_dir.rglob("*") if p.is_file() and not p.is_symlink()):
+            return True
+    except OSError:
         return True
     completed = subprocess.run(["git", f"--git-dir={git_dir}", "cat-file", "--batch-all-objects", "--batch"],
                                capture_output=True, env={"PATH": "/usr/bin:/bin:/opt/homebrew/bin",

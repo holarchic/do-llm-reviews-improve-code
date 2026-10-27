@@ -123,7 +123,9 @@ def _calibrate(args) -> int:
               f"{cost} flags={record.get('flags')}")
     if experiment.routed:
         print(f"calibration spend so far: {openrouter.spent(data_root / pilot.SPEND_LEDGER, 'calibration')}")
-    return 0 if built and all(record["status"] == "complete" for record in built) else 1
+    # A job that crashed or wasn't admitted leaves no record, so success needs every requested build.
+    complete = sum(record["status"] == "complete" for record in built)
+    return 0 if complete == len(task_ids) * args.reps else 1
 
 
 def _percent(value) -> str:
@@ -164,7 +166,8 @@ def _judge(args) -> int:
         result = judge.judge_pair(args.judge, task, a, b, data_root / "dev-judgements" / f"{stamp}-{args.judge}",
                                   offline=args.experiment.offline)
     else:
-        result = judge.calibrate(args.judge, task, data_root / "dev-calibration" / f"{stamp}-{args.judge}")
+        result = judge.calibrate(args.judge, task, data_root / "dev-calibration" / f"{stamp}-{args.judge}",
+                                 offline=args.experiment.offline)
     print(json.dumps({"result": result["result"], "picks": [o["pick"] for o in result["orders"]],
                       "leak_words": result["leak_words"]}))
     return 0

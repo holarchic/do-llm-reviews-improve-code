@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from eval.harness import egress
@@ -75,6 +76,36 @@ class ProxyTest(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 5)
         with sock:
             self.assertEqual(sock.recv(1024), b"")
+
+    def test_exit_does_not_wait_on_a_slow_lookup_and_refuses_its_late_connection(self):
+        resolving, release = threading.Event(), threading.Event()
+        real = socket.create_connection
+        late = []
+
+        def slow(address, timeout=None):
+            resolving.set()
+            release.wait(5)
+            sock = real(address, timeout=timeout)
+            late.append(sock)
+            return sock
+
+        with mock.patch.object(egress.socket, "create_connection", slow):
+            with egress.Proxy(self.log, frozenset({self.allowed})) as proxy:
+                client = real(("127.0.0.1", proxy.port), timeout=5)  # the patch is module-wide
+                client.sendall(f"CONNECT {self.allowed} HTTP/1.1\r\n\r\n".encode())
+                self.assertTrue(resolving.wait(5))
+                started = time.monotonic()
+            self.assertLess(time.monotonic() - started, 2)
+            release.set()
+            for _ in range(50):
+                if late:
+                    break
+                time.sleep(0.05)
+        time.sleep(0.1)
+        self.assertEqual(len(late), 1)
+        self.assertEqual(late[0].fileno(), -1)  # closed: no tunnel outlives the session
+        with client:
+            self.assertEqual(client.recv(1024), b"")
 
     def test_the_default_admits_only_the_model_hosts(self):
         self.assertEqual(egress.ALLOWED_TARGETS, frozenset({"chatgpt.com:443", "auth.openai.com:443"}))

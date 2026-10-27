@@ -12,7 +12,7 @@ discovery pattern (default test_*.py; a build's own tests use unittest's
 default, test*.py). --top-level is the import root when the suite is a package
 inside the code (default: the suite dir itself). --only runs just the test IDs
 listed one per line in IDS_FILE. --detail adds each failure's exception type,
-stage (import, setup or call) and traceback, the evidence a replay anchor needs.
+stage (import, setup, call, teardown or timeout) and traceback, the evidence a replay anchor needs.
 
 This file runs in the candidate's process, so it imports nothing from the
 harness.

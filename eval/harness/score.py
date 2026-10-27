@@ -29,7 +29,8 @@ _BRANCH_NODES = (ast.If, ast.For, ast.AsyncFor, ast.While, ast.IfExp, ast.Except
 class SuiteOutcome:
     outcomes: dict[str, str]
     timed_out: bool
-    # Per failing test with --detail: exception type, stage (import | setup | call) and traceback.
+    # Per failing test with --detail: exception type, stage (import | setup | call | teardown | timeout) and
+    # traceback.
     details: dict[str, dict] = field(default_factory=dict)
 
     def passed(self) -> frozenset[str]:
@@ -47,10 +48,8 @@ class StaticMetrics:
 def run_suite(code_dir: Path, suite_dir: Path, work_dir: Path, *, timeout: float = SUITE_SECONDS) -> SuiteOutcome:
     """Run suite_dir's tests against a copy of code_dir inside work_dir."""
     results = _execute(code_dir, suite_dir, work_dir, timeout=timeout, list_only=False)
-    outcomes: dict[str, str] = {}
-    for record in results.records:
-        outcomes[record["id"]] = record["outcome"]
-    return SuiteOutcome(outcomes=outcomes, timed_out=results.timed_out)
+    return SuiteOutcome(outcomes={i: r["outcome"] for i, r in _by_test(results.records).items()},
+                        timed_out=results.timed_out)
 
 
 def run_in_place(code_dir: Path, work_dir: Path, *, pattern: str = "test*.py",
@@ -58,7 +57,7 @@ def run_in_place(code_dir: Path, work_dir: Path, *, pattern: str = "test*.py",
     """Run the tests that live in code_dir, from one copy of it that is discovery root, import root
     and cwd at once — what `python3 -m unittest discover` does there."""
     results = _execute(code_dir, None, work_dir, timeout=timeout, list_only=False, pattern=pattern)
-    return SuiteOutcome(outcomes={record["id"]: record["outcome"] for record in results.records},
+    return SuiteOutcome(outcomes={i: r["outcome"] for i, r in _by_test(results.records).items()},
                         timed_out=results.timed_out)
 
 
@@ -68,10 +67,25 @@ def run_package(code_dir: Path, package: str, work_dir: Path, *, ids: list[str] 
     does in a repo whose tests are a package; `ids` limits the run to those test IDs."""
     results = _execute(code_dir, None, work_dir, timeout=timeout, list_only=False, pattern="test*.py",
                        package=package, ids=ids, detail=detail)
-    outcomes = {record["id"]: record["outcome"] for record in results.records}
-    details = {record["id"]: {key: record[key] for key in ("exc", "stage", "trace")}
-               for record in results.records if "exc" in record}
+    by_test = _by_test(results.records)
+    outcomes = {test_id: record["outcome"] for test_id, record in by_test.items()}
+    details = {test_id: {key: record[key] for key in ("exc", "stage", "trace")}
+               for test_id, record in by_test.items() if "exc" in record}
     return SuiteOutcome(outcomes=outcomes, timed_out=results.timed_out, details=details)
+
+
+_SEVERITY = {"error": 2, "fail": 1}
+
+
+def _by_test(records: list[dict]) -> dict[str, dict]:
+    """One record per test. A test with failed subtests reports each; the most severe stands for it (an
+    error over an assertion failure), the first at equal severity, so a missing name is never hidden."""
+    chosen: dict[str, dict] = {}
+    for record in records:
+        current = chosen.get(record["id"])
+        if current is None or _SEVERITY.get(record["outcome"], 0) > _SEVERITY.get(current["outcome"], 0):
+            chosen[record["id"]] = record
+    return chosen
 
 
 def list_package(code_dir: Path, package: str, work_dir: Path) -> list[str]:

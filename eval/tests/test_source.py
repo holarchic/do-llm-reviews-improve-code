@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from eval.harness import source, tasks
+from eval.harness import score, source, tasks
 
 GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@localhost", "GIT_COMMITTER_NAME": "t",
            "GIT_COMMITTER_EMAIL": "t@localhost", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
@@ -147,6 +147,16 @@ class ValidateTest(FixtureCase):
         self.assertEqual(tasks.validate(self.task), [])
         evidence = self.task.expected()["defects"][1]["pre_review"]["tests.test_hidden_review_sub.SubTest.test_zero"]
         self.assertEqual((evidence["outcome"], evidence["stage"]), ("error", "call"))
+
+    def test_attribution_must_hold_on_every_pre_review_run(self):
+        test_id = "tests.test_hidden_review_div.T.test"
+        good = score.SuiteOutcome({test_id: "fail"}, False, {test_id: {"exc": "AssertionError", "stage": "call"}})
+        drift = score.SuiteOutcome({test_id: "fail"}, False, {test_id: {"exc": "AssertionError", "stage": "setup"}})
+        stable = {"reference": score.SuiteOutcome({test_id: "pass"}, False), "base": good, "pre_review": good}
+        defects = [{"id": "d", "tests": [test_id]}]
+        self.assertEqual(source._anchor_problems(self.task, stable, [], defects, [good, good, good]), [])
+        problems = source._anchor_problems(self.task, stable, [], defects, [good, drift, good])
+        self.assertIn("does not reach the defect on pre_review (fail, setup", "\n".join(problems))
 
     def test_a_control_flag_must_be_a_boolean(self):
         data = json.loads(self.task.path("source.json").read_text())

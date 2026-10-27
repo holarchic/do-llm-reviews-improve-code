@@ -38,7 +38,8 @@ Version Y each contain the source files and tests one developer wrote.
 """
 PATCH_INTRO = """You are comparing two changes to the same existing repository. TASK.md below is the contract. Version X \
 and Version Y are each one developer's patch from the same starting tree: a diff of every file they changed, added or \
-deleted, each shown in full, with removed lines marked - and added lines marked +.
+deleted, each shown in full, with removed lines marked - and added lines marked +. A binary file is named, not \
+shown.
 """
 CRITERIA = """
 Decide which version is the better code, weighing in this order:
@@ -200,10 +201,11 @@ def _export_patches(task: Task, task_text: str, builds: dict[str, Path], exports
     raise PromptTooLong(f"{task.id}: {size} characters of source patches, over {PROMPT_CHARS}")
 
 
-def calibrate(judge: str, task: Task, out_dir: Path, *, manifest_hash: str | None = None) -> dict:
+def calibrate(judge: str, task: Task, out_dir: Path, *, manifest_hash: str | None = None,
+              offline: bool = False) -> dict:
     """Reference (a) vs degraded reference (b): the judge passes the task if it picks a in both orders."""
     result = judge_pair(judge, task, task.path("reference"), task.path("degraded"), out_dir,
-                        manifest_hash=manifest_hash)
+                        manifest_hash=manifest_hash, offline=offline)
     return {**result, "prefers_reference": result["result"] == "a"}
 
 

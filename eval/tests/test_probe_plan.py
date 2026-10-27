@@ -82,6 +82,12 @@ class NetworkProblemsTest(unittest.TestCase):
             found = self.problems({step: ""})
             self.assertTrue(any(problem.startswith(expected) for problem in found), (step, found))
 
+    def test_an_upstream_failure_is_not_a_refusal(self):
+        found = self.problems({"git": "fatal: unable to access: CONNECT tunnel failed, response 502",
+                               "curl": "curl: (56) CONNECT tunnel failed, response 502\nHTTP 000"})
+        self.assertTrue(any(p.startswith("git: no proxy refusal") for p in found), found)
+        self.assertTrue(any(p.startswith("curl: no proxy refusal") for p in found), found)
+
     def test_a_step_that_never_ran_is_unproven(self):
         self.assertIn("bypass step never ran; unproven", self.problems(drop=("bypass",)))
 

@@ -173,7 +173,7 @@ def _validate_in(task, work: Path) -> list[str]:
     flaky = sorted({test_id for anchor in ANCHORS for test_id in _varying(rounds[anchor])})
     problems += [f"{task.id}: flaky test {test_id}" for test_id in flaky if test_id in feature + review]
     stable = {anchor: rounds[anchor][0] for anchor in ANCHORS}
-    problems += _anchor_problems(task, stable, feature, defects)
+    problems += _anchor_problems(task, stable, feature, defects, rounds["pre_review"])
     if problems:
         return problems
     base_suite = sorted(set(listed) - set(feature) - set(review))
@@ -224,11 +224,15 @@ def _anchor_rounds(trees: dict[str, Path], work: Path) -> dict[str, list[score.S
         for anchor in ANCHORS:
             rounds[anchor].append(score.run_package(trees[anchor], TESTS, work / f"{anchor}-{n}", detail=True,
                                                     timeout=SUITE_SECONDS))
-    jobs = [(anchor, copy) for anchor in ANCHORS for copy in range(CONCURRENT_COPIES)]
-    with ThreadPoolExecutor(len(jobs)) as pool:
-        results = pool.map(lambda job: (job[0], score.run_package(
-            trees[job[0]], TESTS, work / f"{job[0]}-3-{job[1]}", detail=True, timeout=SUITE_SECONDS)), jobs)
-        for anchor, outcome in results:
+    copies = [(anchor, copy) for anchor in ANCHORS for copy in range(CONCURRENT_COPIES)]
+
+    def run_copy(anchor: str, copy: int) -> score.SuiteOutcome:
+        return score.run_package(trees[anchor], TESTS, work / f"{anchor}-3-{copy}", detail=True,
+                                 timeout=SUITE_SECONDS)
+
+    with ThreadPoolExecutor(len(copies)) as pool:
+        outcomes = pool.map(lambda job: run_copy(*job), copies)
+        for (anchor, _), outcome in zip(copies, outcomes):
             rounds[anchor].append(outcome)
     return rounds
 
@@ -238,7 +242,9 @@ def _varying(runs: list[score.SuiteOutcome]) -> set[str]:
     return {t for t in ids if len({run.outcomes.get(t, "missing") for run in runs}) > 1}
 
 
-def _anchor_problems(task, stable: dict[str, score.SuiteOutcome], feature: list[str], defects: list[dict]) -> list[str]:
+def _anchor_problems(task, stable: dict[str, score.SuiteOutcome], feature: list[str], defects: list[dict],
+                     pre_review_runs: list[score.SuiteOutcome]) -> list[str]:
+    """Attribution must hold on every pre_review run, not just the first: same outcome, same stage, same kind."""
     problems = []
     hidden = feature + [t for d in defects for t in d["tests"]]
     for test_id in hidden:
@@ -249,7 +255,8 @@ def _anchor_problems(task, stable: dict[str, score.SuiteOutcome], feature: list[
             problems.append(f"{task.id}: feature test passes on base: {test_id}")
     for defect in defects:
         for test_id in defect["tests"]:
-            reason = _attribution_problem(stable["pre_review"], test_id, defect.get("crash_is_defect", False))
+            reason = next(filter(None, (_attribution_problem(run, test_id, defect.get("crash_is_defect", False))
+                                        for run in pre_review_runs)), None)
             if reason:
                 problems.append(f"{task.id}: review test {test_id} ({defect['id']}) {reason}")
     return problems
@@ -285,9 +292,15 @@ def _missing(git_dir: Path, source: Source) -> list[str]:
     return absent
 
 
+# Git with none of the host's configuration or attributes, so an export is the commit's tree on any machine.
+_GIT_ENV = {"PATH": "/usr/bin:/bin:/opt/homebrew/bin", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_ATTR_NOSYSTEM": "1", "HOME": "/nonexistent", "GIT_TERMINAL_PROMPT": "0"}
+
+
 def _git(git_dir: Path | None, *args: str, text: bool = True):
-    argv = ["git"] + (["--git-dir", str(git_dir)] if git_dir else []) + list(args)
-    completed = subprocess.run(argv, capture_output=True, text=text)
+    argv = (["git", "-c", "core.attributesFile=/dev/null"] + (["--git-dir", str(git_dir)] if git_dir else [])
+            + list(args))
+    completed = subprocess.run(argv, capture_output=True, text=text, env=_GIT_ENV)
     if completed.returncode != 0:
         error = completed.stderr if text else completed.stderr.decode(errors="replace")
         raise SourceError(f"git {' '.join(args[:2])} failed: {error.strip()}")
