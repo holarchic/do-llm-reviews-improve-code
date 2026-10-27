@@ -101,6 +101,7 @@ The `base` README names the source repository, so no session may reach it:
 - A3 vs A1 measures the whole loop package: plan, rubric, review and extra compute. A3 vs A2 measures the reviewer configuration, its CLI included.
 - Four caught tasks with 2 replicates each give coarse resolution: on a task with 3 defects, one defect moves `review` by 33 points.
 - Model CLIs update themselves between stages. Each record keeps its CLI versions, and the report lists each stage's.
+- The harness runs a build's code outside the sessions' sandbox twice: the build's own tests, whose summary line reaches the next review, and the scoring. Only a build written to fetch the source at test time could exploit this, and it would show in its patch.
 
 ## Feasibility gate
 
