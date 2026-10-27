@@ -4,7 +4,9 @@ Each probe states the property it proves and the positive control that keeps it
 from passing vacuously. Settings, argv and raw transcripts stay in the probe dir.
 The probes run on the experiment's own agents (`probe_plan`); a routed experiment
 adds a key probe per routed CLI, and an offline one runs every probe offline and
-adds a network probe per writer and reviewer configuration.
+adds a network probe per writer and reviewer configuration. Run dirs come from
+`audit.anonymous_workdir`, as runs' do, so probes see the same layout and root
+permissions.
 """
 
 import json
@@ -137,13 +139,8 @@ def instruction_markers() -> list[str]:
     return sorted(markers)
 
 
-def _run_dir(name: str) -> Path:
-    # The production builder: probes must see the same dir layout and root permissions as runs.
-    return audit.anonymous_workdir()
-
-
 def _instructions_probe(probe: Probe, stamp: Path, markers: list[str]) -> dict:
-    run_dir = _run_dir(probe.name)
+    run_dir = audit.anonymous_workdir()
     try:
         out_dir = stamp / _slug(probe.name)
         session = agents.run(probe.agent, QUOTE_PROMPT, role=probe.role, cwd=run_dir, out_dir=out_dir,
@@ -175,8 +172,8 @@ def _slug(name: str) -> str:
 
 
 def _claude_canary_probe(probe: Probe, stamp: Path, canary: Path, canary_token: str, markers: list[str]) -> dict:
-    sibling = _run_dir("sibling")
-    run_dir = _run_dir("claude-canary")
+    sibling = audit.anonymous_workdir()
+    run_dir = audit.anonymous_workdir()
     permitted_token = f"PERMITTED-{secrets.token_hex(8)}"
     (run_dir / "permitted.txt").write_text(permitted_token + "\n", encoding="utf-8")
     prompt = (
@@ -221,7 +218,7 @@ def _claude_canary_probe(probe: Probe, stamp: Path, canary: Path, canary_token: 
 
 def _claude_reviewer_probe(probe: Probe, stamp: Path) -> dict:
     """The Claude reviewer runs commands like the Codex reviewer but cannot write to the repo."""
-    run_dir = _run_dir("claude-reviewer")
+    run_dir = audit.anonymous_workdir()
     token = f"RAN-{secrets.token_hex(6)}"
     prompt = (
         "Do these two steps with the Bash tool and report each raw output, even if one fails.\n"
@@ -248,10 +245,10 @@ def _claude_reviewer_probe(probe: Probe, stamp: Path) -> dict:
 def _codex_canary_probe(probe: Probe, stamp: Path, canary: Path) -> dict:
     """Codex's outer Seatbelt profile: its own dir readable, not writable; private roots and
     other runs unreadable, the runs root unlistable."""
-    sibling = _run_dir("sibling")
+    sibling = audit.anonymous_workdir()
     sibling_token = f"SIBLING-{secrets.token_hex(8)}"
     (sibling / "secret.txt").write_text(sibling_token + "\n", encoding="utf-8")
-    run_dir = _run_dir("codex-canary")
+    run_dir = audit.anonymous_workdir()
     permitted_token = f"PERMITTED-{secrets.token_hex(8)}"
     (run_dir / "permitted.txt").write_text(permitted_token + "\n", encoding="utf-8")
     canary_token = canary.read_text(encoding="utf-8").strip()
@@ -285,7 +282,7 @@ def _codex_canary_probe(probe: Probe, stamp: Path, canary: Path) -> dict:
 
 def _codex_writer_probe(probe: Probe, stamp: Path, canary: Path) -> dict:
     """A Codex writer builds and tests code in its own dir, and is refused on private reads and writes."""
-    run_dir = _run_dir("codex-writer")
+    run_dir = audit.anonymous_workdir()
     canary_token = canary.read_text(encoding="utf-8").strip()
     forbidden = stamp / "codex-writer-was-here.txt"
     prompt = (
@@ -362,7 +359,7 @@ def _key_probe(probe: Probe, stamp: Path) -> dict:
 
 
 def _key_probe_once(probe: Probe, out_dir: Path) -> dict:
-    run_dir = _run_dir(probe.name)
+    run_dir = audit.anonymous_workdir()
     permitted_token = f"PERMITTED-{secrets.token_hex(8)}"
     (run_dir / "permitted.txt").write_text(permitted_token + "\n", encoding="utf-8")
     (run_dir / "envcheck.py").write_text(KEY_SCRIPT, encoding="utf-8")
@@ -387,7 +384,7 @@ def _passthrough_probe(probe: Probe, stamp: Path) -> dict:
     """Routed text reaches the model and comes back unaltered: an OpenRouter account guardrail once
     rewrote digit runs as [PHONE], corrupting the code a writer saw."""
     token = passthrough_token()
-    run_dir = _run_dir(probe.name)
+    run_dir = audit.anonymous_workdir()
     try:
         session = agents.run(probe.agent, f"Do not use any tools. Reply with exactly this line and nothing else:\n{token}",
                              role=probe.role, cwd=run_dir, out_dir=stamp / _slug(probe.name), offline=probe.offline)
@@ -457,7 +454,7 @@ _DENIED = ("EPERM", "EACCES")
 def _network_probe(probe: Probe, stamp: Path) -> dict:
     """An offline session's tool commands reach localhost and nothing else: not the source through the
     proxy, not around it by IP or Unix socket, and not through web search."""
-    run_dir = _run_dir(probe.name)
+    run_dir = audit.anonymous_workdir()
     out_dir = stamp / _slug(probe.name)
     token = f"PERMITTED-{secrets.token_hex(8)}"
     local_token = f"LOCAL-{secrets.token_hex(8)}"
