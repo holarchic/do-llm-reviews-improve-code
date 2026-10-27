@@ -17,6 +17,10 @@ Isolation:
   its own home, and its cwd only in the writer role.
 - Routed sessions (provider "openrouter") get their routing and key from
   openrouter.py; the operator's Codex login is not copied into their home.
+- Offline sessions (the replay's) reach no network beyond localhost from their
+  tool commands. Claude's Bash sandbox allows no domain. Codex's Seatbelt
+  profile denies every outbound connection but localhost, its model calls go
+  through a per-session allowlist proxy (egress.py), and its web search is off.
 - The transcript audit is a diagnostic: access is denied by the OS, and the
   probes prove it. Audit hits are recorded, not counted as contamination.
 """
@@ -24,10 +28,11 @@ Isolation:
 import json
 import os
 import shutil
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import audit, openrouter, procs
+from . import audit, egress, openrouter, procs
 
 CLAUDE_JUDGE_MODEL = "claude-fable-5-1"
 CODEX_JUDGE_MODEL = "gpt-6-astra"
@@ -55,9 +60,10 @@ class Agent:
     provider: str = NATIVE  # NATIVE: the CLI's own login | OPENROUTER
 
 
-def run(agent: Agent, prompt: str, *, role: str, cwd: Path, out_dir: Path) -> "Session":
+def run(agent: Agent, prompt: str, *, role: str, cwd: Path, out_dir: Path, offline: bool = False) -> "Session":
     session = {"claude": run_claude, "codex": run_codex}[agent.cli]
-    return session(agent.model, prompt, role=role, cwd=cwd, out_dir=out_dir, provider=agent.provider)
+    return session(agent.model, prompt, role=role, cwd=cwd, out_dir=out_dir, provider=agent.provider,
+                   offline=offline)
 
 
 @dataclass(frozen=True)
@@ -83,13 +89,15 @@ class Session:
         }
 
 
-def claude_settings(role: str, cwd: Path, provider: str = NATIVE) -> dict:
+def claude_settings(role: str, cwd: Path, provider: str = NATIVE, offline: bool = False) -> dict:
     roots = [str(root) for root in audit.sandbox_deny_roots()]
     filesystem: dict = {"denyRead": roots}
     if role == REVIEWER:
         # Read-only like the Codex reviewer: any shell command, no writes to the repo.
         filesystem["denyWrite"] = [os.path.realpath(cwd)]
     routing = {"apiKeyHelper": openrouter.claude_key_helper()} if provider == OPENROUTER else {}
+    # The CLI's own model traffic is outside the Bash sandbox; tool commands get localhost only.
+    network = {"network": {"allowedDomains": [], "allowLocalBinding": True}} if offline else {}
     return {
         **routing,
         "sandbox": {
@@ -98,6 +106,7 @@ def claude_settings(role: str, cwd: Path, provider: str = NATIVE) -> dict:
             "autoAllowBashIfSandboxed": role in (WRITER, REVIEWER),
             "allowUnsandboxedCommands": False,
             "filesystem": filesystem,
+            **network,
         },
         # "//" marks an absolute path in permission rules.
         "permissions": {"deny": [f"{tool}(/{root}/**)" for tool in _FILE_TOOLS for root in roots]
@@ -121,12 +130,13 @@ def claude_argv(model: str, role: str, settings_path: Path) -> list[str]:
     ]
 
 
-def run_claude(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path, provider: str = NATIVE) -> Session:
+def run_claude(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path, provider: str = NATIVE,
+               offline: bool = False) -> Session:
     # Absolute: the CLI runs in cwd, where a relative settings path would not resolve.
     out_dir = out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     settings_path = out_dir / "settings.json"
-    settings_path.write_text(json.dumps(claude_settings(role, cwd, provider), indent=2), encoding="utf-8")
+    settings_path.write_text(json.dumps(claude_settings(role, cwd, provider, offline), indent=2), encoding="utf-8")
     argv = claude_argv(model, role, settings_path)
     prompt_path = out_dir / "prompt.md"
     prompt_path.write_text(prompt, encoding="utf-8")
@@ -138,7 +148,8 @@ def run_claude(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path, 
     return _finish(classify_claude(transcript, proc, role), cwd)
 
 
-def run_codex(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path, provider: str = NATIVE) -> Session:
+def run_codex(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path, provider: str = NATIVE,
+              offline: bool = False) -> Session:
     out_dir = out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     final_path = out_dir / "final.txt"
@@ -148,6 +159,8 @@ def run_codex(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path, p
     try:
         os.chmod(codex_home, 0o700)
         config = f'model_reasoning_effort = "{CODEX_EFFORT}"\n'
+        if offline:
+            config += 'web_search = "disabled"\n'
         if provider == OPENROUTER:
             config += openrouter.CODEX_PROVIDER_CONFIG
             env = openrouter.codex_env(codex_home)
@@ -156,7 +169,8 @@ def run_codex(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path, p
             env = {**os.environ, "CODEX_HOME": str(codex_home)}
         (codex_home / "config.toml").write_text(config, encoding="utf-8")
         profile = out_dir / "seatbelt.sb"
-        profile.write_text(codex_seatbelt_profile(cwd, codex_home, writable=role == WRITER), encoding="utf-8")
+        profile.write_text(codex_seatbelt_profile(cwd, codex_home, writable=role == WRITER, offline=offline),
+                           encoding="utf-8")
         # Every file Codex touches lives in its own home and is copied out after: out_dir is under a
         # read-denied root, and node aborts at start-up if it cannot stat its stdout.
         inner = {name: codex_home / name for name in ("final.txt", "transcript.jsonl", "stderr.log")}
@@ -164,8 +178,11 @@ def run_codex(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path, p
         prompt_path.write_text(prompt, encoding="utf-8")
         argv = ["sandbox-exec", "-f", str(profile), *codex_argv(model, inner["final.txt"])]
         (out_dir / "argv.json").write_text(json.dumps(argv, indent=2), encoding="utf-8")
-        proc = procs.run(argv, cwd=cwd, timeout=TIMEOUT_SECONDS[role], stdout_path=inner["transcript.jsonl"],
-                         stderr_path=inner["stderr.log"], env=env, stdin_path=prompt_path)
+        with (egress.Proxy(out_dir / "egress.log") if offline else nullcontext()) as proxy:
+            proc = procs.run(argv, cwd=cwd, timeout=TIMEOUT_SECONDS[role], stdout_path=inner["transcript.jsonl"],
+                             stderr_path=inner["stderr.log"], env={**env, **proxy.env()} if proxy else env,
+                             stdin_path=prompt_path)
+        shutil.copy2(codex_home / "config.toml", out_dir / "codex-config.toml")
         for name, path in inner.items():
             if path.exists():
                 shutil.copy2(path, out_dir / name)
@@ -174,9 +191,11 @@ def run_codex(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path, p
     return _finish(classify_codex(transcript, final_path, proc, role, model), cwd)
 
 
-def codex_seatbelt_profile(cwd: Path, home: Path, *, writable: bool = False) -> str:
+def codex_seatbelt_profile(cwd: Path, home: Path, *, writable: bool = False, offline: bool = False) -> str:
     """Deny reads and writes of every private root and of other runs. The session reads its cwd and
-    its own home, writes its home, and writes its cwd only when `writable` (the writer role).
+    its own home, writes its home, and writes its cwd only when `writable` (the writer role). Offline,
+    every outbound connection is denied, Unix sockets included (the Docker socket is a way out), but
+    localhost, where the session's egress proxy listens.
     Later rules win in Seatbelt, so the own dirs are re-allowed after their roots are denied."""
     own = os.path.realpath(cwd)
     own_home = os.path.realpath(home)
@@ -193,6 +212,7 @@ def codex_seatbelt_profile(cwd: Path, home: Path, *, writable: bool = False) -> 
         f"(deny file-write* {denied} {runs})\n"
         f'(allow file-write* (subpath "{own_home}"))\n'
         + (f'(allow file-write* (subpath "{own}"))\n' if writable else "")
+        + ('(deny network-outbound)\n(allow network-outbound (remote ip "localhost:*"))\n' if offline else "")
     )
 
 

@@ -41,9 +41,11 @@ class StubAgentCase(FixtureCase):
         super().setUp()
         self.assertEqual(tasks.validate(self.task), [])
         self.seen_task_md = []
+        self.offline_flags = []
         self.calc = REFERENCE_CALC
 
-    def agent(self, model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE):
+    def agent(self, model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE, offline=False):
+        self.offline_flags.append(offline)
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "transcript.jsonl").touch()
         if role == agents.REVIEWER:
@@ -58,13 +60,22 @@ class StubAgentCase(FixtureCase):
 
     def execute(self, arm: loop.Arm) -> dict:
         with mock.patch.object(agents, "run_claude", self.agent), mock.patch.object(agents, "run_codex", self.agent):
-            return loop.execute_run(self.task, arm, self.tmp / "runs", rep=1, manifest_hash="d")
+            return loop.execute_run(self.task, arm, self.tmp / "runs", rep=1, manifest_hash="d", offline=True)
 
 
 
 class RunTest(StubAgentCase):
     """A replay run: seeded from base, built, scored on the replay groups, saved and read back by the records
     loader every consumer uses."""
+
+    def test_a_replay_run_starts_only_offline_and_every_session_is_offline(self):
+        with mock.patch.object(agents, "run_claude", self.agent), self.assertRaises(ValueError):
+            loop.execute_run(self.task, SOLO, self.tmp / "runs", rep=1, manifest_hash="d")
+        self.assertEqual(self.offline_flags, [])
+        self.assertFalse((self.tmp / "runs").exists())
+        self.execute(LOOP)
+        self.assertGreater(len(self.offline_flags), 2)
+        self.assertTrue(all(self.offline_flags))
 
     def test_a_solo_replay_run_is_seeded_scored_and_reloadable(self):
         record = self.execute(SOLO)

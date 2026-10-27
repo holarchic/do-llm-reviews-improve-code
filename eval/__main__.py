@@ -91,7 +91,7 @@ def _run(args) -> int:
         return 2
     arm = experiment.arm(args.arm)
     runs_root = _data_root(experiment) / "runs"
-    record = loop.execute_run(task, arm, runs_root, manifest_hash=None)
+    record = loop.execute_run(task, arm, runs_root, manifest_hash=None, offline=experiment.offline)
     print(json.dumps({k: record.get(k) for k in ("run_id", "exec", "status", "flags", "rounds", "scores")}))
     if record["status"] != "complete":
         return 1

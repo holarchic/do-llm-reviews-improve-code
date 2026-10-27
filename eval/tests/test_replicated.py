@@ -133,7 +133,7 @@ class EndToEndTest(unittest.TestCase):
         self.experiment = dataclasses.replace(PILOT2, tasks=("dev-planted",), reps=2, parallel=1, budget_usd=100.0)
         self.fail_once = {("A3", "r2")}
 
-    def writer(self, model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE):
+    def writer(self, model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE, offline=False):
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "transcript.jsonl").touch()
         if role == agents.REVIEWER:
@@ -155,11 +155,11 @@ class EndToEndTest(unittest.TestCase):
     def run_builds(self):
         real_execute = loop.execute_run
 
-        def execute(task, arm, runs_root, *, rep=None, manifest_hash):
+        def execute(task, arm, runs_root, *, rep=None, manifest_hash, offline=False):
             if (arm.name, f"r{rep}") in self.fail_once:
                 self.fail_once.discard((arm.name, f"r{rep}"))
                 return {"run_id": loop.run_id(task.id, arm.name, rep), "exec": "exec-0", "status": "invalid"}
-            return real_execute(task, arm, runs_root, rep=rep, manifest_hash=manifest_hash)
+            return real_execute(task, arm, runs_root, rep=rep, manifest_hash=manifest_hash, offline=offline)
 
         with mock.patch.object(pilot, "scored_tasks", lambda experiment: [self.task]), \
                 mock.patch.object(manifest, "verify", return_value="d"), \

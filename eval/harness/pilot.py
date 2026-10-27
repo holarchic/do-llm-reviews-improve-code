@@ -86,7 +86,8 @@ def run_builds(data_root: Path, experiment: Experiment) -> int:
             if cap is not None and not cap.admit():
                 _log(f"build {loop.run_id(task.id, arm, rep)}: not admitted (spend cap or unreadable usage)")
                 return False
-            record = loop.execute_run(task, experiment.arm(arm), runs_root, rep=rep, manifest_hash=digest)
+            record = loop.execute_run(task, experiment.arm(arm), runs_root, rep=rep, manifest_hash=digest,
+                                     offline=experiment.offline)
             _log(f"build {record['run_id']} {record['exec']}: {record['status']} {record.get('flags')}")
             if record["status"] != "complete":
                 return False
@@ -122,7 +123,8 @@ def run_calibration(data_root: Path, experiment: Experiment, task_ids: list[str]
             if cap is not None and not cap.admit():
                 _log(f"calibration {task_id} r{rep}: not admitted (spend cap or unreadable usage)")
                 break
-            built.append(loop.execute_run(by_id[task_id], experiment.arm(arm), runs_root, rep=rep, manifest_hash=None))
+            built.append(loop.execute_run(by_id[task_id], experiment.arm(arm), runs_root, rep=rep, manifest_hash=None,
+                                         offline=experiment.offline))
         return built
 
     # One worker per task: a task's replicates run one after another.

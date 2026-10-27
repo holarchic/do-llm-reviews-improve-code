@@ -155,10 +155,11 @@ class TaskExclusionTest(unittest.TestCase):
         import threading
         import time
 
-        active, overlaps, lock = {}, [], threading.Lock()
+        active, overlaps, calls, lock = {}, [], [], threading.Lock()
 
-        def fake_execute(task, arm, runs_root, *, rep=None, manifest_hash):
+        def fake_execute(task, arm, runs_root, *, rep=None, manifest_hash, offline=False):
             with lock:
+                calls.append(task.id)
                 if active.get(task.id):
                     overlaps.append(task.id)
                 active[task.id] = active.get(task.id, 0) + 1
@@ -172,6 +173,7 @@ class TaskExclusionTest(unittest.TestCase):
         with mock.patch.object(manifest, "verify", return_value="d"), \
              mock.patch.object(pilot.loop, "execute_run", fake_execute):
             pilot.run_builds(root, PILOT)
+        self.assertGreater(len(calls), len(PILOT.tasks))
         self.assertEqual(overlaps, [])
 
 

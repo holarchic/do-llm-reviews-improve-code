@@ -23,7 +23,7 @@ class FakeJudge:
         self.replies = list(replies)
         self.prompts = []
 
-    def __call__(self, model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE):
+    def __call__(self, model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE, offline=False):
         self.prompts.append(prompt)
         reply = self.replies.pop(0)
         if reply is None:
@@ -72,7 +72,7 @@ class JudgeTest(unittest.TestCase):
     def test_judge_runs_in_neutral_folder_outside_repo(self):
         cwds = []
 
-        def fake(model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE):
+        def fake(model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE, offline=False):
             cwds.append(cwd)
             self.assertTrue((cwd / "X").is_dir())
             return session(out_dir, text=verdict("X"))
@@ -95,7 +95,7 @@ class JudgeTest(unittest.TestCase):
         self.assertIn("contains no Python files", fake.prompts[0])
 
     def test_session_exception_counts_toward_infra_budget(self):
-        def boom(model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE):
+        def boom(model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE, offline=False):
             raise OSError("spawn failed")
 
         with mock.patch.object(agents, "run_codex", boom), self.assertRaises(InfraExhausted):

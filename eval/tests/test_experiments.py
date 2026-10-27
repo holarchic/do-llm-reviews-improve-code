@@ -170,7 +170,7 @@ class SyntheticExperimentRunTest(unittest.TestCase):
         self.calls = []
 
     def fake(self, cli):
-        def session(model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE):
+        def session(model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE, offline=False):
             self.calls.append({"cli": cli, "model": model, "role": role, "followup": "FOLLOWUP.md" in prompt})
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / "transcript.jsonl").touch()

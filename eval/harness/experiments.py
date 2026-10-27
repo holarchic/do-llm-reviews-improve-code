@@ -55,6 +55,7 @@ class Experiment:
     parallel: int = 3
     budget_usd: float | None = None  # OpenRouter spend cap for the scored runs
     report: str = "judged"  # "judged" (report.py) | "replicated" (replicated.py) | "replay" (replay.py)
+    offline: bool = False  # tool commands reach no network beyond localhost (agents.py); a source task requires it
 
     def arm(self, name: str) -> Arm:
         return next(arm for arm in self.arms if arm.name == name)
@@ -167,6 +168,7 @@ REPLAY = Experiment(
     tasks=REPLAY_TASKS,
     reps=2,
     report="replay",
+    offline=True,
 )
 
 EXPERIMENTS = {experiment.name: experiment for experiment in (

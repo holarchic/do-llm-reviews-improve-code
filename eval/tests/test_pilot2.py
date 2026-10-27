@@ -83,7 +83,7 @@ class RunBuildsCapTest(unittest.TestCase):
         usage = iter([0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0])
         started = []
 
-        def fake_execute(task, arm, runs_root, *, rep=None, manifest_hash):
+        def fake_execute(task, arm, runs_root, *, rep=None, manifest_hash, offline=False):
             started.append((arm.name, rep))
             return {"run_id": loop.run_id(task.id, arm.name, rep), "exec": "exec-1", "status": "invalid"}
 
@@ -110,7 +110,7 @@ class RoutedRunTest(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def test_unrouted_model_and_leaked_key_are_flagged(self):
-        def writer(model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE):
+        def writer(model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE, offline=False):
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / "transcript.jsonl").write_text(json.dumps({"leak": KEY}) + "\n")
             shutil.copy(DEV.path("reference") / "intervals.py", cwd / "intervals.py")

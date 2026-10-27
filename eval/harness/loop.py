@@ -84,6 +84,7 @@ class _Run:
     # A replay run starts from an existing repository, whose own suite runs for minutes.
     brownfield: bool = False
     suite_seconds: float = score.SUITE_SECONDS
+    offline: bool = False
 
 
 _ISSUE_START = re.compile(r"^\s*(\d+)\.\s*\[(HIGH|MEDIUM|LOW)\]", re.MULTILINE)
@@ -144,13 +145,16 @@ def run_id(task_id: str, arm: str, rep: int | None = None) -> str:
 
 
 def execute_run(task: Task, arm: Arm, runs_root: Path, *, rep: int | None = None,
-                manifest_hash: str | None) -> dict:
+                manifest_hash: str | None, offline: bool = False) -> dict:
+    brownfield = task.source is not None
+    if brownfield and not offline:
+        # The source's history is public: a networked session could read the landed phase.
+        raise ValueError(f"{task.id} replays a source repository and runs only offline")
     run_id_ = run_id(task.id, arm.name, rep)
     exec_dir = _next_exec_dir(runs_root.resolve() / run_id_)
-    brownfield = task.source is not None
     run = _Run(repo=audit.anonymous_workdir() / "repo", exec_dir=exec_dir, arm=arm,
                basis_rule=prompts.basis_required(), brownfield=brownfield,
-               suite_seconds=source.SUITE_SECONDS if brownfield else score.SUITE_SECONDS)
+               suite_seconds=source.SUITE_SECONDS if brownfield else score.SUITE_SECONDS, offline=offline)
     record = {"run_id": run_id_, "task": task.id, "arm": arm.name, "rep": rep, "exec": exec_dir.name,
               "manifest": manifest_hash, "cli_versions": _cli_versions(), "started": _now()}
 
@@ -338,7 +342,7 @@ def _loop(run: _Run) -> None:
 
 def _writer(run: _Run, name: str, prompt: str) -> None:
     session = _step(run, name, lambda out: agents.run(
-        run.arm.writer, prompt, role=agents.WRITER, cwd=run.repo, out_dir=out))
+        run.arm.writer, prompt, role=agents.WRITER, cwd=run.repo, out_dir=out, offline=run.offline))
     _check_routing(run, run.arm.writer, session, name)
     run.last_commit = _commit(run.repo, name)
     if session.terminal == agents.TIMEOUT:
@@ -348,7 +352,7 @@ def _writer(run: _Run, name: str, prompt: str) -> None:
 
 def _review(run: _Run, name: str, prompt: str) -> Verdict:
     session = _step(run, name, lambda out: agents.run(
-        run.arm.reviewer, prompt, role=agents.REVIEWER, cwd=run.repo, out_dir=out))
+        run.arm.reviewer, prompt, role=agents.REVIEWER, cwd=run.repo, out_dir=out, offline=run.offline))
     _check_routing(run, run.arm.reviewer, session, name)
     if _git(run.repo, "status", "--porcelain"):
         run.flags.append(f"reviewer_wrote:{name}")
