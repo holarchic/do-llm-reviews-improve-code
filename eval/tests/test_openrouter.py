@@ -147,6 +147,22 @@ class ScrubTest(_KeyFile):
         self.assertFalse((self.tmp / "locked.txt").exists())
         self.assertNotIn(KEY, (self.tmp / "later.txt").read_text())
 
+    def test_a_file_that_cant_be_redacted_is_removed_and_the_scan_goes_on(self):
+        (self.tmp / "a-readonly.txt").write_text(KEY)
+        (self.tmp / "b-later.txt").write_text(KEY)
+        real = Path.write_bytes
+
+        def write_bytes(path, data):
+            if path.name == "a-readonly.txt":
+                raise PermissionError(13, "denied")
+            return real(path, data)
+
+        with mock.patch.object(Path, "write_bytes", write_bytes):
+            hits = openrouter.scrub(self.tmp)
+        self.assertEqual(sorted(hits), ["a-readonly.txt", "b-later.txt"])
+        self.assertFalse((self.tmp / "a-readonly.txt").exists())
+        self.assertNotIn(KEY, (self.tmp / "b-later.txt").read_text())
+
     def test_a_clean_tree_is_untouched(self):
         (self.tmp / "a.txt").write_text("plain")
         self.assertEqual(openrouter.scrub(self.tmp), [])

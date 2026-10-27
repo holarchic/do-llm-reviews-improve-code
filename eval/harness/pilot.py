@@ -136,6 +136,8 @@ def run_calibration(data_root: Path, experiment: Experiment, task_ids: list[str]
     and cost samples (a loop arm). Stored apart under calibration/, never read by the report; a routed
     experiment's calibration spend has its own cap."""
     runs_root = data_root / "calibration" / "runs"
+    if experiment.routed and runs_root.exists():
+        openrouter.scrub(runs_root)  # a calibration killed mid-way leaves files the end-of-run scrub never reached
     cap = (openrouter.SpendCap(data_root / SPEND_LEDGER, "calibration", CALIBRATION_CAP_USD)
            if experiment.routed else None)
     by_id = {task.id: task for task in scored_tasks(experiment)}

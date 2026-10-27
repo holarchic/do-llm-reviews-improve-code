@@ -88,6 +88,14 @@ class NetworkProblemsTest(unittest.TestCase):
         self.assertTrue(any(p.startswith("git: no proxy refusal") for p in found), found)
         self.assertTrue(any(p.startswith("curl: no proxy refusal") for p in found), found)
 
+    def test_a_later_run_of_the_socket_step_that_connects_is_caught(self):
+        commands = [{"command": f"bash -lc '{self.STEPS[name]}'", "output": self.CLEAN[name]} for name in self.STEPS]
+        commands.append({"command": self.STEPS["socket"], "output": "DIRECT-RESULT CONNECTED\nUNIX-RESULT CONNECTED"})
+        found = probe.network_problems(commands, self.STEPS, permitted="PERMITTED-1", local="LOCAL-1",
+                                       egress_log=self.EGRESS, search={"config_disabled": True, "web_search_items": 0})
+        self.assertTrue(any(p.startswith("direct socket not denied") for p in found), found)
+        self.assertTrue(any(p.startswith("unix socket not denied") for p in found), found)
+
     def test_a_step_that_never_ran_is_unproven(self):
         self.assertIn("bypass step never ran; unproven", self.problems(drop=("bypass",)))
 

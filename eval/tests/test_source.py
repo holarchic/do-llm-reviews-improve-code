@@ -158,6 +158,20 @@ class ValidateTest(FixtureCase):
         problems = source._anchor_problems(self.task, stable, [], defects, [good, drift, good])
         self.assertIn("does not reach the defect on pre_review (fail, setup", "\n".join(problems))
 
+    def test_every_failure_a_test_reports_must_show_the_defect(self):
+        test_id = "tests.test_hidden_review_div.T.test"
+        crash = {"outcome": "error", "exc": "ValueError", "stage": "call"}
+
+        def run(*failures):
+            return score.SuiteOutcome({test_id: "error"}, False,
+                                      {test_id: {"exc": "ValueError", "stage": "call", "failures": list(failures)}})
+
+        self.assertIsNone(source._attribution_problem(run(crash, crash), test_id, True))
+        for other in ({"outcome": "error", "exc": "AttributeError", "stage": "call"},
+                      {"outcome": "error", "exc": "RuntimeError", "stage": "teardown"}):
+            for failures in ((crash, other), (other, crash)):
+                self.assertIn("does not reach the defect", source._attribution_problem(run(*failures), test_id, True))
+
     def test_a_control_flag_must_be_a_boolean(self):
         data = json.loads(self.task.path("source.json").read_text())
         self.task.path("source.json").write_text(json.dumps({**data, "control": "false"}))

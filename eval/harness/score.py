@@ -69,7 +69,12 @@ def run_package(code_dir: Path, package: str, work_dir: Path, *, ids: list[str] 
                        package=package, ids=ids, detail=detail)
     by_test = _by_test(results.records)
     outcomes = {test_id: record["outcome"] for test_id, record in by_test.items()}
-    details = {test_id: {key: record[key] for key in ("exc", "stage", "trace")}
+    # Every failure a test reported (failed subtests, a tearDown after the body): attribution weighs them all.
+    failures: dict[str, list[dict]] = {}
+    for record in results.records:
+        if "exc" in record:
+            failures.setdefault(record["id"], []).append({key: record[key] for key in ("outcome", "exc", "stage")})
+    details = {test_id: {**{key: record[key] for key in ("exc", "stage", "trace")}, "failures": failures[test_id]}
                for test_id, record in by_test.items() if "exc" in record}
     return SuiteOutcome(outcomes=outcomes, timed_out=results.timed_out, details=details)
 

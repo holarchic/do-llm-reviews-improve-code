@@ -115,6 +115,9 @@ def _calibrate(args) -> int:
     if arm not in experiment.arm_names or any(t not in experiment.tasks for t in task_ids):
         print(f"calibrate: arm one of {experiment.arm_names}, task one of {experiment.tasks}", file=sys.stderr)
         return 2
+    if len(set(task_ids)) != len(task_ids) or args.reps < 1:
+        print("calibrate: each task once, and --reps at least 1", file=sys.stderr)
+        return 2
     data_root = _data_root(experiment)
     built = pilot.run_calibration(data_root, experiment, task_ids, arm, args.reps)
     for record in built:

@@ -128,8 +128,11 @@ def scrub(root: Path, key: str | None = None) -> list[str]:
             hits.append(str(path.relative_to(root)))
             continue
         if secret in data:
-            path.write_bytes(data.replace(secret, REDACTED))
             hits.append(str(path.relative_to(root)))
+            try:
+                path.write_bytes(data.replace(secret, REDACTED))
+            except OSError:  # a copy that can't be redacted is removed
+                path.unlink(missing_ok=True)
     for git_dir in sorted(p for p in root.rglob(".git") if p.is_dir() and not p.is_symlink()):
         if _git_dir_holds(git_dir, secret):
             shutil.rmtree(git_dir)

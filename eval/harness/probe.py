@@ -536,10 +536,10 @@ def network_problems(commands: list[dict], steps: dict[str, str], *, permitted: 
                                     or not re.search(r"Failed to connect|Couldn't connect", bypass)):
         problems.append("bypass: no connection refusal in its output")
     for label in ("DIRECT", "UNIX"):
-        match = re.search(rf"{label}-RESULT (\S+)", outputs["socket"])
-        if "socket" in ran_steps and (match is None or match.group(1) not in _DENIED):
-            result = match.group(1) if match else "no result"
-            problems.append(f"{label.lower()} socket not denied by the sandbox: {result}")
+        results = re.findall(rf"{label}-RESULT (\S+)", outputs["socket"])  # every run of the step counts
+        if "socket" in ran_steps and (not results or any(result not in _DENIED for result in results)):
+            shown = ", ".join(results) or "no result"
+            problems.append(f"{label.lower()} socket not denied by the sandbox: {shown}")
     if egress_log is not None:
         if "ALLOW CONNECT chatgpt.com:443" not in egress_log:
             problems.append("no model call through the egress proxy")

@@ -268,11 +268,20 @@ def _attribution_problem(pre_review: score.SuiteOutcome, test_id: str, crash_is_
     detail = pre_review.details.get(test_id, {})
     if outcome == "pass":
         return "passes on pre_review"
-    if outcome == "fail" and detail.get("stage") == "call":
-        return None
-    if outcome == "error" and crash_is_defect and detail.get("stage") == "call" and detail.get("exc") not in NAME_ERRORS:
-        return None
-    return f"does not reach the defect on pre_review ({outcome}, {detail.get('stage')}, {detail.get('exc')})"
+    failures = detail.get("failures") or [{"outcome": outcome, "stage": detail.get("stage"), "exc": detail.get("exc")}]
+    for failure in failures:  # each failure the test reported must be the defect's
+        if not _shows_defect(failure, crash_is_defect):
+            return (f"does not reach the defect on pre_review ({failure['outcome']}, {failure.get('stage')}, "
+                    f"{failure.get('exc')})")
+    return None
+
+
+def _shows_defect(failure: dict, crash_is_defect: bool) -> bool:
+    if failure.get("stage") != "call":
+        return False
+    if failure["outcome"] == "fail":
+        return True
+    return failure["outcome"] == "error" and crash_is_defect and failure.get("exc") not in NAME_ERRORS
 
 
 def _evidence(outcome: score.SuiteOutcome, test_id: str) -> dict:
