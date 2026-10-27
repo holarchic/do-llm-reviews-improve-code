@@ -1,0 +1,32 @@
+{
+  "defects": [
+    {
+      "id": "encoded-job-link-is-a-board",
+      "fix_commit": "7fb6834",
+      "basis": "TASK.md: apply.workable.com/j/<shortcode> links a job, not an account, so it is no board; a percent-encoded form of the same path (%6a) is the same link",
+      "tests": ["tests.test_hidden_review_workable_gem.DecodedLinkTest.test_an_encoded_job_link_is_not_a_board"],
+      "crash_is_defect": false
+    },
+    {
+      "id": "greenhouse-token-checked-before-folding",
+      "fix_commit": "ccc76ae",
+      "basis": "existing behaviour: at base a Greenhouse link whose token case-folds to a valid one (a Kelvin sign folding to k) names that board; moving the slug check must not break it",
+      "tests": ["tests.test_hidden_review_workable_gem.DecodedLinkTest.test_a_greenhouse_token_is_folded_before_it_is_checked"],
+      "crash_is_defect": false
+    },
+    {
+      "id": "workable-place-listed-twice",
+      "fix_commit": "7fb6834",
+      "basis": "TASK.md: a posting's location lists each place once",
+      "tests": ["tests.test_hidden_review_workable_gem.WorkablePlacesTest.test_a_hidden_record_repeating_a_place_lists_it_once"],
+      "crash_is_defect": false
+    },
+    {
+      "id": "gem-remote-marker-lost-to-a-substring",
+      "fix_commit": "ccc76ae",
+      "basis": "TASK.md: a remote Gem job adds Remote unless a name already says Remote, which the prefilter matches as a word; a name that merely contains the letters (Work remotely, RemoteHQ) doesn't say it, so a Remote search would miss the job",
+      "tests": ["tests.test_hidden_review_workable_gem.GemRemoteTest.test_remote_is_added_unless_a_name_says_remote_as_a_word"],
+      "crash_is_defect": false
+    }
+  ]
+}
