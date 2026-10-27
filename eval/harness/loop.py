@@ -1,4 +1,5 @@
-"""One eval run: a task built by one arm, from an empty repo to a scored build.
+"""One eval run: a task built by one arm, from an empty repo (or a replay task's seeded starting tree) to a
+scored build.
 
 The harness, not the model, sequences the loop. Each step is one fresh
 headless session; after every writer step the harness commits, so HEAD always
@@ -176,12 +177,15 @@ def execute_run(task: Task, arm: Arm, runs_root: Path, *, rep: int | None = None
     return record
 
 
-def execute_followup(task: Task, build_exec_dir: Path, arm: Arm, *, manifest_hash: str | None) -> dict:
+def execute_followup(task: Task, build_exec_dir: Path, arm: Arm, *, manifest_hash: str | None,
+                     offline: bool = False) -> dict:
     """A fresh solo session of the arm's writer makes the FOLLOWUP.md change in a copy of a finished build.
 
     Regressions are base test IDs that passed on the build and fail after the change;
     tests that failed before are reported apart, so a weak build isn't penalised twice.
     """
+    if task.source is not None and not offline:
+        raise ValueError(f"{task.id} replays a source repository and runs only offline")
     build_exec_dir = build_exec_dir.resolve()
     build = records.build(build_exec_dir / "record.json", manifest_hash)
     if build is None:
@@ -190,7 +194,7 @@ def execute_followup(task: Task, build_exec_dir: Path, arm: Arm, *, manifest_has
         raise ValueError(f"build is arm {build['arm']}, follow-up asked for {arm.name}")
     out_dir = build_exec_dir / "followup"
     out_dir.mkdir()
-    run = _Run(repo=audit.anonymous_workdir() / "repo", exec_dir=out_dir, arm=arm)
+    run = _Run(repo=audit.anonymous_workdir() / "repo", exec_dir=out_dir, arm=arm, offline=offline)
     record = {"run_id": build["run_id"], "task": task.id, "arm": build["arm"], "build_exec": build_exec_dir.name,
               "manifest": manifest_hash, "cli_versions": _cli_versions(), "started": _now()}
 
@@ -219,7 +223,10 @@ def _write_record(exec_dir: Path, record: dict, arm: Arm) -> None:
         return
     hits = openrouter.scrub(exec_dir)
     if hits:
-        record["flags"] = record.get("flags", []) + [f"key_exposed:{hit}" for hit in hits]
+        # The record itself may have held the key: carry on from its scrubbed copy, never the original.
+        scrubbed = json.loads(path.read_text(encoding="utf-8"))
+        record.clear()
+        record.update(scrubbed, flags=scrubbed.get("flags", []) + [f"key_exposed:{hit}" for hit in hits])
         path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
 
 

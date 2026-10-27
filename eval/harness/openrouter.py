@@ -114,8 +114,8 @@ def credit_used() -> float:
 
 
 def scrub(root: Path, key: str | None = None) -> list[str]:
-    """Redact the key in every regular file under root; delete the .git of any repo whose objects
-    hold it (compressed objects can't be redacted in place). Returns the paths hit, relative to root."""
+    """Redact the key in every regular file under root; delete the .git of any repo that holds it in an object
+    or a metadata file (compressed objects can't be redacted in place). Returns the paths hit, relative to root."""
     secret = (key or api_key()).encode()
     hits = []
     for path in sorted(root.rglob("*")):
@@ -126,17 +126,20 @@ def scrub(root: Path, key: str | None = None) -> list[str]:
             path.write_bytes(data.replace(secret, REDACTED))
             hits.append(str(path.relative_to(root)))
     for git_dir in sorted(p for p in root.rglob(".git") if p.is_dir() and not p.is_symlink()):
-        if secret in _git_objects(git_dir):
+        if _git_dir_holds(git_dir, secret):
             shutil.rmtree(git_dir)
             hits.append(str(git_dir.relative_to(root)))
     return hits
 
 
-def _git_objects(git_dir: Path) -> bytes:
+def _git_dir_holds(git_dir: Path, secret: bytes) -> bool:
+    """The key in any metadata file (config, logs, hooks) or object; a repo git can't read is assumed to hold it."""
+    if any(secret in p.read_bytes() for p in git_dir.rglob("*") if p.is_file() and not p.is_symlink()):
+        return True
     completed = subprocess.run(["git", f"--git-dir={git_dir}", "cat-file", "--batch-all-objects", "--batch"],
                                capture_output=True, env={"PATH": "/usr/bin:/bin:/opt/homebrew/bin",
                                                          "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"})
-    return completed.stdout
+    return completed.returncode != 0 or secret in completed.stdout
 
 
 class SpendCap:

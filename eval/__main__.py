@@ -101,7 +101,7 @@ def _run(args) -> int:
     if arm.name not in experiment.followup_arms:
         return 0
     exec_dir = runs_root / record["run_id"] / record["exec"]
-    followup = loop.execute_followup(task, exec_dir, arm, manifest_hash=None)
+    followup = loop.execute_followup(task, exec_dir, arm, manifest_hash=None, offline=experiment.offline)
     print(json.dumps({k: followup.get(k) for k in ("status", "flags", "scores")}))
     return 0 if followup["status"] == "complete" else 1
 
@@ -161,7 +161,8 @@ def _judge(args) -> int:
             print(f"judge: {unknown} not arms of {args.experiment.name}", file=sys.stderr)
             return 2
         a, b = (loop.latest_complete_exec(data_root / "runs", f"{task.id}--{arm}") / "artifact" for arm in args.pair)
-        result = judge.judge_pair(args.judge, task, a, b, data_root / "dev-judgements" / f"{stamp}-{args.judge}")
+        result = judge.judge_pair(args.judge, task, a, b, data_root / "dev-judgements" / f"{stamp}-{args.judge}",
+                                  offline=args.experiment.offline)
     else:
         result = judge.calibrate(args.judge, task, data_root / "dev-calibration" / f"{stamp}-{args.judge}")
     print(json.dumps({"result": result["result"], "picks": [o["pick"] for o in result["orders"]],

@@ -18,18 +18,21 @@ from pathlib import Path
 
 ALLOWED_TARGETS = frozenset({"chatgpt.com:443", "auth.openai.com:443"})
 _HEADER_LIMIT = 65536
+_HEADER_SECONDS = 30
 _CONNECT_SECONDS = 30
 
 
 class Proxy:
-    """One session's proxy: `with Proxy(log) as proxy:` serves on an ephemeral loopback port until exit,
-    then closes every connection it relayed."""
+    """One session's proxy: `with Proxy(log) as proxy:` serves on an ephemeral loopback port until exit.
+    Exit owns every connection: from acceptance on, each socket is registered, a connection that arrives
+    or completes while closing is refused, open ones are shut down, and every handler is joined."""
 
     def __init__(self, log_path: Path, allowed: frozenset[str] = ALLOWED_TARGETS):
         self._log_path = log_path
         self._allowed = allowed
         self._lock = threading.Lock()
         self._open: set[socket.socket] = set()
+        self._closing = False
         self._server: socketserver.ThreadingTCPServer | None = None
 
     def __enter__(self) -> "Proxy":
@@ -40,12 +43,24 @@ class Proxy:
                 proxy._handle(self.request)
 
         self._log = open(self._log_path, "a", encoding="utf-8", buffering=1)
-        self._server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
-        self._server.daemon_threads = True
+        try:
+            self._server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+        except OSError:
+            self._log.close()
+            raise
+        self._server.daemon_threads = False
+        self._server.block_on_close = True  # server_close joins the handlers
         threading.Thread(target=self._server.serve_forever, daemon=True).start()
         return self
 
     def __exit__(self, *exc) -> None:
+        with self._lock:
+            self._closing = True
+            for sock in self._open:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)  # unblocks a handler's recv, select or sendall
+                except OSError:
+                    pass
         self._server.shutdown()
         self._server.server_close()
         with self._lock:
@@ -64,35 +79,50 @@ class Proxy:
                 "NO_PROXY": "localhost,127.0.0.1", "no_proxy": "localhost,127.0.0.1"}
 
     def _handle(self, client: socket.socket) -> None:
-        request_line = _request_line(client)
-        if request_line is None:
+        if not self._track(client):
             return
-        method, target = request_line
-        if method != "CONNECT" or target not in self._allowed:
-            self._write(f"DENY {method} {target}")
-            client.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            return
+        upstream = None
         try:
-            host, _, port = target.rpartition(":")
-            upstream = socket.create_connection((host, int(port)), timeout=_CONNECT_SECONDS)
-        except OSError as e:
-            self._write(f"FAIL CONNECT {target} {type(e).__name__}")
-            client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            return
-        self._write(f"ALLOW CONNECT {target}")
-        upstream.settimeout(None)
-        with self._lock:
-            self._open.update((client, upstream))
-        try:
+            client.settimeout(_HEADER_SECONDS)
+            request_line = _request_line(client)
+            if request_line is None:
+                return
+            method, target = request_line
+            if method != "CONNECT" or target not in self._allowed:
+                self._write(f"DENY {method} {target}")
+                client.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                return
+            try:
+                host, _, port = target.rpartition(":")
+                upstream = socket.create_connection((host, int(port)), timeout=_CONNECT_SECONDS)
+            except OSError as e:
+                self._write(f"FAIL CONNECT {target} {type(e).__name__}")
+                client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                return
+            if not self._track(upstream):
+                return
+            self._write(f"ALLOW CONNECT {target}")
+            client.settimeout(None)
+            upstream.settimeout(None)
             client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             _relay(client, upstream)
-        except (OSError, ValueError):  # ValueError: __exit__ closed a socket under select
+        except (OSError, ValueError):  # ValueError: a socket closed under select
             pass
         finally:
             with self._lock:
                 self._open.discard(client)
                 self._open.discard(upstream)
-            upstream.close()
+            if upstream is not None:
+                upstream.close()
+
+    def _track(self, sock: socket.socket) -> bool:
+        """Register a socket for exit to shut down; False, and the socket closed, once exit has begun."""
+        with self._lock:
+            if not self._closing:
+                self._open.add(sock)
+                return True
+        sock.close()
+        return False
 
     def _write(self, line: str) -> None:
         with self._lock:

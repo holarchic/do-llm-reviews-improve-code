@@ -110,6 +110,27 @@ class ScrubTest(_KeyFile):
         self.assertFalse((repo / ".git").exists())
         self.assertEqual((root / "clean.txt").read_text(), "nothing here\n")
 
+    def test_drops_a_repo_holding_the_key_in_its_metadata_or_that_git_cant_read(self):
+        git = ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]
+        for name in ("config", "broken"):
+            repo = self.tmp / name
+            repo.mkdir()
+            subprocess.run(git + ["init", "-q"], cwd=repo, check=True)
+        with (self.tmp / "config" / ".git" / "config").open("a") as config:
+            config.write(f'[remote "o"]\n\turl = https://x:{KEY}@example.com/r\n')
+        (self.tmp / "broken" / ".git" / "HEAD").write_text("not a ref\n")
+        self.assertEqual(sorted(openrouter.scrub(self.tmp)), ["broken/.git", "config/.git"])
+
+    def test_a_record_that_held_the_key_stays_scrubbed_once_flagged(self):
+        from eval.harness import loop
+        arm = loop.Arm("A1", agents.Agent("claude", "m", agents.OPENROUTER))
+        record = {"status": "invalid", "invalid_reason": f"provider said: bad key {KEY}", "flags": []}
+        loop._write_record(self.tmp, record, arm)
+        saved = (self.tmp / "record.json").read_text()
+        self.assertNotIn(KEY, saved)
+        self.assertNotIn(KEY, json.dumps(record))
+        self.assertEqual(json.loads(saved)["flags"], ["key_exposed:record.json"])
+
     def test_a_clean_tree_is_untouched(self):
         (self.tmp / "a.txt").write_text("plain")
         self.assertEqual(openrouter.scrub(self.tmp), [])

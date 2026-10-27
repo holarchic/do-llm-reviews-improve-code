@@ -3,9 +3,10 @@
 Tier and reverse-direction experiments reuse the pilot's arm roles — A1 solo,
 A1r its replicate, A2 reviewed by the writer's own family, A3 by the other
 family — so their reports read the same way. Ablations compare the full loop
-with one switch off at a time. Only the pilot carries a pre-registered decision
-rule; every other experiment needs its own `eval/prereg/<name>.md`, frozen,
-before it can run.
+with one switch off at a time. The pilot, pilot2 and the replay carry
+pre-registered decision rules; every other experiment needs its own
+`eval/prereg/<name>.md`, frozen, before it can run, and is descriptive until it
+defines one.
 
 pilot2 is judge-free: open-weight models through OpenRouter, three replicates per
 cell, scored by hidden tests and planted bugs (`report="replicated"`), under its

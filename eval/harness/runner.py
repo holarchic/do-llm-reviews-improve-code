@@ -37,15 +37,22 @@ def _on_alarm(signum, frame):
 
 
 _SETUP_FRAMES = {"setUp", "setUpClass", "setUpModule", "asyncSetUp"}
+_TEARDOWN_FRAMES = {"tearDown", "tearDownClass", "tearDownModule", "asyncTearDown", "doCleanups", "doClassCleanups",
+                    "_callCleanup"}
 
 
 def _stage(test, err) -> str:
+    """Where the failure arose: only "call", the test body, is evidence about the code under test."""
     if type(test).__name__ == "_FailedTest":
         return "import"
     if isinstance(test, unittest.suite._ErrorHolder):
         return "setup"
+    if issubclass(err[0], _Alarm):
+        return "timeout"
     frames = {frame.name for frame in traceback.extract_tb(err[2])}
-    return "setup" if frames & _SETUP_FRAMES else "call"
+    if frames & _SETUP_FRAMES:
+        return "setup"
+    return "teardown" if frames & _TEARDOWN_FRAMES else "call"
 
 
 class _StreamingResult(unittest.TestResult):
@@ -81,6 +88,12 @@ class _StreamingResult(unittest.TestResult):
     def addError(self, test, err):
         super().addError(test, err)
         self._write(test, "error", err)
+
+    def addSubTest(self, test, subtest, err):
+        # A failed subtest is the parent test's outcome: unittest then never reports the parent a success.
+        super().addSubTest(test, subtest, err)
+        if err is not None:
+            self._write(test, "fail" if issubclass(err[0], test.failureException) else "error", err)
 
     def addSkip(self, test, reason):
         super().addSkip(test, reason)

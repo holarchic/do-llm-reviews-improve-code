@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +36,7 @@ REVIEW_PREFIX = "test_hidden_review_"
 ANCHORS = ("base", "pre_review", "reference")
 # The base suite of a real repo runs for minutes, and a hung test only dies at the runner's per-test alarm.
 SUITE_SECONDS = 900
+_MIRROR_LOCK = threading.Lock()
 # Validate's third round runs every anchor this many times at once: the scored run's load, roughly.
 CONCURRENT_COPIES = 2
 # A review test that errors for these reasons on pre_review never reached the defect.
@@ -56,22 +58,27 @@ class Source:
     @classmethod
     def load(cls, path: Path) -> "Source":
         data = json.loads(path.read_text(encoding="utf-8"))
+        control = data.get("control", False)
+        if not isinstance(control, bool):
+            raise SourceError(f"{path}: control must be true or false, not {control!r}")
         return cls(url=data["url"], base=data["base"], pre_review=data["pre_review"],
-                   reference=data["reference"], control=bool(data.get("control", False)))
+                   reference=data["reference"], control=control)
 
     def commit(self, anchor: str) -> str:
         return {"base": self.base, "pre_review": self.pre_review, "reference": self.reference}[anchor]
 
 
 def mirror(source: Source) -> Path:
-    """The bare mirror holding every anchor commit; fetched once, refreshed only when a commit is missing."""
+    """The bare mirror holding every anchor commit; fetched once, refreshed only when a commit is missing.
+    Concurrent runs of one source share it, so they take turns preparing it."""
     git_dir = SOURCES_ROOT / (hashlib.sha256(source.url.encode()).hexdigest()[:16] + ".git")
-    if not git_dir.exists():
-        SOURCES_ROOT.mkdir(parents=True, exist_ok=True)
-        _git(None, "clone", "--quiet", "--bare", source.url, str(git_dir))
-    if _missing(git_dir, source):
-        _git(git_dir, "fetch", "--quiet", "origin", "+refs/heads/*:refs/heads/*")
-    missing = _missing(git_dir, source)
+    with _MIRROR_LOCK:
+        if not git_dir.exists():
+            SOURCES_ROOT.mkdir(parents=True, exist_ok=True)
+            _git(None, "clone", "--quiet", "--bare", source.url, str(git_dir))
+        if _missing(git_dir, source):
+            _git(git_dir, "fetch", "--quiet", "origin", "+refs/heads/*:refs/heads/*")
+        missing = _missing(git_dir, source)
     if missing:
         raise SourceError(f"{source.url} has no commit {', '.join(missing)}")
     return git_dir
@@ -210,7 +217,8 @@ def _shape_problems(task, listed: list[str], feature: list[str], review: list[st
 
 
 def _anchor_rounds(trees: dict[str, Path], work: Path) -> dict[str, list[score.SuiteOutcome]]:
-    """Each anchor three times: twice in turn, then CONCURRENT_COPIES copies of every anchor at once."""
+    """Three rounds per anchor: two runs in turn, then a third round of CONCURRENT_COPIES copies of every
+    anchor at once, the scored run's concurrency."""
     rounds: dict[str, list[score.SuiteOutcome]] = {anchor: [] for anchor in ANCHORS}
     for n in (1, 2):
         for anchor in ANCHORS:

@@ -512,7 +512,8 @@ def network_steps(ip: str, local_token: str) -> dict[str, str]:
 def network_problems(commands: list[dict], steps: dict[str, str], *, permitted: str, local: str,
                      egress_log: str | None, search: dict) -> list[str]:
     """Each step must have run; the controls must succeed and every way out must be refused, with the
-    refusal's own evidence (a DNS failure proves nothing)."""
+    refusal's own evidence: empty output or a DNS failure proves nothing. A step that never ran is
+    reported once, as unproven."""
     outputs = {}
     problems = []
     for name, command in steps.items():
@@ -520,6 +521,7 @@ def network_problems(commands: list[dict], steps: dict[str, str], *, permitted: 
         if not ran:
             problems.append(f"{name} step never ran; unproven")
         outputs[name] = "\n".join(ran)
+    ran_steps = {name for name, command in steps.items() if any(command in c["command"] for c in commands)}
     if permitted not in outputs["permitted"]:
         problems.append("permitted local read failed; positive control missing")
     if f"LOCAL-OK {local}" not in outputs["localhost"]:
@@ -527,16 +529,17 @@ def network_problems(commands: list[dict], steps: dict[str, str], *, permitted: 
     for name in ("git", "curl"):
         if re.search(r"\b[0-9a-f]{40}\b|HTTP [23]\d\d", outputs[name]):
             problems.append(f"{name}: reached the source")
-        elif outputs[name] and not _PROXY_REFUSAL.search(outputs[name]):
+        elif name in ran_steps and not _PROXY_REFUSAL.search(outputs[name]):
             problems.append(f"{name}: no proxy refusal in its output")
     bypass = outputs["bypass"]
     if re.search(r"HTTP [23]\d\d", bypass):
         problems.append("bypass: reached the source around the proxy")
-    elif bypass and ("Could not resolve" in bypass or not re.search(r"Failed to connect|Couldn't connect", bypass)):
+    elif "bypass" in ran_steps and ("Could not resolve" in bypass
+                                    or not re.search(r"Failed to connect|Couldn't connect", bypass)):
         problems.append("bypass: no connection refusal in its output")
     for label in ("DIRECT", "UNIX"):
         match = re.search(rf"{label}-RESULT (\S+)", outputs["socket"])
-        if outputs["socket"] and (match is None or match.group(1) not in _DENIED):
+        if "socket" in ran_steps and (match is None or match.group(1) not in _DENIED):
             result = match.group(1) if match else "no result"
             problems.append(f"{label.lower()} socket not denied by the sandbox: {result}")
     if egress_log is not None:

@@ -166,10 +166,14 @@ def render(results: Results, decision: Decision, experiment: Experiment) -> str:
     if "A2" in arms:
         a2_gain = arm_mean(results, "A2", REVIEW, results.caught) - arm_mean(results, "A1", REVIEW, results.caught)
         lines += [f"- A2 − A1 review (descriptive): {a2_gain:+.1f}", ""]
+    elif results.builds.get("A2"):
+        lines += [f"- A2 left out: the loop effect did not pass, and {len(results.missing['A2'])} of its builds "
+                  "are missing.", ""]
     else:
         lines += ["- A2 not run: the loop effect did not pass.", ""]
     for pair in experiment.pairs:
         lines += _judgment_lines(results, experiment, pair)
+    lines += _stage_lines(results, arms)
     lines += ["## Diagnostics", ""]
     lines += _table(["Arm", "Plan rounds", "Phase rounds", "Capped", "Timeouts", "Model minutes"],
                     [_diagnostics_row(results, arm) for arm in arms]) + [""]
@@ -180,6 +184,21 @@ def render(results: Results, decision: Decision, experiment: Experiment) -> str:
               " the reviewer configuration, its CLI included.",
               "- A few tasks with two replicates each is an exploratory continuation rule, not a significance test.", ""]
     return "\n".join(lines)
+
+
+def _stage_lines(results: Results, arms: list[str]) -> list[str]:
+    """When each arm was built and with which CLIs: the arms run as stages, possibly days apart."""
+    rows, versions = [], {}
+    for arm in arms:
+        builds = [record for by_task in results.builds[arm].values() for record in by_task]
+        versions[arm] = sorted({f"{cli} {version}" for record in builds
+                                for cli, version in record["cli_versions"].items()})
+        rows.append([arm, f"{min(r['started'] for r in builds)[:10]} to {max(r['finished'] for r in builds)[:10]}",
+                     "; ".join(versions[arm])])
+    lines = ["## Stages", "", *_table(["Arm", "Built", "CLI versions"], rows), ""]
+    if len({tuple(seen) for seen in versions.values()}) > 1:
+        lines += ["- **The CLI versions differ between stages.**", ""]
+    return lines
 
 
 def _judgment_lines(results: Results, experiment: Experiment, pair: tuple[str, str]) -> list[str]:

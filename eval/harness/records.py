@@ -26,7 +26,7 @@ def build(path: Path, digest: str) -> dict | None:
     valid = (
         _identity(record)
         and isinstance(scores, dict)
-        and (_replay(scores["replay"]) if "replay" in scores else _hidden(scores))
+        and (_replay(scores["replay"]) and _staged(record) if "replay" in scores else _hidden(scores))
         and _valid_steps(record.get("steps"))
         and isinstance(record.get("flags"), list) and all(isinstance(flag, str) for flag in record["flags"])
         and isinstance(record.get("rounds"), dict) and all(isinstance(v, int) for v in record["rounds"].values())
@@ -45,6 +45,13 @@ def _hidden(scores: dict) -> bool:
         and all(isinstance(scores["static"].get(key), int) for key in _STATIC_KEYS)
         and ("planted" not in scores or _planted(scores["planted"]))
     )
+
+
+def _staged(record: dict) -> bool:
+    """What a replay report needs to date each stage and compare its CLI versions."""
+    versions = record.get("cli_versions")
+    return (isinstance(record.get("started"), str) and isinstance(record.get("finished"), str)
+            and isinstance(versions, dict) and all(isinstance(v, str) for v in versions.values()))
 
 
 def _replay(replay) -> bool:

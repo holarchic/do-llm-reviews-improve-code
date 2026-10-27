@@ -83,13 +83,14 @@ def export_patch(task: Task, build: Path, dest: Path, *, tests: bool = True) -> 
     with tempfile.TemporaryDirectory(prefix="eval-patch-") as tmp:
         start = Path(tmp)
         source.seed(task, start)
-        _git(start, "init", "-q")
+        _git(start, "init", "-q", "--template=")
         _git(start, "add", "-A", "-f")
         _git(start, "commit", "-q", "--no-verify", "-m", "start")
         # The build's files staged over the starting tree: deletions included, its .gitignore no filter.
         _git(start, f"--work-tree={build}", "add", "-A", "-f")
-        patch = _git(start, "diff", "--cached", "--no-renames", "--no-ext-diff", f"-U{WHOLE_FILE_CONTEXT}", *pathspec)
-        changed = _git(start, "diff", "--cached", "--no-renames", "--name-only", *pathspec).splitlines()
+        diff = ["diff", "--cached", "--no-renames", "--no-ext-diff", "--no-textconv", "--no-color"]
+        patch = _git(start, *diff, "--src-prefix=a/", "--dst-prefix=b/", f"-U{WHOLE_FILE_CONTEXT}", *pathspec)
+        changed = _git(start, *diff, "--name-only", *pathspec).splitlines()
     (dest / PATCH).write_text(patch, encoding="utf-8")
     return changed
 
@@ -143,6 +144,8 @@ def judge_pair(judge: str, task: Task, a_repo: Path, b_repo: Path, out_dir: Path
     """Judge builds a and b in both orders. Returns per-order picks and the combined result. `builds` identifies
     what a and b are (exec and artifact hash), so a re-run build invalidates this. Offline, a judge can't look
     up the source repository's history."""
+    if task.source is not None and not offline:
+        raise ValueError(f"{task.id} replays a source repository and is judged only offline")
     out_dir.mkdir(parents=True, exist_ok=False)
     exports = {"a": out_dir / "export-a", "b": out_dir / "export-b"}
     task_text = task.path("TASK.md").read_text(encoding="utf-8")
@@ -180,15 +183,21 @@ def judge_pair(judge: str, task: Task, a_repo: Path, b_repo: Path, out_dir: Path
     return result
 
 
+class PromptTooLong(Exception):
+    pass
+
+
 def _export_patches(task: Task, task_text: str, builds: dict[str, Path], exports: dict[str, Path]) -> str:
-    """Both builds' patches with their tests, or their source alone when that prompt would pass PROMPT_CHARS."""
+    """Both builds' patches with their tests, or their source alone when that prompt would pass PROMPT_CHARS;
+    PromptTooLong, before any judge runs, when even that would."""
     for scope, tests in ((PATCH_SCOPE, True), (SOURCE_SCOPE, False)):
         for side, build in builds.items():
             shutil.rmtree(exports[side], ignore_errors=True)
             export_patch(task, build, exports[side], tests=tests)
-        if len(build_prompt(task_text, exports["a"], exports["b"], scope=scope)) <= PROMPT_CHARS:
-            break
-    return scope
+        size = len(build_prompt(task_text, exports["a"], exports["b"], scope=scope))
+        if size <= PROMPT_CHARS:
+            return scope
+    raise PromptTooLong(f"{task.id}: {size} characters of source patches, over {PROMPT_CHARS}")
 
 
 def calibrate(judge: str, task: Task, out_dir: Path, *, manifest_hash: str | None = None) -> dict:
@@ -219,8 +228,15 @@ def _judge_once(judge: str, prompt: str, cwd: Path, order_dir: Path, offline: bo
             return "TIE", attempts
 
 
+# Git with none of the host's configuration, hooks or attributes, so the patch is the same on any machine.
+_GIT_ENV = {"PATH": "/usr/bin:/bin:/opt/homebrew/bin", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_ATTR_NOSYSTEM": "1", "HOME": "/nonexistent"}
+_GIT_CONFIG = ("user.name=eval", "user.email=eval@localhost", "commit.gpgsign=false", "core.hooksPath=/dev/null",
+               "core.autocrlf=false", "core.attributesFile=/dev/null", "core.quotePath=false")
+
+
 def _git(repo: Path, *args: str) -> str:
-    completed = subprocess.run(["git", "-c", "user.name=eval", "-c", "user.email=eval@localhost",
-                                "-c", "commit.gpgsign=false", *args], cwd=repo, capture_output=True,
+    config = [arg for setting in _GIT_CONFIG for arg in ("-c", setting)]
+    completed = subprocess.run(["git", *config, *args], cwd=repo, env=_GIT_ENV, capture_output=True,
                                encoding="utf-8", errors="replace", check=True)
     return completed.stdout

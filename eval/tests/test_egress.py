@@ -3,6 +3,7 @@ import socket
 import socketserver
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -62,6 +63,16 @@ class ProxyTest(unittest.TestCase):
         with egress.Proxy(self.log, frozenset({self.allowed})) as proxy:
             head, sock = connect(proxy.port, f"CONNECT {self.allowed} HTTP/1.1\r\n\r\n".encode())
             self.assertTrue(head.startswith(b"HTTP/1.1 200"))
+        with sock:
+            self.assertEqual(sock.recv(1024), b"")
+
+    def test_exit_closes_a_client_still_sending_its_header_and_returns(self):
+        with egress.Proxy(self.log, frozenset({self.allowed})) as proxy:
+            sock = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
+            sock.sendall(b"CONNECT ")  # the header never finishes
+            time.sleep(0.2)
+            started = time.monotonic()
+        self.assertLess(time.monotonic() - started, 5)
         with sock:
             self.assertEqual(sock.recv(1024), b"")
 

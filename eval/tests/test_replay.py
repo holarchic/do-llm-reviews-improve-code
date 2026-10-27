@@ -116,12 +116,15 @@ class RunTest(StubAgentCase):
 
 
 CAUGHT = [f"c{n}" for n in range(6)]
+STAGE_DATES = {"A1": "2026-11-02", "A3": "2026-11-03", "A2": "2026-11-05"}
 CONTROLS = ["k0", "k1"]
 
 
 def replay_record(arm: str, review, feature: float, regressions: float) -> dict:
     defects = [] if review is None else [{"id": "d", "avoided": review == 1.0}]
     return {"run_id": "x", "task": "t", "arm": arm, "rep": 1, "exec": "exec-1", "status": "complete", "manifest": "d",
+            "started": STAGE_DATES[arm] + "T09:00:00+00:00", "finished": STAGE_DATES[arm] + "T10:00:00+00:00",
+            "cli_versions": {"claude": "2.4.0", "codex": "0.164.0" if arm != "A2" else "0.165.0"},
             "flags": [], "rounds": {"plan": 1, "phase": 1},
             "steps": [{"name": "build", "attempts": [{"seconds": 60.0, "usage": {}}]}],
             "scores": {"replay": {"review": review, "feature": feature, "regressions": regressions,
@@ -217,6 +220,16 @@ class DecisionTest(unittest.TestCase):
         self.assertNotIn("k0", review_table)
         self.assertIn("| A3 | 80.0 ± 0.0 |", review_table)
         self.assertIn("**Loop (A3 vs A1):** effect", text)
+        self.assertIn("| A2 | 2026-11-05 to 2026-11-05 | claude 2.4.0; codex 0.165.0 |", text)
+        self.assertIn("The CLI versions differ between stages", text)
+
+    def test_a_partial_a2_without_a_loop_effect_is_left_out_and_counted(self):
+        built = self.staged({"A1": [0.5] * 6, "A2": [0.5] * 6, "A3": [0.5] * 6}, a2_missing=3)
+        decision = replay.decide(built, experiments.REPLAY)
+        text = replay.render(built, decision, experiments.REPLAY)
+        self.assertEqual(decision.verdict, "DECIDED")
+        self.assertIn("A2 left out: the loop effect did not pass, and 3 of its builds are missing.", text)
+        self.assertNotIn("| A2 |", text)
 
 
 class EndToEndTest(StubAgentCase):
@@ -300,12 +313,32 @@ class PatchExportTest(FixtureCase):
             return agents.Session(agents.COMPLETED, "ok", '{"winner": "TIE", "reasons": []}',
                                   out_dir / "transcript.jsonl", 0.1, reported_models=[model])
 
-        with mock.patch.object(agents, "run_claude", fake), mock.patch.object(judge, "PROMPT_CHARS", 0):
-            result = judge.judge_pair("fable", self.task, build, build, self.tmp / "judged")
+        task_text = self.task.path("TASK.md").read_text()
+        judge.export_patch(self.task, build, self.tmp / "full")
+        whole = len(judge.build_prompt(task_text, self.tmp / "full", self.tmp / "full", scope=judge.PATCH_SCOPE))
+        with mock.patch.object(agents, "run_claude", fake), mock.patch.object(judge, "PROMPT_CHARS", whole - 1):
+            result = judge.judge_pair("fable", self.task, build, build, self.tmp / "judged", offline=True)
         self.assertEqual(result["scope"], judge.SOURCE_SCOPE)
         self.assertEqual(len(prompts_seen), 2)
         self.assertTrue(all(judge.SOURCE_ONLY_NOTE in p and "test_calc" not in p for p in prompts_seen))
         self.assertIn("+def div(a, b):", prompts_seen[0])
+        with mock.patch.object(agents, "run_claude", fake), mock.patch.object(judge, "PROMPT_CHARS", 0), \
+                self.assertRaises(judge.PromptTooLong):
+            judge.judge_pair("fable", self.task, build, build, self.tmp / "too-long", offline=True)
+        with self.assertRaises(ValueError):  # a replayed build is judged only offline
+            judge.judge_pair("fable", self.task, build, build, self.tmp / "online")
+        self.assertEqual(len(prompts_seen), 2)
+
+    def test_the_patch_ignores_the_hosts_git_configuration(self):
+        build = self.build()
+        home = self.tmp / "home"
+        home.mkdir()
+        (home / ".gitconfig").write_text("[diff]\n\tnoprefix = true\n\tmnemonicPrefix = true\n[color]\n\tui = always\n")
+        with mock.patch.dict("os.environ", {"HOME": str(home), "GIT_CONFIG_GLOBAL": str(home / ".gitconfig")}):
+            judge.export_patch(self.task, build, self.tmp / "export")
+        patch = (self.tmp / "export" / judge.PATCH).read_text()
+        self.assertIn("--- a/calc.py\n+++ b/calc.py", patch)
+        self.assertNotIn("\x1b[", patch)
 
 
 class ReplayJudgingTest(StubAgentCase):

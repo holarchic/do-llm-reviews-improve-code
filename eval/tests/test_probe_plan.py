@@ -76,6 +76,12 @@ class NetworkProblemsTest(unittest.TestCase):
             found = self.problems(outputs)
             self.assertTrue(any(problem.startswith(expected) for problem in found), (expected, found))
 
+    def test_a_way_out_that_ran_with_no_output_is_unproven(self):
+        for step, expected in (("git", "git: no proxy refusal"), ("curl", "curl: no proxy refusal"),
+                               ("bypass", "bypass: no connection refusal"), ("socket", "direct socket not denied")):
+            found = self.problems({step: ""})
+            self.assertTrue(any(problem.startswith(expected) for problem in found), (step, found))
+
     def test_a_step_that_never_ran_is_unproven(self):
         self.assertIn("bypass step never ran; unproven", self.problems(drop=("bypass",)))
 

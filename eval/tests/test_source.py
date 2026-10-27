@@ -117,6 +117,43 @@ class ValidateTest(FixtureCase):
         problems = tasks.validate(self.task)
         self.assertTrue(any("does not reach the defect" in p for p in problems), problems)
 
+    def test_a_review_test_that_fails_only_in_its_teardown_is_refused(self):
+        self.add_review_test("test_hidden_review_teardown.py", """
+            import unittest
+            import calc
+
+            class TeardownTest(unittest.TestCase):
+                def test_div_works(self):
+                    self.assertEqual(calc.div(4, 2), 2)
+
+                def tearDown(self):
+                    self.assertTrue(hasattr(calc, "safe_div"))
+        """, {"id": "teardown", "tests": ["tests.test_hidden_review_teardown.TeardownTest.test_div_works"]})
+        problems = "\n".join(tasks.validate(self.task))
+        self.assertIn("does not reach the defect on pre_review (fail, teardown", problems)
+
+    def test_a_failed_subtest_is_its_tests_outcome(self):
+        self.add_review_test("test_hidden_review_sub.py", """
+            import unittest
+            import calc
+
+            class SubTest(unittest.TestCase):
+                def test_zero(self):
+                    for b in (2, 0):
+                        with self.subTest(b=b):
+                            with self.assertRaises(ValueError):
+                                calc.div(1, b) if b == 0 else (_ for _ in ()).throw(ValueError())
+        """, {"id": "sub", "tests": ["tests.test_hidden_review_sub.SubTest.test_zero"], "crash_is_defect": True})
+        self.assertEqual(tasks.validate(self.task), [])
+        evidence = self.task.expected()["defects"][1]["pre_review"]["tests.test_hidden_review_sub.SubTest.test_zero"]
+        self.assertEqual((evidence["outcome"], evidence["stage"]), ("error", "call"))
+
+    def test_a_control_flag_must_be_a_boolean(self):
+        data = json.loads(self.task.path("source.json").read_text())
+        self.task.path("source.json").write_text(json.dumps({**data, "control": "false"}))
+        with self.assertRaises(source.SourceError):
+            source.Source.load(self.task.path("source.json"))
+
     def test_a_review_test_that_passes_on_pre_review_is_refused(self):
         self.add_review_test("test_hidden_review_ok.py", """
             import unittest

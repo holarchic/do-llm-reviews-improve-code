@@ -15,6 +15,7 @@ import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import NamedTuple
 
 from . import judge, loop, manifest, openrouter, records, tasks
 from .experiments import Experiment
@@ -27,10 +28,23 @@ def scored_tasks(experiment: Experiment) -> list[tasks.Task]:
     return [tasks.Task(tasks.TASKS_ROOT / task_id) for task_id in experiment.tasks]
 
 
-def build_schedule(experiment: Experiment) -> list[tuple[str, str, int | None]]:
-    """(task, arm, rep). Shuffling depends only on the list's length and the seed, so an
-    experiment without replicates keeps the order it had before replicates existed."""
-    jobs = [(task.id, arm, rep) for task, arm, rep in
+class BuildJob(NamedTuple):
+    task: str
+    arm: str
+    rep: int | None
+
+
+class JudgeJob(NamedTuple):
+    judge: str
+    task: str
+    pair: tuple[str, str] | None  # None: the task's calibration
+    rep: int | None  # replicate rep of each arm of the pair
+
+
+def build_schedule(experiment: Experiment) -> list[BuildJob]:
+    """Shuffling depends only on the list's length and the seed, so an experiment without replicates keeps
+    the order it had before replicates existed."""
+    jobs = [BuildJob(task.id, arm, rep) for task, arm, rep in
             itertools.product(scored_tasks(experiment), experiment.arm_names, experiment.rep_ids)]
     random.Random(experiment.seed).shuffle(jobs)
     return jobs
@@ -41,10 +55,12 @@ def judged_tasks(experiment: Experiment) -> list[tasks.Task]:
     return [task for task in scored_tasks(experiment) if task.source is None or not task.source.control]
 
 
-def judge_schedule(experiment: Experiment) -> list[tuple[str, str, tuple[str, str] | None, int | None]]:
-    """(judge, task, pair, rep): replicate rep of each arm of the pair. A None pair is that task's calibration,
-    which a task replayed from a source repository lacks: a degraded reference has no brownfield counterpart."""
-    jobs = [(name, task.id, pair, rep) for name in judge.JUDGES for task in judged_tasks(experiment)
+def judge_schedule(experiment: Experiment) -> list[JudgeJob]:
+    """Nothing for a judge-free experiment. A task replayed from a source repository has no calibration job:
+    a degraded reference has no brownfield counterpart."""
+    if not experiment.pairs:
+        return []
+    jobs = [JudgeJob(name, task.id, pair, rep) for name in judge.JUDGES for task in judged_tasks(experiment)
             for pair in (None, *experiment.pairs) if pair is not None or task.source is None
             for rep in (experiment.rep_ids if pair else (None,))]
     random.Random(experiment.seed + 1).shuffle(jobs)
@@ -69,8 +85,7 @@ def run_builds(data_root: Path, experiment: Experiment, only_arm: str | None = N
     digest = manifest.verify(experiment)
     runs_root = data_root / "runs"
     by_id = {task.id: task for task in scored_tasks(experiment)}
-    jobs = [(by_id[task_id], arm, rep) for task_id, arm, rep in build_schedule(experiment)
-            if only_arm is None or arm == only_arm]
+    jobs = [job for job in build_schedule(experiment) if only_arm is None or job.arm == only_arm]
     cap = None
     if experiment.routed:
         # A run killed mid-way leaves files the end-of-run scrub never reached.
@@ -81,14 +96,14 @@ def run_builds(data_root: Path, experiment: Experiment, only_arm: str | None = N
     task_locks = {task_id: threading.Lock() for task_id in by_id}
 
     @_contained
-    def job(item):
+    def job(item: BuildJob):
         # One job per task at a time: whatever a session could glimpse of a concurrent one
         # (process lists, open files) then belongs to a different task.
-        with task_locks[item[0].id]:
+        with task_locks[item.task]:
             return build_job(item)
 
-    def build_job(item):
-        task, arm, rep = item
+    def build_job(item: BuildJob):
+        task, arm, rep = by_id[item.task], item.arm, item.rep
         exec_dir = complete_build(runs_root, task.id, arm, digest, rep)
         if exec_dir is None:
             if cap is not None and not cap.admit():
@@ -103,7 +118,8 @@ def run_builds(data_root: Path, experiment: Experiment, only_arm: str | None = N
         if arm not in experiment.followup_arms or complete_followup(exec_dir, digest):
             return True
         _set_aside(exec_dir / "followup")
-        followup = loop.execute_followup(task, exec_dir, experiment.arm(arm), manifest_hash=digest)
+        followup = loop.execute_followup(task, exec_dir, experiment.arm(arm), manifest_hash=digest,
+                                         offline=experiment.offline)
         _log(f"followup {task.id}--{arm}: {followup['status']}")
         return followup["status"] == "complete"
 
@@ -148,16 +164,16 @@ def run_judging(data_root: Path, experiment: Experiment) -> int:
     runs_root = data_root / "runs"
     by_id = {task.id: task for task in judged_tasks(experiment)}
     schedule = judge_schedule(experiment)
-    builds = {(task_id, arm, rep): complete_build(runs_root, task_id, arm, digest, rep)
-              for _, task_id, pair, rep in schedule if pair for arm in pair}
+    builds = {(job.task, arm, job.rep): complete_build(runs_root, job.task, arm, digest, job.rep)
+              for job in schedule if job.pair for arm in job.pair}
     missing = sorted(loop.run_id(t, a, r) for (t, a, r), path in builds.items() if path is None)
     if missing:
         _log(f"judge: builds incomplete, {experiment.name} INCOMPLETE: {missing}")
         return 1
 
     @_contained
-    def job(item):
-        name, task_id, pair, rep = item
+    def job(item: JudgeJob):
+        name, task_id, pair, rep = item.judge, item.task, item.pair, item.rep
         out_dir = judging_dir(data_root, name, task_id, pair, rep)
         identity = None if pair is None else {side: build_identity(builds[(task_id, arm, rep)])
                                               for side, arm in zip(("a", "b"), pair)}
@@ -173,8 +189,8 @@ def run_judging(data_root: Path, experiment: Experiment) -> int:
                 a, b = (builds[(task_id, arm, rep)] / "artifact" for arm in pair)
                 result = judge.judge_pair(name, task, a, b, out_dir, manifest_hash=digest, builds=identity,
                                           offline=experiment.offline)
-        except loop.InfraExhausted as exc:
-            _log(f"judge {name} {out_dir.relative_to(data_root)}: infrastructure failure: {exc}")
+        except (loop.InfraExhausted, judge.PromptTooLong) as exc:
+            _log(f"judge {name} {out_dir.relative_to(data_root)}: not judged: {exc}")
             return False
         _log(f"judge {name} {out_dir.relative_to(data_root)}: {result['result']}")
         return True
