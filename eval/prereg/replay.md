@@ -1,6 +1,6 @@
 # Pre-registration: replay of real phases
 
-**Draft.** Fixed before any scored run. The frozen inputs are hashed in `eval/manifests/replay.json`: this file, the six tasks, the harness code (model ids, arms, prompts, thresholds, the judge prompt and the schedule seed) and the shipped skill files the prompts are built from.
+Fixed before any scored run. The frozen inputs are hashed in `eval/manifests/replay.json`: this file, the six tasks, the harness code (model ids, arms, prompts, thresholds, the judge prompt and the schedule seed) and the shipped skill files the prompts are built from.
 
 ## Question
 
