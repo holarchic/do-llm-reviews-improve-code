@@ -8,7 +8,7 @@ from pathlib import Path
 DATA_ROOT = Path(__file__).resolve().parent / "data"
 
 COMMANDS = {
-    "validate": "check every task's hidden suites against its reference and wrong variants",
+    "validate": "check each unfrozen task's hidden suites against its reference and wrong variants",
     "probe": "prove isolation of headless Claude and Codex sessions",
     "calibrate": "unscored builds of the experiment's tasks before its freeze (difficulty and cost)",
     "freeze": "write the experiment's manifest over its frozen inputs",
@@ -37,7 +37,7 @@ def main(argv: list[str]) -> int:
     parsers["judge"].add_argument("--pair", nargs=2, metavar="ARM", help="with --task: judge two arms' builds")
     parsers["rounds"].add_argument("--arm", required=True, help="a reviewed arm of the experiment")
     parsers["validate"].add_argument("--task", action="append", help="validate only this task, repeatable "
-                                     "(default: every task, rewriting each one's expected.json)")
+                                     "(default: every task no manifest freezes; a frozen task is refused)")
     args = parser.parse_args(argv)
     if args.command in EXPERIMENT_COMMANDS:
         from .harness import experiments
@@ -56,21 +56,34 @@ def _data_root(experiment) -> Path:
 
 
 def _validate(args) -> int:
-    from .harness import tasks
+    from .harness import frozen, tasks
 
     every = tasks.load_tasks()
     unknown = sorted(set(args.task or ()) - {task.id for task in every})
     if unknown:
         print(f"validate: no task {', '.join(unknown)}", file=sys.stderr)
         return 2
-    problems = []
-    for task in (t for t in every if args.task is None or t.id in args.task):
-        found = tasks.validate(task)
-        print(f"{task.id}: {'FAIL' if found else 'ok'}")
-        problems += found
-    for problem in problems:
-        print(problem, file=sys.stderr)
-    return 1 if problems else 0
+
+    def check() -> int:
+        held = frozen.frozen_tasks()
+        named = sorted(set(args.task or ()) & set(held))
+        if named:
+            print("validate: frozen, expected.json never rewritten: "
+                  + ", ".join(f"{task_id} ({held[task_id]})" for task_id in named), file=sys.stderr)
+            return 2
+        problems = []
+        for task in (t for t in every if args.task is None or t.id in args.task):
+            if task.id in held:
+                print(f"{task.id}: frozen ({held[task.id]}), skipped")
+                continue
+            found = tasks.validate(task)
+            print(f"{task.id}: {'FAIL' if found else 'ok'}")
+            problems += found
+        for problem in problems:
+            print(problem, file=sys.stderr)
+        return 1 if problems else 0
+
+    return _guarded(check)
 
 
 def _probe(args) -> int:
@@ -236,7 +249,7 @@ def _rounds(args) -> int:
 
 
 def _guarded(action) -> int:
-    """Experiment commands refuse to start on a missing or changed freeze."""
+    """Run action; a missing, unreadable or changed freeze it raises becomes a refusal, exit 3."""
     from .harness import manifest
 
     try:

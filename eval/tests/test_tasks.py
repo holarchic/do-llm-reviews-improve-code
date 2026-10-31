@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from eval.harness import tasks
+from eval.harness import manifest, tasks
 
 
 class ValidateTest(unittest.TestCase):
@@ -40,10 +40,6 @@ class ValidateTest(unittest.TestCase):
         self.assertTrue(tasks.validate(self.task))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ValidateCommandTest(unittest.TestCase):
     """`validate --task` touches only the tasks it names: a frozen task's expected.json is never rewritten."""
 
@@ -53,6 +49,16 @@ class ValidateCommandTest(unittest.TestCase):
         for name in ("dev-a", "dev-b"):
             shutil.copytree(tasks.TASKS_ROOT / "dev-intervals", self.root / name)
             (self.root / name / "expected.json").write_text("frozen\n")
+        self.manifests = Path(tempfile.mkdtemp(prefix="eval-test-manifests-"))
+        self.addCleanup(shutil.rmtree, self.manifests)
+        for name, value in (("MANIFEST", self.manifests / "MANIFEST.json"), ("MANIFESTS", self.manifests)):
+            patcher = mock.patch.object(manifest, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def freeze(self, task_id: str, text: str | None = None) -> None:
+        files = {f"eval/tasks/{task_id}/expected.json": "0" * 64}
+        (self.manifests / "replay.json").write_text(text if text is not None else json.dumps({"files": files}))
 
     def validate(self, *argv: str) -> int:
         from eval.__main__ import main
@@ -79,3 +85,39 @@ class ValidateCommandTest(unittest.TestCase):
             self.assertEqual(self.validate("--task", "dev-a", "--task", "nope"), 2)
         validated.assert_not_called()
         self.assertEqual(self.expected("dev-a"), "frozen\n")
+
+    def test_a_named_frozen_task_is_refused_and_nothing_validated(self):
+        self.freeze("dev-b")
+        with mock.patch.object(tasks, "validate") as validated:
+            self.assertEqual(self.validate("--task", "dev-a", "--task", "dev-b"), 2)
+        validated.assert_not_called()
+        self.assertEqual((self.expected("dev-a"), self.expected("dev-b")), ("frozen\n", "frozen\n"))
+
+    def test_bare_validate_skips_a_frozen_task(self):
+        self.freeze("dev-b")
+        self.assertEqual(self.validate(), 0)
+        self.assertNotEqual(self.expected("dev-a"), "frozen\n")
+        self.assertEqual(self.expected("dev-b"), "frozen\n")
+
+    def test_an_unreadable_manifest_refuses_everything(self):
+        self.freeze("dev-b", text="{not json")
+        with mock.patch.object(tasks, "validate") as validated:
+            self.assertEqual(self.validate("--task", "dev-a"), 3)
+        validated.assert_not_called()
+
+
+class FrozenTasksTest(unittest.TestCase):
+    def test_the_real_manifests_freeze_every_v1_task_and_no_v2(self):
+        from eval.harness import frozen
+
+        held = frozen.frozen_tasks()
+        replay = ("email", "greenhouse", "workable-gem", "setup-commands", "watchlist", "company-notes")
+        for name in replay:
+            self.assertEqual(held.get(f"jobscan-{name}"), "replay.json")
+            self.assertNotIn(f"jobscan-{name}-v2", held)
+        self.assertEqual(held.get("bill-split"), "MANIFEST.json")
+        self.assertNotIn("dev-intervals", held)
+
+
+if __name__ == "__main__":
+    unittest.main()
