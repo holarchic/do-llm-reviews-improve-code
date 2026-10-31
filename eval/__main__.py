@@ -36,6 +36,8 @@ def main(argv: list[str]) -> int:
     parsers["judge"].add_argument("--judge", choices=["fable", "astra"], required=False)
     parsers["judge"].add_argument("--pair", nargs=2, metavar="ARM", help="with --task: judge two arms' builds")
     parsers["rounds"].add_argument("--arm", required=True, help="a reviewed arm of the experiment")
+    parsers["validate"].add_argument("--task", action="append", help="validate only this task, repeatable "
+                                     "(default: every task, rewriting each one's expected.json)")
     args = parser.parse_args(argv)
     if args.command in EXPERIMENT_COMMANDS:
         from .harness import experiments
@@ -56,8 +58,13 @@ def _data_root(experiment) -> Path:
 def _validate(args) -> int:
     from .harness import tasks
 
+    every = tasks.load_tasks()
+    unknown = sorted(set(args.task or ()) - {task.id for task in every})
+    if unknown:
+        print(f"validate: no task {', '.join(unknown)}", file=sys.stderr)
+        return 2
     problems = []
-    for task in tasks.load_tasks():
+    for task in (t for t in every if args.task is None or t.id in args.task):
         found = tasks.validate(task)
         print(f"{task.id}: {'FAIL' if found else 'ok'}")
         problems += found
