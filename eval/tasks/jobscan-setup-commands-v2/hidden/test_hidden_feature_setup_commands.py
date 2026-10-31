@@ -1,6 +1,7 @@
 """Hidden feature tests. The scriptable set-up commands, through the CLI in a temporary home with no terminal: `tags`, `check`,
 `boards`, `preview`, and `init` and `email` by flags."""
 import contextlib
+import fcntl
 import io
 import json
 import os
@@ -452,13 +453,16 @@ class PreviewTest(CliHome):
 
     def test_a_run_holding_the_lock_is_exit_1_and_the_database_unopened(self):
         self.seed()
-        with cli._run_lock(self.home), mock.patch.object(store, "open_db", side_effect=AssertionError) as opened:
+        with (self.home / ".lock").open("w") as held, \
+                mock.patch.object(store, "open_db", side_effect=AssertionError) as opened:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)  # the run lock, as a run holds it
             code, out, err = self.cli("preview")
         opened.assert_not_called()
         self.assertEqual((code, out), (1, ""))
         self.assertIn("a run is using the database", err)
 
     def test_no_profile_is_exit_2(self):
+        self.seed()  # a database exists, so the refusal can't depend on which check comes first
         self.assertEqual(self.cli("preview")[0], 0)  # the control: with its profile, the same install previews
         (self.home / "profiles" / "ae.toml").unlink()
         self.assertEqual(self.cli("preview")[0], 2)

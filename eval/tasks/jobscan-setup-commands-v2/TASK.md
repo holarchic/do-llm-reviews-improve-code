@@ -4,8 +4,8 @@ jobscan is set up by answering questions in a terminal, and the only way to see 
 
 ## Exit codes and errors
 
-- Exit 0: done. Exit 1: finished with something left undone (a test email refused, a run holding the database). Exit 2: a config or usage error, before any work.
-- An error prints `jobscan: <message>` on stderr and nothing on stdout.
+- Exit 0: done. Exit 1: finished with something left undone (a test email refused; `preview` while a run holds the database; `run` leaving postings untagged or a digest unwritten or unsent, as now). Exit 2: a config or usage error, before any work. `run` and `discover` refused because a run holds the lock stay exit 2, as now.
+- An error prints `jobscan: <message>` on stderr. A refusal before any work (exit 2) prints nothing on stdout. A command that exits 0 or 1 still prints its usual output on stdout: `run` its summary line, `email` its `Sending a test email to <to> ...` line.
 
 ## Help: `jobscan/arguments.py`
 
@@ -87,7 +87,7 @@ OK: `jobscan run` can start.
   - `that isn't an app password jobscan can send (empty, or control characters)`;
   - `--off` with any other flag: `--off takes no other flags`.
 - A refused test email is exit 1, `… nothing was saved`, as now.
-- No flags and no terminal on stdin: exit 2, asking nothing: `` no terminal to ask in: give the flags instead (see `jobscan email --help`) ``.
+- No flags and no terminal on stdin: exit 2, asking nothing: `` no terminal to ask in: give the flags instead (see `jobscan email --help`) ``. With no install, `email` (`--off` aside) is still refused first with the missing-profile message, as now.
 
 ## The boards file: `jobscan boards`, `jobscan boards add URL…`
 
@@ -128,7 +128,7 @@ Left out by your excluded titles:
 - New jobs are counted as the run counts them: one posting per job (the run's rule for a job on several boards), none of a job already sent under any key. The cost is $0.0005 a job, to the cent. Already sent: matching postings whose job was sent.
 - Samples: up to 10 new jobs, newest first by when the posting was first stored, then up to 10 left out, as `  <company> — <title> — <location>` (`(no location)` when empty). The company is named as the digest names it: the boards file's name for the board, else the looked-up name, else the board's slug. Counts use thousands separators.
 - Before any run has made the database: `` No postings yet: `jobscan run` fetches them, then `jobscan preview` can count them. ``, exit 0, creating nothing (no database, lock or log).
-- It takes the run lock without waiting, before opening the database: while a run holds it, exit 1 and `a run is using the database; preview once it has finished`. Opening the database backs it up first, as a run does.
+- It takes the run lock (the exclusive lock on `$JOBSCAN_HOME/.lock` that `run` holds) without waiting, before opening the database: while a run holds it, exit 1 and `a run is using the database; preview once it has finished`. Opening the database backs it up first, as a run does.
 - No profile or a broken install is exit 2.
 
 ## Docs

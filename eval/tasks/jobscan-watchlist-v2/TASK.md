@@ -23,7 +23,7 @@ A new module with `watched(terms, company, board_id) -> bool`. A posting is watc
 ## The digest
 
 - Watched postings come first, in their usual order among themselves, then the rest. Each watched heading starts `★ ` (`## ★ Acme — Account Executive · London`).
-- A digest with any ★ carries one legend line after its title, `digest.WATCH_LEGEND`: "★ marks a company on your watchlist (`watch` in your profile)."
+- A digest with any ★ carries one legend line, `digest.WATCH_LEGEND`: "★ marks a company on your watchlist (`watch` in your profile)." It sits right under the title (below the unread-boards line, when there is one), ahead of the ⓘ legend (`digest.LEGEND`).
 - The title counts them: `# ae — 2026-10-12 · 4 new · 2 watched · 1 left out`.
 - A watched posting that a requirement left out is starred in the left-out list too (`- ★ Acme — …`, the star right after the `- `), and it isn't counted as watched.
 - A digest without watched postings is unchanged.

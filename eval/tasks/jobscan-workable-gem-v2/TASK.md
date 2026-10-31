@@ -14,7 +14,7 @@ Workable's and Gem's APIs are case-sensitive, so their slugs keep their case, un
 - **One posting per shortcode.** The widget lists a job once per location. Entries sharing a shortcode merge into one posting carrying every entry's locations, a place repeated across entries listed once, and repeats that disagree on title or description fail the board (`BoardError` with "repeats with a different" in its message).
 - **Postings.** Key `workable:<account>:<shortcode>`; title stripped; URL the entry's `url`; description its HTML as text, like Greenhouse's.
 - **Location.** Each location record as `city, region, country` (empty parts left out), hidden records included, then `Remote` when the job is telecommuting, joined with ` / `. A job without location records (`locations` empty, missing or null) uses its own `city, state, country`.
-- **Failures.** A malformed entry, a payload that isn't `{"jobs": [...]}`, or text with lone surrogates fails the board with `BoardError`. Every listed field is type-checked whether or not it is used: `shortcode` is a non-empty string (a number fails), text fields are strings, `telecommuting` is a bool, and `locations` is a list of objects or null. No jobs is an empty board.
+- **Failures.** A malformed entry, a payload that isn't `{"jobs": [...]}`, or text with lone surrogates fails the board with `BoardError`. Every listed field is type-checked whether or not it is used: `shortcode` is a non-blank string (a number fails) and `title` a string; the other text fields (`url`, `description`, the job's `city`, `state` and `country`, and each location's `city`, `region`, `country` and `countryCode`) are strings, null or missing (the widget sends `"region": null`); `telecommuting` is a bool; and `locations` is a list of objects or null. No jobs is an empty board.
 
 ## Gem
 
@@ -23,7 +23,7 @@ Workable's and Gem's APIs are case-sensitive, so their slugs keep their case, un
 - **Payload.** A list of jobs. Each has `id`, `title`, `absolute_url`, `content_plain`, `content` (HTML), `location` (`{"name"}`), `offices` (a list of `{"name", "location": {"name"}}`), and `location_type`.
 - **Postings.** Key `gem:<slug>:<id>`; title stripped; URL `absolute_url`; description the stripped plain text, or the HTML as text when the plain text is blank. Two jobs with one id fail the board.
 - **Location.** The job's location name, then each office's name and its location's name, leaving out empty ones and repeats, joined with ` / `; a null or missing `location` or `offices` is empty. A remote job (`location_type` `remote`) adds `Remote` unless a name already says Remote.
-- **Failures.** As for Workable: malformed fields, a payload that isn't a list, or lone surrogates fail the board. Every listed field is type-checked whether or not it is used: `id` is a non-empty string (a number fails); `title`, `absolute_url`, `content_plain`, `content` and `location_type` are strings; `location` and each office's `location` are objects; `offices` is a list of objects.
+- **Failures.** As for Workable: malformed fields, a payload that isn't a list, or lone surrogates fail the board. Every listed field is type-checked whether or not it is used: `id` is a non-blank string (a number fails); `title`, `absolute_url`, `content_plain`, `content` and `location_type` are strings; `location` and each office's `location` are objects, null or missing; `offices` is a list of objects, null or missing.
 
 ## Routing and discovery
 

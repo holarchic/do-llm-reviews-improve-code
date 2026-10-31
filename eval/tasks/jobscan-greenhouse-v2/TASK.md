@@ -10,7 +10,7 @@ jobscan reads Ashby boards only. Add Greenhouse as a second adapter: a new modul
   - the Job Board API `https://boards-api.greenhouse.io/v1/boards/<token>/jobs`, with or without `?content=true`, on any host. Tests point it at a local server, and that host is kept.
 - **The token.** It is percent-decoded and case-folded (Greenhouse tokens are case-insensitive), and must be printable ASCII without spaces or any of `/:?#`; `:` separates posting keys. It is encoded again for the API: board `greenhouse:ep+co` reads `…/v1/boards/ep%2Bco/jobs?content=true`.
 - **The board.** The API URL is `https://boards-api.greenhouse.io/v1/boards/<token>/jobs?content=true` (or the kept host). The company is the one given, or the token when none is.
-- **Not boards.** A bare host, an embed page without `for`, a token that fails the rules above, another host, a scheme other than http(s), and anything that isn't a URL.
+- **Not boards.** A bare host, an embed page without `for`, a token that fails the rules above, a board or embed page on another host, a scheme other than http(s), and anything that isn't a URL.
 
 ## Payload
 
