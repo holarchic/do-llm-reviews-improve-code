@@ -22,8 +22,10 @@ def frozen_tasks() -> dict[str, str]:
             continue
         try:
             names = json.loads(path.read_text(encoding="utf-8"))["files"]
-        except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError) as exc:
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError) as exc:
             raise manifest.ManifestMismatch(f"{path.name} has no readable files table: {exc!r}") from None
+        if not isinstance(names, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in names.items()):
+            raise manifest.ManifestMismatch(f"{path.name}: files is not a table of path -> hash")
         for name in names:
             parts = Path(name).parts
             if parts[:2] == ("eval", "tasks") and len(parts) > 3:

@@ -100,8 +100,17 @@ class ValidateCommandTest(unittest.TestCase):
         self.assertEqual(self.expected("dev-b"), "frozen\n")
 
     def test_an_unreadable_manifest_refuses_everything(self):
-        self.freeze("dev-b", text="{not json")
-        with mock.patch.object(tasks, "validate") as validated:
+        for text in ("{not json", '{"files": []}', '{"files": "broken"}', '{"files": null}', '{"files": {"1": 2}}',
+                     "[]", "{}"):
+            with self.subTest(text=text), mock.patch.object(tasks, "validate") as validated:
+                self.freeze("dev-b", text=text)
+                self.assertEqual(self.validate("--task", "dev-a"), 3)
+                validated.assert_not_called()
+
+    def test_a_manifest_that_cannot_be_read_refuses_everything(self):
+        self.freeze("dev-b")
+        with mock.patch.object(Path, "read_text", side_effect=PermissionError("denied")), \
+                mock.patch.object(tasks, "validate") as validated:
             self.assertEqual(self.validate("--task", "dev-a"), 3)
         validated.assert_not_called()
 
