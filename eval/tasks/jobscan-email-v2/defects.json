@@ -1,0 +1,26 @@
+{
+  "defects": [
+    {
+      "id": "password-in-server-reply",
+      "fix_commit": "d0027c2 6f18667 0300dcd",
+      "basis": "norm: a secret never reaches logs or the screen; a server's reply can quote the password it was sent, and smtplib's AUTH loop quotes it in a repr",
+      "tests": ["tests.test_hidden_review_email.SecretInReplyTest.test_a_refusal_quoting_the_password_never_reaches_any_output",
+                "tests.test_hidden_review_email.SecretInReplyTest.test_a_server_that_keeps_challenging_never_gets_the_password_into_any_output"],
+      "crash_is_defect": false
+    },
+    {
+      "id": "accepted-message-reported-failed",
+      "fix_commit": "6f18667",
+      "basis": "norm: an outcome is reported as it is; a message the server accepted was sent, so a refused QUIT afterwards is not a failed send",
+      "tests": ["tests.test_hidden_review_email.AcceptedMessageTest.test_a_refused_goodbye_after_the_message_is_accepted_is_not_a_failure"],
+      "crash_is_defect": false
+    },
+    {
+      "id": "mail-to-another-address",
+      "fix_commit": "d0027c2",
+      "basis": "TASK.md: `to` is one email address; mail goes only to the address configured, never to one the mail library reads out of it (a:b@example.com is a group sending to b@example.com)",
+      "tests": ["tests.test_hidden_review_email.RecipientTest.test_mail_never_goes_to_an_address_other_than_the_configured_one"],
+      "crash_is_defect": false
+    }
+  ]
+}
