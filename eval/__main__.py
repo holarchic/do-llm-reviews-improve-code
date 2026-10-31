@@ -220,6 +220,7 @@ def _rounds(args) -> int:
         results = rounds.collect(data_root, experiment, args.arm, digest)
         trigger = rounds.decide(results)
         text = rounds.render(results, trigger, experiment)
+        data_root.mkdir(parents=True, exist_ok=True)
         (data_root / "rounds.md").write_text(text, encoding="utf-8")
         print(text)
         return 0 if trigger.verdict != "INCOMPLETE" else 1

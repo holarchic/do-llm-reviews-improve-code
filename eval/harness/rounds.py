@@ -123,7 +123,12 @@ def verify_freeze(experiment: Experiment) -> str:
         raise manifest.ManifestMismatch(f"no manifest for {experiment.name}")
     if not prereg_path(experiment).is_file():
         raise manifest.ManifestMismatch(f"no round pre-registration: write {prereg_path(experiment).name}")
-    frozen = json.loads(path.read_text(encoding="utf-8"))["files"]
+    try:
+        frozen = json.loads(path.read_text(encoding="utf-8"))["files"]
+    except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError) as exc:
+        raise manifest.ManifestMismatch(f"{path.name} has no readable files table: {exc!r}") from None
+    if not isinstance(frozen, dict):
+        raise manifest.ManifestMismatch(f"{path.name} has no files table")
     changed = changed_inputs(frozen, manifest.compute(experiment))
     if changed:
         raise manifest.ManifestMismatch("frozen inputs changed: " + ", ".join(changed))
@@ -187,7 +192,8 @@ def score_rounds(data_root: Path, experiment: Experiment, arm: str, digest: str)
     """Score every unscored round of the arm's builds; returns the rounds that failed to score."""
     builds, _ = scheduled_builds(data_root, experiment, arm, digest)
     by_id = {task.id: task for task in pilot.scored_tasks(experiment)}
-    jobs = [(build, r) for build in builds for r in build.rounds if _stored(round_dir(data_root, build, r.number), r) is None]
+    jobs = [(build, r) for build in builds for r in build.rounds
+            if _stored(round_dir(data_root, build, r.number), r, by_id[build.task]) is None]
 
     def score(job: tuple[Build, Round]) -> str | None:
         build, r = job
@@ -209,9 +215,9 @@ def score_rounds(data_root: Path, experiment: Experiment, arm: str, digest: str)
         return [failure for failure in pool.map(score, jobs) if failure]
 
 
-def _stored(out: Path, r: Round) -> dict | None:
-    """The round's stored replay scores, when they exist, are this commit's, and pass the record validator;
-    None sends the round back to scoring."""
+def _stored(out: Path, r: Round, task) -> dict | None:
+    """The round's stored replay scores, when they exist, are this commit's, pass the record validator and
+    cover exactly the task's frozen defects and tests; None sends the round back to scoring."""
     try:
         stored = json.loads((out / "score.json").read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError):
@@ -220,14 +226,21 @@ def _stored(out: Path, r: Round) -> dict | None:
         return None
     scores = (stored.get("scores") or {}).get("replay") if isinstance(stored.get("scores"), dict) else None
     # The same check every run record's replay scores pass (records.build), so one rule validates both.
-    return scores if records._replay(scores) else None
+    if not records._replay(scores):
+        return None
+    expected = task.expected()
+    wanted = set(expected["feature"] + expected["review"] + expected["regression"])
+    matches = ([d["id"] for d in scores["defects"]] == [d["id"] for d in expected["defects"]]
+               and set(scores["outcomes"]) == wanted)
+    return scores if matches else None
 
 
 def collect(data_root: Path, experiment: Experiment, arm: str, digest: str) -> Results:
     builds, problems = scheduled_builds(data_root, experiment, arm, digest)
+    by_id = {task.id: task for task in pilot.scored_tasks(experiment)}
     for build in builds:
         for r in build.rounds:
-            scores = _stored(round_dir(data_root, build, r.number), r)
+            scores = _stored(round_dir(data_root, build, r.number), r, by_id[build.task])
             if scores is None:
                 problems.append(f"{build.run_id}: round {r.number} unscored")
             else:

@@ -217,6 +217,32 @@ class EndToEndTest(StubAgentCase):
         self.assertEqual(rounds.score_rounds(self.data, self.experiment, "A3", "d"), [])
         self.assertEqual(json.loads(stored.read_text())["scores"]["replay"]["feature"], 1.0)
 
+    def test_a_stored_score_for_other_defects_or_tests_is_scored_again(self):
+        self.build_rep(1)
+        self.build_rep(2)
+        rounds.score_rounds(self.data, self.experiment, "A3", "d")
+        stored = self.data / "rounds" / "fixture--A3--r1" / "exec-1" / "round-1" / "score.json"
+        data = json.loads(stored.read_text())
+        # Valid as a control's scores, but this task is caught: its one defect is missing.
+        data["scores"]["replay"].update(review=None, defects=[])
+        stored.write_text(json.dumps(data))
+        self.assertEqual(rounds.collect(self.data, self.experiment, "A3", "d").problems,
+                         ["fixture--A3--r1: round 1 unscored"])
+        data["scores"]["replay"] = json.loads(stored.read_text())["scores"]["replay"] | {"review": 1.0}
+        data["scores"]["replay"]["defects"] = [{"id": "zero", "avoided": True}]
+        data["scores"]["replay"]["outcomes"].popitem()  # one frozen test unaccounted for
+        stored.write_text(json.dumps(data))
+        self.assertEqual(rounds.collect(self.data, self.experiment, "A3", "d").problems,
+                         ["fixture--A3--r1: round 1 unscored"])
+
+    def test_the_command_writes_an_incomplete_report_into_a_missing_data_dir(self):
+        from eval.__main__ import main
+        experiment = dataclasses.replace(self.experiment, data_dir=str(self.tmp / "absent"))
+        with mock.patch.dict(experiments.EXPERIMENTS, {"replay": experiment}), \
+                mock.patch.object(rounds, "verify_freeze", return_value="d"), mock.patch("sys.stdout"):
+            self.assertEqual(main(["rounds", "--experiment", "replay", "--arm", "A3"]), 1)
+        self.assertIn("INCOMPLETE, withheld", (self.tmp / "absent" / "rounds.md").read_text())
+
     def test_a_build_without_its_repo_is_listed_not_raised(self):
         self.build_rep(1)
         self.build_rep(2)
