@@ -1,4 +1,5 @@
 import dataclasses
+import json
 import shutil
 import tempfile
 import unittest
@@ -63,7 +64,7 @@ class TriggerTest(unittest.TestCase):
     def test_any_problem_withholds_the_trigger(self):
         built = results(*(build(f"{t}--r1", t, [0, 1, 1, 1, 1]) for t in "abc"), problems=["c--r2: no complete build"])
         trigger = rounds.decide(built)
-        self.assertEqual((trigger.verdict, trigger.reasons), ("INCOMPLETE", ["c--r2: no complete build"]))
+        self.assertEqual((trigger.verdict, trigger.problems), ("INCOMPLETE", ["c--r2: no complete build"]))
         self.assertIn("INCOMPLETE, withheld", rounds.render(built, trigger, experiments.REPLAY))
 
 
@@ -109,8 +110,8 @@ class CodeRoundsTest(unittest.TestCase):
             git(repo, "commit", "-q", "--allow-empty", "-m", subject)
         return repo
 
-    def record(self, *steps: str) -> dict:
-        return {"steps": [{"name": name} for name in steps]}
+    def record(self, *steps: str, flags=()) -> dict:
+        return {"steps": [{"name": name} for name in steps], "flags": list(flags)}
 
     def test_rounds_are_matched_by_step_name_and_plan_steps_are_not_rounds(self):
         repo = self.repo("task", "plan", "plan-revise-1", "build", "fix-1", "fix-2")
@@ -130,6 +131,13 @@ class CodeRoundsTest(unittest.TestCase):
             rounds.code_rounds(self.record("build", "fix-1"), self.repo("task", "build", "fix-1", "fix-1"))
         with self.assertRaisesRegex(rounds.RoundError, "0 commits named fix-1"):
             rounds.code_rounds(self.record("build", "fix-1"), self.repo("task", "build"))
+
+    def test_a_capped_build_must_reach_the_last_round_and_none_may_pass_it(self):
+        with self.assertRaisesRegex(rounds.RoundError, "capped, but its last round is 1"):
+            rounds.code_rounds(self.record("build", "fix-1", flags=["review_capped"]), self.repo("build", "fix-1"))
+        steps = ["build", *(f"fix-{k}" for k in range(1, 6))]
+        with self.assertRaisesRegex(rounds.RoundError, "past round 4"):
+            rounds.code_rounds(self.record(*steps), self.repo(*steps))
 
 
 class EndToEndTest(StubAgentCase):
@@ -195,6 +203,27 @@ class EndToEndTest(StubAgentCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual((exec_dir / "round-0" / "score.json").stat().st_mtime_ns, kept)
         self.assertEqual(rounds.collect(self.data, self.experiment, "A3", "d").problems, [])
+
+    def test_an_invalid_stored_score_is_scored_again(self):
+        self.build_rep(1)
+        self.build_rep(2)
+        rounds.score_rounds(self.data, self.experiment, "A3", "d")
+        stored = self.data / "rounds" / "fixture--A3--r1" / "exec-1" / "round-1" / "score.json"
+        data = json.loads(stored.read_text())
+        data["scores"]["replay"]["feature"] = float("nan")  # the right commit, but not a fraction
+        stored.write_text(json.dumps(data))
+        self.assertEqual(rounds.collect(self.data, self.experiment, "A3", "d").problems,
+                         ["fixture--A3--r1: round 1 unscored"])
+        self.assertEqual(rounds.score_rounds(self.data, self.experiment, "A3", "d"), [])
+        self.assertEqual(json.loads(stored.read_text())["scores"]["replay"]["feature"], 1.0)
+
+    def test_a_build_without_its_repo_is_listed_not_raised(self):
+        self.build_rep(1)
+        self.build_rep(2)
+        shutil.rmtree(self.data / "runs" / "fixture--A3--r2" / "exec-1" / "repo")
+        self.assertEqual(rounds.score_rounds(self.data, self.experiment, "A3", "d"), [])
+        built = rounds.collect(self.data, self.experiment, "A3", "d")
+        self.assertEqual([p.split(":")[0] for p in built.problems], ["fixture--A3--r2"])
 
     def test_a_missing_build_or_unscored_round_is_incomplete(self):
         self.build_rep(1)

@@ -6,7 +6,8 @@ under its name); the records hold no commit ids. Each round is exported and re-s
 scorer, so the last round doubles as a reproduction check against the record.
 
 The builds predate this module, so the experiment's manifest no longer verifies as a whole: `verify_freeze`
-checks every frozen file except the two edited to add this command, neither on the scoring path.
+checks every frozen file except the two edited to add this command. The CLI is not on the scoring path;
+`loop.materialize_head`, which exports each round, is, and its HEAD path is unchanged.
 `score_rounds` does the work and resumes; `collect` reads the scores back, `decide` applies the trigger and
 `render` is the only place numbers become text.
 """
@@ -25,7 +26,9 @@ from statistics import mean, median
 from . import loop, manifest, pilot, records, source
 from .experiments import Experiment
 
-LAST_ROUND = loop.MAX_ROUNDS - 1  # five code reviews, four fixes
+# The registered horizon: the replay's loop ran at most five code reviews and four fixes. Owned here, not read
+# from loop.py, which the freeze check exempts.
+LAST_ROUND = 4
 # Edited after the replay freeze to add this command: the CLI table, and an optional commit for
 # `loop.materialize_head` (its HEAD path, which scored the records, is unchanged).
 UNFROZEN = frozenset({"eval/__main__.py", "eval/harness/loop.py"})
@@ -92,8 +95,8 @@ class Eligible:
 class Trigger:
     verdict: str  # met | not met | INCOMPLETE
     eligible: list[Eligible]
-    task_means: dict[str, float]
-    reasons: list[str]
+    task_means: dict[str, float]  # caught task -> mean ratio of its eligible builds
+    problems: list[str]  # why it is INCOMPLETE
 
     @property
     def mean(self) -> float | None:
@@ -150,8 +153,10 @@ def code_rounds(record: dict, repo: Path) -> list[Round]:
         if len(commits) != 1:
             raise RoundError(f"{len(commits)} commits named {step}")
         rounds.append(Round(int(match.group(1) or 0), step, commits[0]))
-    if [r.number for r in rounds] != list(range(len(rounds))) or not rounds:
-        raise RoundError(f"rounds out of order or absent: {[r.step for r in rounds]}")
+    if [r.number for r in rounds] != list(range(len(rounds))) or not rounds or rounds[-1].number > LAST_ROUND:
+        raise RoundError(f"rounds out of order, absent or past round {LAST_ROUND}: {[r.step for r in rounds]}")
+    if stop_kind(record) == CAPPED and rounds[-1].number != LAST_ROUND:
+        raise RoundError(f"capped, but its last round is {rounds[-1].number}, not {LAST_ROUND}")
     return rounds
 
 
@@ -167,7 +172,7 @@ def scheduled_builds(data_root: Path, experiment: Experiment, arm: str, digest: 
             record = records.build(exec_dir / "record.json", digest)
             try:
                 rounds = code_rounds(record, exec_dir / "repo")
-            except (RoundError, subprocess.CalledProcessError) as exc:
+            except (RoundError, subprocess.CalledProcessError, OSError) as exc:  # OSError: no repo
                 problems.append(f"{run_id}: {exc}")
                 continue
             builds.append(Build(run_id, task.id, not task.source.control, stop_kind(record), exec_dir, rounds, record))
@@ -205,11 +210,17 @@ def score_rounds(data_root: Path, experiment: Experiment, arm: str, digest: str)
 
 
 def _stored(out: Path, r: Round) -> dict | None:
+    """The round's stored replay scores, when they exist, are this commit's, and pass the record validator;
+    None sends the round back to scoring."""
     try:
         stored = json.loads((out / "score.json").read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
+    except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError):
         return None
-    return stored["scores"]["replay"] if stored.get("commit") == r.commit else None
+    if not isinstance(stored, dict) or stored.get("commit") != r.commit:
+        return None
+    scores = (stored.get("scores") or {}).get("replay") if isinstance(stored.get("scores"), dict) else None
+    # The same check every run record's replay scores pass (records.build), so one rule validates both.
+    return scores if records._replay(scores) else None
 
 
 def collect(data_root: Path, experiment: Experiment, arm: str, digest: str) -> Results:
@@ -251,13 +262,8 @@ def decide(results: Results) -> Trigger:
         if final > TOLERANCE:
             eligible.append(Eligible(build.run_id, build.task, gain(build, 1, REVIEW), final))
     task_means = {task: mean(e.ratio for e in eligible if e.task == task) for task in sorted({e.task for e in eligible})}
-    reasons = [f"{len(task_means)} caught tasks contribute an eligible build (needs {TRIGGER_TASKS})"]
-    met = False
-    if task_means:
-        share = mean(task_means.values())
-        reasons.append(f"mean round-1 share {share:.3f} (needs {TRIGGER_SHARE})")
-        met = len(task_means) >= TRIGGER_TASKS and share >= TRIGGER_SHARE - TOLERANCE
-    return Trigger("met" if met else "not met", eligible, task_means, reasons)
+    met = len(task_means) >= TRIGGER_TASKS and mean(task_means.values()) >= TRIGGER_SHARE - TOLERANCE
+    return Trigger("met" if met else "not met", eligible, task_means, [])
 
 
 def reproduction(build: Build) -> list[str]:
@@ -278,12 +284,15 @@ def reproduction(build: Build) -> list[str]:
 def render(results: Results, trigger: Trigger, experiment: Experiment) -> str:
     lines = [f"# Per-round scores: {experiment.name}, arm {results.arm}", "",
              f"- Rule: `eval/{results.prereg}` (sha256 `{results.prereg_sha256}`)",
+             f"- Command: `python3 -m eval rounds --experiment {experiment.name} --arm {results.arm}`",
              f"- Builds under manifest digest `{results.digest}`; round 0 = `build`, round k = `fix-k`", ""]
     if trigger.verdict == "INCOMPLETE":
         lines += ["**A3-2 trigger:** INCOMPLETE, withheld; A3-2 is not admitted.", "",
-                  *[f"- {problem}" for problem in trigger.reasons], ""]
+                  *[f"- {problem}" for problem in trigger.problems], ""]
     else:
-        lines += [f"**A3-2 trigger:** {trigger.verdict}: " + "; ".join(trigger.reasons) + ".", ""]
+        share = "" if trigger.mean is None else f"; mean round-1 share {trigger.mean:.3f} (needs {TRIGGER_SHARE})"
+        lines += [f"**A3-2 trigger:** {trigger.verdict}: {len(trigger.task_means)} caught tasks contribute an "
+                  f"eligible build (needs {TRIGGER_TASKS}){share}.", ""]
         lines += _trigger_lines(trigger)
     lines += _curve_lines(results)
     lines += _build_lines(results)
