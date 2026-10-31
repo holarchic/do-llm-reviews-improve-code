@@ -48,7 +48,7 @@ class ValidateCommandTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root)
         for name in ("dev-a", "dev-b"):
             shutil.copytree(tasks.TASKS_ROOT / "dev-intervals", self.root / name)
-            (self.root / name / "expected.json").write_text("frozen\n")
+            (self.root / name / "expected.json").write_bytes(b"frozen\n")
         self.manifests = Path(tempfile.mkdtemp(prefix="eval-test-manifests-"))
         self.addCleanup(shutil.rmtree, self.manifests)
         for name, value in (("MANIFEST", self.manifests / "MANIFEST.json"), ("MANIFESTS", self.manifests)):
@@ -67,37 +67,37 @@ class ValidateCommandTest(unittest.TestCase):
                 mock.patch("sys.stdout"), mock.patch("sys.stderr"):
             return main(["validate", *argv])
 
-    def expected(self, name: str) -> str:
-        return (self.root / name / "expected.json").read_text()
+    def expected(self, name: str) -> bytes:
+        return (self.root / name / "expected.json").read_bytes()
 
     def test_only_the_named_task_is_validated(self):
         self.assertEqual(self.validate("--task", "dev-a"), 0)
-        self.assertNotEqual(self.expected("dev-a"), "frozen\n")
-        self.assertEqual(self.expected("dev-b"), "frozen\n")
+        self.assertNotEqual(self.expected("dev-a"), b"frozen\n")
+        self.assertEqual(self.expected("dev-b"), b"frozen\n")
 
     def test_a_repeated_task_flag_validates_each(self):
         self.assertEqual(self.validate("--task", "dev-a", "--task", "dev-b"), 0)
-        self.assertNotEqual(self.expected("dev-a"), "frozen\n")
-        self.assertNotEqual(self.expected("dev-b"), "frozen\n")
+        self.assertNotEqual(self.expected("dev-a"), b"frozen\n")
+        self.assertNotEqual(self.expected("dev-b"), b"frozen\n")
 
     def test_an_unknown_task_validates_nothing(self):
         with mock.patch.object(tasks, "validate") as validated:
             self.assertEqual(self.validate("--task", "dev-a", "--task", "nope"), 2)
         validated.assert_not_called()
-        self.assertEqual(self.expected("dev-a"), "frozen\n")
+        self.assertEqual(self.expected("dev-a"), b"frozen\n")
 
     def test_a_named_frozen_task_is_refused_and_nothing_validated(self):
         self.freeze("dev-b")
         with mock.patch.object(tasks, "validate") as validated:
             self.assertEqual(self.validate("--task", "dev-a", "--task", "dev-b"), 2)
         validated.assert_not_called()
-        self.assertEqual((self.expected("dev-a"), self.expected("dev-b")), ("frozen\n", "frozen\n"))
+        self.assertEqual((self.expected("dev-a"), self.expected("dev-b")), (b"frozen\n", b"frozen\n"))
 
     def test_bare_validate_skips_a_frozen_task(self):
         self.freeze("dev-b")
         self.assertEqual(self.validate(), 0)
-        self.assertNotEqual(self.expected("dev-a"), "frozen\n")
-        self.assertEqual(self.expected("dev-b"), "frozen\n")
+        self.assertNotEqual(self.expected("dev-a"), b"frozen\n")
+        self.assertEqual(self.expected("dev-b"), b"frozen\n")
 
     def test_an_unreadable_manifest_refuses_everything(self):
         for text in ("{not json", '{"files": []}', '{"files": "broken"}', '{"files": null}', '{"files": {"1": 2}}',
@@ -106,6 +106,22 @@ class ValidateCommandTest(unittest.TestCase):
                 self.freeze("dev-b", text=text)
                 self.assertEqual(self.validate("--task", "dev-a"), 3)
                 validated.assert_not_called()
+
+    def test_a_manifests_directory_that_cannot_be_listed_refuses_everything(self):
+        self.freeze("dev-b")
+        self.manifests.chmod(0)
+        self.addCleanup(self.manifests.chmod, 0o700)
+        with mock.patch.object(manifest, "MANIFEST", self.root / "absent.json"), \
+                mock.patch.object(tasks, "validate") as validated:
+            self.assertEqual(self.validate("--task", "dev-a"), 3)
+        validated.assert_not_called()
+
+    def test_no_manifests_at_all_freezes_nothing(self):
+        absent = self.manifests / "absent"
+        with mock.patch.object(manifest, "MANIFEST", absent / "MANIFEST.json"), \
+                mock.patch.object(manifest, "MANIFESTS", absent):
+            self.assertEqual(self.validate("--task", "dev-a"), 0)
+        self.assertNotEqual(self.expected("dev-a"), b"frozen\n")
 
     def test_a_manifest_that_cannot_be_read_refuses_everything(self):
         self.freeze("dev-b")
