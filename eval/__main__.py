@@ -15,8 +15,9 @@ COMMANDS = {
     "run": "execute the experiment's arm runs, resuming finished ones",
     "judge": "run judge calibration and pairwise judging",
     "report": "regenerate the experiment's report from raw run records",
+    "rounds": "score each code-review round of a replay experiment's reviewed builds; apply the round rule",
 }
-EXPERIMENT_COMMANDS = ("probe", "calibrate", "freeze", "run", "judge", "report")
+EXPERIMENT_COMMANDS = ("probe", "calibrate", "freeze", "run", "judge", "report", "rounds")
 
 
 def main(argv: list[str]) -> int:
@@ -34,6 +35,7 @@ def main(argv: list[str]) -> int:
     parsers["judge"].add_argument("--task", help="dev task: calibrate, or judge --pair, on one task")
     parsers["judge"].add_argument("--judge", choices=["fable", "astra"], required=False)
     parsers["judge"].add_argument("--pair", nargs=2, metavar="ARM", help="with --task: judge two arms' builds")
+    parsers["rounds"].add_argument("--arm", required=True, help="a reviewed arm of the experiment")
     args = parser.parse_args(argv)
     if args.command in EXPERIMENT_COMMANDS:
         from .harness import experiments
@@ -201,6 +203,30 @@ def _report(args) -> int:
     return _guarded(write)
 
 
+def _rounds(args) -> int:
+    from .harness import rounds
+
+    experiment = args.experiment
+    if experiment.report != "replay" or args.arm not in experiment.treatments:
+        print(f"rounds: needs a replay experiment and one of its reviewed arms, not {experiment.name} {args.arm}",
+              file=sys.stderr)
+        return 2
+    data_root = _data_root(experiment)
+
+    def write() -> int:
+        digest = rounds.verify_freeze(experiment)
+        for failure in rounds.score_rounds(data_root, experiment, args.arm, digest):
+            print(failure, file=sys.stderr)
+        results = rounds.collect(data_root, experiment, args.arm, digest)
+        trigger = rounds.decide(results)
+        text = rounds.render(results, trigger, experiment)
+        (data_root / "rounds.md").write_text(text, encoding="utf-8")
+        print(text)
+        return 0 if trigger.verdict != "INCOMPLETE" else 1
+
+    return _guarded(write)
+
+
 def _guarded(action) -> int:
     """Experiment commands refuse to start on a missing or changed freeze."""
     from .harness import manifest
@@ -213,7 +239,7 @@ def _guarded(action) -> int:
 
 
 HANDLERS = {"validate": _validate, "probe": _probe, "calibrate": _calibrate, "freeze": _freeze, "run": _run,
-            "judge": _judge, "report": _report}
+            "judge": _judge, "report": _report, "rounds": _rounds}
 
 
 if __name__ == "__main__":

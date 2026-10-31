@@ -263,9 +263,10 @@ def _execute(run: "_Run", record: dict, work, scores) -> None:
     record.update(finished=_now(), flags=run.flags, steps=run.steps)
 
 
-def materialize_head(repo: Path, dest: Path) -> None:
-    """Write the tracked files of repo's HEAD commit to dest: what the run actually committed."""
-    archive = subprocess.run(["git", "archive", "--format=tar", "HEAD"], cwd=repo, env=_git_env(),
+def materialize_head(repo: Path, dest: Path, commit: str = "HEAD") -> None:
+    """Write the tracked files of repo's HEAD commit (or another of its commits) to dest: what the run
+    actually committed."""
+    archive = subprocess.run(["git", "archive", "--format=tar", commit], cwd=repo, env=_git_env(),
                              capture_output=True, check=True).stdout
     dest.mkdir(parents=True)
     with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
