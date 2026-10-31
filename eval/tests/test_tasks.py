@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import tempfile
 import unittest
@@ -107,6 +108,7 @@ class ValidateCommandTest(unittest.TestCase):
                 self.assertEqual(self.validate("--task", "dev-a"), 3)
                 validated.assert_not_called()
 
+    @unittest.skipIf(os.geteuid() == 0, "root lists a mode-0 directory")
     def test_a_manifests_directory_that_cannot_be_listed_refuses_everything(self):
         self.freeze("dev-b")
         self.manifests.chmod(0)
