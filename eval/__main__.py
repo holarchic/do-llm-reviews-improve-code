@@ -16,8 +16,9 @@ COMMANDS = {
     "judge": "run judge calibration and pairwise judging",
     "report": "regenerate the experiment's report from raw run records",
     "rounds": "score each code-review round of a replay experiment's reviewed builds; apply the round rule",
+    "cost": "price every recorded step of the experiment at the dated list prices (descriptive)",
 }
-EXPERIMENT_COMMANDS = ("probe", "calibrate", "freeze", "run", "judge", "report", "rounds")
+EXPERIMENT_COMMANDS = ("probe", "calibrate", "freeze", "run", "judge", "report", "rounds", "cost")
 
 
 def main(argv: list[str]) -> int:
@@ -36,6 +37,7 @@ def main(argv: list[str]) -> int:
     parsers["judge"].add_argument("--judge", choices=["fable", "astra"], required=False)
     parsers["judge"].add_argument("--pair", nargs=2, metavar="ARM", help="with --task: judge two arms' builds")
     parsers["rounds"].add_argument("--arm", required=True, help="a reviewed arm of the experiment")
+    parsers["cost"].add_argument("--arm", action="append", help="one of the experiment's arms, repeatable (default: all)")
     parsers["validate"].add_argument("--task", action="append", help="validate only this task, repeatable "
                                      "(default: every task no manifest freezes; a frozen task is refused)")
     args = parser.parse_args(argv)
@@ -259,8 +261,23 @@ def _guarded(action) -> int:
         return 3
 
 
+def _cost(args) -> int:
+    from .harness import cost_report
+
+    unknown = sorted(set(args.arm or ()) - set(args.experiment.arm_names))
+    if unknown:
+        print(f"cost: no arm {', '.join(unknown)}; one of {', '.join(args.experiment.arm_names)}", file=sys.stderr)
+        return 2
+    data_root = _data_root(args.experiment)
+    text = cost_report.render(cost_report.collect(data_root, args.experiment, args.arm))
+    data_root.mkdir(parents=True, exist_ok=True)
+    (data_root / "cost.md").write_text(text, encoding="utf-8")
+    print(text)
+    return 0
+
+
 HANDLERS = {"validate": _validate, "probe": _probe, "calibrate": _calibrate, "freeze": _freeze, "run": _run,
-            "judge": _judge, "report": _report, "rounds": _rounds}
+            "judge": _judge, "report": _report, "rounds": _rounds, "cost": _cost}
 
 
 if __name__ == "__main__":
