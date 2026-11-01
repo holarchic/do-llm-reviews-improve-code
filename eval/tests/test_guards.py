@@ -73,7 +73,8 @@ class RegressionGuardTest(unittest.TestCase):
 
     def test_bad_inputs_are_refused(self):
         for args in (("t", 0, (0,), (0,)), ("t", 10, (1, 0), (1,)), ("t", 10, (), ()), ("t", 10, (-1,), (0,)),
-                     ("t", 10, (11,), (0,))):
+                     ("t", 10, (11,), (0,)), ("t", 10.0, (1,), (0,)), ("t", 10, (1.5,), (0,)),
+                     ("t", 10, (True,), (0,))):
             with self.subTest(args=args), self.assertRaises(ValueError):
                 TaskRegressions(*args)
         with self.assertRaises(ValueError):
@@ -98,6 +99,7 @@ class FeatureAndHeadroomTest(unittest.TestCase):
         self.assertTrue(guards.headroom(six, 15).ok)
         self.assertFalse(guards.headroom({**six, "t0": 85.6}, 15).ok)  # mean 85.1
         self.assertTrue(guards.headroom({**six, "t0": 85.6}, 10).ok)
+        self.assertTrue(guards.headroom({f"t{i}": 90.0 for i in range(6)}, 10).ok)
         self.assertFalse(guards.headroom({f"t{i}": 90.0 + (i == 0) for i in range(6)}, 10).ok)  # mean 90.17
 
     def test_wins_needed_is_two_thirds_rounded_up(self):

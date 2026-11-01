@@ -43,6 +43,9 @@ class TaskRegressions:
     comparator: tuple[int, ...]
 
     def __post_init__(self):
+        counts = (self.tests, *self.treatment, *self.comparator)
+        if not all(isinstance(n, int) and not isinstance(n, bool) for n in counts):
+            raise ValueError(f"{self.task}: test and failure counts must be integers")
         if self.tests < 1:
             raise ValueError(f"{self.task}: no regression tests")
         if not self.treatment or len(self.treatment) != len(self.comparator):
