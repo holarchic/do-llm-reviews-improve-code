@@ -82,6 +82,16 @@ PRICES: dict[tuple[str, str], Price] = {(price.provider, price.model): price for
 )}
 
 
+def request_charge_bound(price: Price, *, max_input_tokens: int, max_output_tokens: int,
+                         per_request_usd: float = 0.0) -> float:
+    """One request's worst case: all its input at the dearest input-side rate the price allows
+    (uncached, any cache write, the long-context tier), all its output at the dearest output rate."""
+    candidates = [price.rates] + ([price.tier.rates] if price.tier is not None else [])
+    input_rate = max(max([r.input] + [p for _, p in r.cache_write]) for r in candidates)
+    output_rate = max(r.output for r in candidates)
+    return (max_input_tokens * input_rate + max_output_tokens * output_rate) / 1e6 + per_request_usd
+
+
 def lookup(provider: str, model: str) -> Price:
     try:
         return PRICES[(provider, model)]

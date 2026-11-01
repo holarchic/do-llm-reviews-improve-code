@@ -77,6 +77,7 @@ class Session:
     usage: dict = field(default_factory=dict)
     reported_models: list[str] = field(default_factory=list)
     audit_hits: list[str] = field(default_factory=list)
+    spend_refused: bool = False  # the envelope refused it: the loop never retries it
 
     def unrouted_models(self, agent: "Agent") -> list[str]:
         """Models a routed session reported besides its own (e.g. a background call to an Anthropic model)."""
@@ -93,6 +94,7 @@ class Session:
             "usage": self.usage,
             "reported_models": self.reported_models,
             "audit_hits": self.audit_hits,
+            **({"spend_refused": True} if self.spend_refused else {}),
         }
 
 
@@ -317,13 +319,12 @@ def _spend_checked(session: Session, out_dir: Path) -> Session:
     refused = routing.refusal(str(out_dir))
     if refused is None:
         return session
-    return replace(session, terminal=INFRA, reason=f"{SPEND_REFUSED}: {refused}")
+    return replace(session, terminal=INFRA, reason=f"{SPEND_REFUSED}: {refused}", spend_refused=True)
 
 
 def _finish(session: Session, cwd: Path) -> Session:
     hits = audit.audit_transcript(session.transcript, cwd)
-    return Session(session.terminal, session.reason, session.final_text, session.transcript,
-                   session.seconds, session.usage, session.reported_models, hits)
+    return replace(session, audit_hits=hits)
 
 
 def _events(transcript: Path):

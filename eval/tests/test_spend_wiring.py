@@ -13,11 +13,11 @@ MODEL = "qwen/qwen3-coder-30b-a3b-instruct"
 
 class StubProxy:
     def __init__(self, refused: str | None = None):
-        self.upstreams = {routing.route_name(agents.OPENROUTER, MODEL): None}
+        self.routes = frozenset({routing.route_name(agents.OPENROUTER, MODEL)})
         self.env = mock.Mock(refusal=lambda attempt: refused)
 
     def session(self, job, attempt):
-        return {route: f"http://127.0.0.1:9/s/t/{route}" for route in self.upstreams}
+        return {route: f"http://127.0.0.1:9/s/t/{route}" for route in self.routes}
 
 
 class Fixture(unittest.TestCase):
@@ -64,6 +64,7 @@ class RefusalTest(Fixture):
 
     def test_a_refused_session_ends_infra_even_when_its_cli_got_through(self):
         session = self.run_claude_succeeding("scope or: allocation spent")
+        self.assertTrue(session.spend_refused)
         self.assertEqual(session.terminal, agents.INFRA)
         self.assertTrue(session.reason.startswith(agents.SPEND_REFUSED))
 
@@ -79,7 +80,8 @@ class LoopTest(StubAgentCase):
             calls.append(role)
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / "transcript.jsonl").touch()
-            return agents.Session(agents.INFRA, f"{agents.SPEND_REFUSED}: no room", "", out_dir / "transcript.jsonl", 0.1)
+            return agents.Session(agents.INFRA, f"{agents.SPEND_REFUSED}: no room", "", out_dir / "transcript.jsonl", 0.1,
+                                  spend_refused=True)
 
         with mock.patch.object(agents, "run_claude", refused), mock.patch.object(agents, "run_codex", refused):
             record = loop.execute_run(self.task, loop.Arm("A1", agents.Agent("claude", "m")), self.tmp / "runs", rep=1,

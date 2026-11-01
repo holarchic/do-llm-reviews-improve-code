@@ -135,6 +135,47 @@ class RunBuildsEnvelopeTest(unittest.TestCase):
             self.assertEqual(pilot.run_builds(root, experiment), 1)
         self.assertEqual(started, [])
 
+    def test_a_follow_up_runs_inside_its_jobs_reservation_and_routing_context(self):
+        import contextlib
+        from eval.harness import envelope, routing
+        root = Path(tempfile.mkdtemp(prefix="eval-test-"))
+        self.addCleanup(shutil.rmtree, root)
+        experiment = dataclasses.replace(PILOT2, tasks=("dev-intervals",), reps=1, parallel=1, envelope="T",
+                                         arms=(PILOT2.arm("A1"),), followup_arms=("A1",))
+        owned = envelope.Envelope.owned("T", root=root / "envelopes", create_usd=50.0)
+        env = owned.__enter__()
+        self.addCleanup(owned.__exit__, None, None, None)
+        env.fund(credit=10.0)
+        env.register_scope("or", provider="openrouter", fingerprint="fp", opening_usage=0.0, allocation=10.0,
+                           provider_limit=10.0)
+        writer = PILOT2.arm("A1").writer
+        env.set_route(routing.route_name(writer.provider, writer.model), scope="or", max_charge=0.5, slots=2,
+                      policy={}, bootstrap_build_usd=1.0)
+        env.reconcile("or", 0.0)
+        seen = []
+
+        def fake_execute(task, arm, runs_root, *, rep=None, manifest_hash, offline=False):
+            exec_dir = runs_root / loop.run_id(task.id, arm.name, rep) / "exec-1"
+            exec_dir.mkdir(parents=True)
+            return {"run_id": loop.run_id(task.id, arm.name, rep), "exec": "exec-1", "status": "complete"}
+
+        def fake_followup(task, exec_dir, arm, *, manifest_hash, offline=False):
+            job = getattr(routing._job, "value", None)
+            seen.append((job, env.state["reservations"].get(job, {}).get("open")))
+            return {"status": "complete"}
+
+        with mock.patch.object(manifest, "verify", return_value="d"), \
+                mock.patch.object(pilot, "routing_context", lambda e: contextlib.nullcontext(env)), \
+                mock.patch.object(pilot.loop, "execute_run", fake_execute), \
+                mock.patch.object(pilot.loop, "execute_followup", fake_followup), \
+                mock.patch.object(openrouter, "scrub", return_value=[]):
+            pilot.run_builds(root, experiment)
+            # A resumed run: the build is complete, only its follow-up is still owed.
+            with mock.patch.object(pilot, "complete_build", lambda *a, **k: root / "runs" / "x" / "exec-1"):
+                pilot.run_builds(root, experiment)
+        run_id = loop.run_id("dev-intervals", "A1", None)  # one replicate: no --r suffix
+        self.assertEqual(seen, [(run_id, True), (run_id, True)])
+
     def test_a_routed_experiment_without_an_envelope_is_refused(self):
         from eval.harness import routing
         with mock.patch.object(manifest, "verify", return_value="d"), self.assertRaises(routing.RoutingRequired):

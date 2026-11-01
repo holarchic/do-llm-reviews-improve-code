@@ -33,11 +33,11 @@ class StubProxy:
     BASE = "http://127.0.0.1:9/s/token"
 
     def __init__(self, *models):
-        self.upstreams = {routing.route_name(agents.OPENROUTER, m): None for m in models}
+        self.routes = frozenset(routing.route_name(agents.OPENROUTER, m) for m in models)
         self.env = mock.Mock(refusal=lambda attempt: None)
 
     def session(self, job, attempt):
-        return {route: f"{self.BASE}/{route}" for route in self.upstreams}
+        return {route: f"{self.BASE}/{route}" for route in self.routes}
 
 
 class RoutedSessionTest(_KeyFile):

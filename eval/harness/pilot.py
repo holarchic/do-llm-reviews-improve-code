@@ -37,13 +37,13 @@ def routing_context(experiment: Experiment):
 def job_estimate(env: envelope.Envelope, experiment: Experiment, arm_name: str, calibration_runs: Path) -> float:
     """What a job of this arm reserves: from the arm's calibration builds, or its routes' bootstrap cost."""
     arm = experiment.arm(arm_name)
-    routes = env.state["routes"]
     names = [routing.route_name(a.provider, a.model) for a in (arm.writer, arm.reviewer)
              if a is not None and a.provider != "native"]
-    missing = [n for n in names if n not in routes]
+    routes = {n: env.route(n) for n in names}
+    missing = [n for n, r in routes.items() if r is None]
     if missing:
-        raise envelope.Refused(f"no route {', '.join(missing)} in envelope {env.state['name']}")
-    bootstrap = sum(routes[n]["bootstrap_build_usd"] for n in names)
+        raise envelope.Refused(f"no route {', '.join(missing)} in the envelope")
+    bootstrap = sum(r.bootstrap_build_usd for r in routes.values())
     highs, unknown = [], False
     for run_root in sorted(calibration_runs.glob(f"*--{arm_name}--r*")) if calibration_runs.is_dir() else []:
         for execution in spend.run_cost(run_root, None, arm).unscored:
@@ -54,7 +54,8 @@ def job_estimate(env: envelope.Envelope, experiment: Experiment, arm_name: str, 
 
 
 def reserved(env: envelope.Envelope | None, job_id: str, estimate, run):
-    """Run `run()` as job `job_id` under a reservation; None when the envelope does not admit it."""
+    """Run `run()` as job `job_id` under a reservation; None when the envelope does not admit it. The
+    job's reservation closes once it has finished and every request it made has settled."""
     if env is None:
         return run()
     try:
@@ -66,7 +67,7 @@ def reserved(env: envelope.Envelope | None, job_id: str, estimate, run):
         with routing.job(job_id):
             return run()
     finally:
-        if not env.release(job_id):
+        if not env.finish(job_id):
             _log(f"{job_id}: its reservation stays held until its requests settle")
 
 
@@ -155,13 +156,18 @@ def run_builds(data_root: Path, experiment: Experiment, only_arm: str | None = N
     def build_job(item: BuildJob):
         task, arm, rep = by_id[item.task], item.arm, item.rep
         exec_dir = complete_build(runs_root, task.id, arm, digest, rep)
+        if exec_dir is not None and (arm not in experiment.followup_arms or complete_followup(exec_dir, digest)):
+            return True
+        # The build and its follow-up run as one job, inside one reservation, a resumed follow-up included.
+        done = reserved(env, loop.run_id(task.id, arm, rep),
+                        lambda: job_estimate(env, experiment, arm, data_root / "calibration" / "runs"),
+                        lambda: build_and_followup(task, arm, rep, exec_dir))
+        return bool(done)
+
+    def build_and_followup(task, arm: str, rep, exec_dir) -> bool:
         if exec_dir is None:
-            run_id = loop.run_id(task.id, arm, rep)
-            record = reserved(env, run_id, lambda: job_estimate(env, experiment, arm, data_root / "calibration" / "runs"),
-                              lambda: loop.execute_run(task, experiment.arm(arm), runs_root, rep=rep,
-                                                       manifest_hash=digest, offline=experiment.offline))
-            if record is None:
-                return False
+            record = loop.execute_run(task, experiment.arm(arm), runs_root, rep=rep, manifest_hash=digest,
+                                      offline=experiment.offline)
             _log(f"build {record['run_id']} {record['exec']}: {record['status']} {record.get('flags')}")
             if record["status"] != "complete":
                 return False

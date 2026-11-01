@@ -39,16 +39,8 @@ def main(argv: list[str]) -> int:
     parsers["judge"].add_argument("--pair", nargs=2, metavar="ARM", help="with --task: judge two arms' builds")
     parsers["rounds"].add_argument("--arm", required=True, help="a reviewed arm of the experiment")
     parsers["cost"].add_argument("--arm", action="append", help="one of the experiment's arms, repeatable (default: all)")
-    spend = parsers["spend"]
-    spend.add_argument("action", choices=["create", "fund", "scope", "route", "validate-route", "status", "resolve"])
-    spend.add_argument("--envelope", required=True, help="the budget's name, e.g. B")
-    for flag in ("--usd", "--credit", "--fees", "--taxes", "--probe", "--allocation", "--provider-limit",
-                 "--max-charge", "--bootstrap", "--billed"):
-        spend.add_argument(flag, type=float)
-    for flag in ("--scope", "--provider", "--route", "--policy", "--upstream-base", "--settler", "--request"):
-        spend.add_argument(flag)
-    spend.add_argument("--slots", type=int)
-    spend.add_argument("--not-billed", action="store_true")
+    from .harness import spend_commands
+    spend_commands.add_arguments(parsers["spend"])
     parsers["validate"].add_argument("--task", action="append", help="validate only this task, repeatable "
                                      "(default: every task no manifest freezes; a frozen task is refused)")
     args = parser.parse_args(argv)
@@ -138,23 +130,27 @@ def _run(args) -> int:
     arm = experiment.arm(args.arm)
     runs_root = _data_root(experiment) / "runs"
     calibration = _data_root(experiment) / "calibration" / "runs"
+
+    def build_and_followup() -> int:
+        record = loop.execute_run(task, arm, runs_root, manifest_hash=None, offline=experiment.offline)
+        print(json.dumps({k: record.get(k) for k in ("run_id", "exec", "status", "flags", "rounds", "scores")}))
+        if record["status"] != "complete":
+            return 1
+        if arm.name not in experiment.followup_arms:
+            return 0
+        exec_dir = runs_root / record["run_id"] / record["exec"]
+        followup = loop.execute_followup(task, exec_dir, arm, manifest_hash=None, offline=experiment.offline)
+        print(json.dumps({k: followup.get(k) for k in ("status", "flags", "scores")}))
+        return 0 if followup["status"] == "complete" else 1
+
+    # The follow-up runs inside the same reservation and routing context as its build.
     with pilot.routing_context(experiment) as env:
-        record = pilot.reserved(env, f"dev:{loop.run_id(task.id, arm.name, None)}",
-                                lambda: pilot.job_estimate(env, experiment, arm.name, calibration),
-                                lambda: loop.execute_run(task, arm, runs_root, manifest_hash=None,
-                                                         offline=experiment.offline))
-    if record is None:
+        code = pilot.reserved(env, f"dev:{loop.run_id(task.id, arm.name, None)}",
+                              lambda: pilot.job_estimate(env, experiment, arm.name, calibration), build_and_followup)
+    if code is None:
         print("run: not admitted by the spend envelope", file=sys.stderr)
         return 1
-    print(json.dumps({k: record.get(k) for k in ("run_id", "exec", "status", "flags", "rounds", "scores")}))
-    if record["status"] != "complete":
-        return 1
-    if arm.name not in experiment.followup_arms:
-        return 0
-    exec_dir = runs_root / record["run_id"] / record["exec"]
-    followup = loop.execute_followup(task, exec_dir, arm, manifest_hash=None, offline=experiment.offline)
-    print(json.dumps({k: followup.get(k) for k in ("status", "flags", "scores")}))
-    return 0 if followup["status"] == "complete" else 1
+    return code
 
 
 def _calibrate(args) -> int:
@@ -305,47 +301,9 @@ def _cost(args) -> int:
 
 
 def _spend(args) -> int:
-    import json
-    import time
+    from .harness import spend_commands
 
-    from .harness import envelope, openrouter, routing
-
-    if args.action == "status":  # read-only: no ownership, so it works while a run owns the envelope
-        state = envelope.load(envelope.DEFAULT_ROOT / f"{args.envelope}.json")
-        print(json.dumps(envelope.summary(state, time.time()), indent=2))
-        return 0
-    try:
-        with envelope.Envelope.owned(args.envelope, create_usd=args.usd if args.action == "create" else None) as env:
-            if args.action == "fund":
-                if args.probe is not None:
-                    env.fund_probe(args.probe)
-                else:
-                    env.fund(credit=args.credit or 0.0, fees=args.fees or 0.0, taxes=args.taxes or 0.0)
-            elif args.action == "scope":
-                if args.provider != "openrouter":
-                    print("spend scope: only an openrouter scope can read its key's usage so far", file=sys.stderr)
-                    return 2
-                key = openrouter.api_key()
-                env.register_scope(args.scope, provider=args.provider, fingerprint=routing.fingerprint(key),
-                                   opening_usage=openrouter.credit_used(), allocation=args.allocation,
-                                   provider_limit=args.provider_limit)
-            elif args.action == "route":
-                env.set_route(args.route, scope=args.scope, max_charge=args.max_charge, slots=args.slots,
-                              policy=json.loads(args.policy or "{}"), bootstrap_build_usd=args.bootstrap,
-                              upstream={"base_url": args.upstream_base, "settler": args.settler})
-            elif args.action == "validate-route":
-                env.validate_route(args.route)
-            elif args.action == "resolve":
-                if args.not_billed == (args.billed is not None):
-                    print("spend resolve: exactly one of --billed USD or --not-billed", file=sys.stderr)
-                    return 2
-                if not env.settle(args.request, None if args.not_billed else args.billed):
-                    print(f"spend resolve: {args.request} was already settled", file=sys.stderr)
-            print(json.dumps(envelope.summary(env.state, time.time()), indent=2))
-    except (envelope.Refused, envelope.EnvelopeError, openrouter.CreditUnavailable, ValueError, TypeError) as exc:
-        print(f"spend {args.action}: refused: {exc}", file=sys.stderr)
-        return 3
-    return 0
+    return spend_commands.run(args, lambda text, error=False: print(text, file=sys.stderr if error else sys.stdout))
 
 
 HANDLERS = {"validate": _validate, "probe": _probe, "calibrate": _calibrate, "freeze": _freeze, "run": _run,

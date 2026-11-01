@@ -25,6 +25,7 @@ import os
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_ROOT = Path(__file__).resolve().parents[1] / "data" / "envelopes"
@@ -33,6 +34,27 @@ RESERVE_FACTOR = 1.5
 PROBE = "probe"  # the job id of a probe reservation
 STAGES = ("probe", "validated")
 _EPSILON = 1e-9
+
+
+@dataclass(frozen=True)
+class Route:
+    name: str
+    scope: str
+    max_charge: float
+    slots: int
+    policy: dict
+    bootstrap_build_usd: float
+    stage: str
+    upstream: dict | None
+    key_fingerprint: str
+
+
+@dataclass(frozen=True)
+class PendingSettlement:
+    request: str
+    billing_id: str
+    upstream: dict | None
+    scope: str
 
 
 class Refused(Exception):
@@ -53,6 +75,7 @@ class Envelope:
     def __init__(self, path: Path, state: dict, lock_file, now):
         self.path, self._state, self._lock_file, self._now = path, state, lock_file, now
         self._mutex = threading.Lock()
+        self._closed = False  # set before the flock is released: a straggling thread can no longer write
 
     # ---- ownership and persistence
 
@@ -75,13 +98,19 @@ class Envelope:
                     raise EnvelopeError(f"envelope must be a positive amount, not {create_usd!r}")
                 _write(path, _empty(name, create_usd))
             envelope = cls(path, load(path), lock_file, now)
-            yield envelope
+            try:
+                yield envelope
+            finally:
+                with envelope._mutex:
+                    envelope._closed = True
         finally:
             lock_file.close()  # releases the flock
 
     def _transition(self, change) -> object:
         """Apply `change` to a copy, persist it, then swap it in: the persisted file is always whole."""
         with self._mutex:
+            if self._closed:
+                raise EnvelopeError("this envelope is no longer owned here")
             draft = copy.deepcopy(self._state)
             result = change(draft)
             _check(draft)
@@ -111,9 +140,9 @@ class Envelope:
             raise Refused("a probe reservation must be positive")
 
         def change(s):
-            held = s["reservations"].setdefault(PROBE, {"amount": 0.0, "open": True})
+            held = s["reservations"].setdefault(PROBE, {"amount": 0.0, "open": True, "terminated": False})
             held["amount"] += usd
-            held["open"] = True
+            held["open"], held["terminated"] = True, False
             _require_reservations_fit(s)
         self._transition(change)
 
@@ -131,7 +160,9 @@ class Envelope:
                     raise Refused(f"that key belongs to envelope {other.stem}")
 
             def change(s):
-                if any(v["fingerprint"] == fingerprint for k, v in s["scopes"].items() if k != scope):
+                if scope in s["scopes"]:
+                    raise Refused(f"scope {scope} exists: a scope's key and opening usage never change")
+                if any(v["fingerprint"] == fingerprint for v in s["scopes"].values()):
                     raise Refused("that key already has a scope in this envelope")
                 s["scopes"][scope] = {"provider": provider, "fingerprint": fingerprint, "opening_usage": opening_usage,
                                       "allocation": allocation, "provider_limit": provider_limit,
@@ -149,12 +180,16 @@ class Envelope:
                 and (upstream is None or isinstance(upstream, dict))):
             raise Refused("a route needs a positive max charge, at least one slot, a policy and a bootstrap cost")
 
+        config = {"scope": scope, "max_charge": max_charge, "slots": slots, "policy": copy.deepcopy(policy),
+                  "bootstrap_build_usd": bootstrap_build_usd, "upstream": copy.deepcopy(upstream)}
+
         def change(s):
             if scope not in s["scopes"]:
                 raise Refused(f"no scope {scope}")
-            stage = s["routes"].get(route, {}).get("stage", "probe")
-            s["routes"][route] = {"scope": scope, "max_charge": max_charge, "slots": slots, "policy": policy,
-                                  "bootstrap_build_usd": bootstrap_build_usd, "stage": stage, "upstream": upstream}
+            old = s["routes"].get(route)
+            unchanged = old is not None and {k: old[k] for k in config} == config
+            # A validated route stays validated only while nothing about it changes.
+            s["routes"][route] = {**config, "stage": old["stage"] if unchanged else "probe"}
             _require_bound(s)
         self._transition(change)
 
@@ -193,19 +228,21 @@ class Envelope:
             _require_trusted(s, self._now())
             held = s["reservations"].get(job)
             if held is not None and held["open"]:
-                return  # a resumed job keeps the reservation it holds
-            s["reservations"][job] = {"amount": amount, "open": True}
+                held["terminated"] = False  # a resumed job keeps the reservation it holds
+                return
+            s["reservations"][job] = {"amount": amount, "open": True, "terminated": False}
             _require_reservations_fit(s)
         self._transition(change)
 
-    def release(self, job: str) -> bool:
-        """Release a terminated job's reservation; False while any of its requests is unresolved."""
+    def finish(self, job: str) -> bool:
+        """Record that a job has terminated. Its reservation closes now if every request it made has
+        settled, else when its last one settles. True when it closed now."""
         def change(s):
-            if any(r["job"] == job and r["state"] == "unresolved" for r in s["requests"].values()):
-                return False
-            if job in s["reservations"]:
-                s["reservations"][job]["open"] = False
-            return True
+            held = s["reservations"].get(job)
+            if held is None or not held["open"]:
+                return True
+            held["terminated"] = True
+            return _close_if_done(s, job)
         return self._transition(change)
 
     # ---- requests
@@ -216,13 +253,20 @@ class Envelope:
             if request in s["requests"]:
                 raise Refused(f"request {request} was already admitted")
             reason = _admission_problem(s, route, job, attempt, self._now())
+            if not reason:
+                r = s["routes"][route]
+                s["requests"][request] = {"route": route, "scope": r["scope"], "bound": r["max_charge"], "job": job,
+                                          "attempt": attempt, "state": "unresolved", "billed": None,
+                                          "billing_id": None, "ambiguous": False,
+                                          "upstream": copy.deepcopy(r["upstream"]), "admitted_at": self._now()}
+                try:
+                    _require_reservations_fit(s)  # the request must not eat into another job's hold
+                except Refused as exc:
+                    del s["requests"][request]
+                    reason = str(exc)
             if reason:
                 s["refusals"][attempt] = reason
                 return reason
-            r = s["routes"][route]
-            s["requests"][request] = {"route": route, "scope": r["scope"], "bound": r["max_charge"], "job": job,
-                                      "attempt": attempt, "state": "unresolved", "billed": None, "billing_id": None,
-                                      "admitted_at": self._now()}
             return None
         reason = self._transition(change)
         if reason:
@@ -230,9 +274,13 @@ class Envelope:
         return self._state["requests"][request]["bound"]
 
     def record_billing_id(self, request: str, billing_id: str) -> None:
+        """The response's billing id; a second, different one makes it ambiguous, never re-pointed."""
         def change(s):
-            if s["requests"][request]["billing_id"] is None:
-                s["requests"][request]["billing_id"] = billing_id
+            entry = s["requests"][request]
+            if entry["billing_id"] is None and not entry["ambiguous"]:
+                entry["billing_id"] = billing_id
+            elif entry["billing_id"] != billing_id:
+                entry["billing_id"], entry["ambiguous"] = None, True
         self._transition(change)
 
     def settle(self, request: str, billed: float | None) -> bool:
@@ -247,8 +295,37 @@ class Envelope:
             if entry["state"] != "unresolved":
                 return False
             entry["state"], entry["billed"] = ("billed", billed) if billed is not None else ("not_billed", 0.0)
+            held = s["reservations"].get(entry["job"])
+            if held is not None and held["open"] and held["terminated"]:
+                _close_if_done(s, entry["job"])
             return True
         return self._transition(change)
+
+    # ---- typed views
+
+    def route(self, name: str) -> "Route | None":
+        with self._mutex:
+            r = self._state["routes"].get(name)
+            if r is None:
+                return None
+            return Route(name, r["scope"], r["max_charge"], r["slots"], copy.deepcopy(r["policy"]),
+                         r["bootstrap_build_usd"], r["stage"], copy.deepcopy(r["upstream"]),
+                         self._state["scopes"][r["scope"]]["fingerprint"])
+
+    def route_names(self) -> list[str]:
+        with self._mutex:
+            return sorted(self._state["routes"])
+
+    def scopes(self) -> list[str]:
+        with self._mutex:
+            return sorted(self._state["scopes"])
+
+    def pending_settlements(self) -> list["PendingSettlement"]:
+        """Unresolved requests with a billing id to look up; each keeps the upstream it was admitted under."""
+        with self._mutex:
+            return [PendingSettlement(rid, r["billing_id"], copy.deepcopy(r["upstream"]), r["scope"])
+                    for rid, r in self._state["requests"].items()
+                    if r["state"] == "unresolved" and r["billing_id"] and not r["ambiguous"]]
 
     def refusal(self, attempt: str) -> str | None:
         with self._mutex:
@@ -302,6 +379,18 @@ def _write(path: Path, state: dict) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(tmp, path)
+    directory = os.open(path.parent, os.O_RDONLY)  # the rename is durable only once its directory is
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def _close_if_done(s: dict, job: str) -> bool:
+    if any(r["job"] == job and r["state"] == "unresolved" for r in s["requests"].values()):
+        return False
+    s["reservations"][job]["open"] = False
+    return True
 
 
 def _check(s: dict) -> None:
@@ -322,16 +411,24 @@ def _check(s: dict) -> None:
         for name, route in s["routes"].items():
             ensure(route["scope"] in s["scopes"] and route["stage"] in STAGES and _money(route["max_charge"])
                    and isinstance(route["slots"], int) and not isinstance(route["slots"], bool) and route["slots"] >= 1
-                   and isinstance(route["policy"], dict), f"route {name}")
+                   and isinstance(route["policy"], dict) and _money(route["bootstrap_build_usd"])
+                   and (route["upstream"] is None or isinstance(route["upstream"], dict)), f"route {name}")
         for name, r in s["requests"].items():
             ensure(r["scope"] in s["scopes"] and _money(r["bound"])
                    and r["state"] in ("unresolved", "billed", "not_billed")
                    and (r["billed"] is None) == (r["state"] == "unresolved")
                    and (r["billed"] is None or _money(r["billed"]))
-                   and isinstance(r["job"], str) and isinstance(r["attempt"], str), f"request {name}")
-        ensure(all(_money(r["amount"]) and isinstance(r["open"], bool) for r in s["reservations"].values()),
-               "reservations")
+                   and isinstance(r["job"], str) and isinstance(r["attempt"], str)
+                   and isinstance(r["ambiguous"], bool) and (r["billing_id"] is None or isinstance(r["billing_id"], str))
+                   and (r["upstream"] is None or isinstance(r["upstream"], dict)), f"request {name}")
+        ensure(all(_money(r["amount"]) and isinstance(r["open"], bool) and isinstance(r["terminated"], bool)
+                   for r in s["reservations"].values()), "reservations")
         ensure(all(isinstance(v, str) for v in s["refusals"].values()), "refusals")
+        # The financial invariants, not only the shapes: a ledger that breaks them is not trusted.
+        ensure(_funded(s) + _purchase_costs(s) + _overdraw(s) <= s["envelope_usd"] + _EPSILON,
+               "funding + fees + taxes + maximum overdraw exceed the envelope")
+        ensure(sum(v["allocation"] for v in s["scopes"].values()) <= _funded(s) + _EPSILON,
+               "scope allocations exceed funded credit")
     except (KeyError, TypeError, AttributeError) as exc:
         raise EnvelopeError(f"envelope state does not check out: {exc!r}") from None
 
@@ -413,8 +510,9 @@ def _admission_problem(s: dict, route: str, job: str, attempt: str, now: float) 
         if spent + r["max_charge"] > held["amount"] + _EPSILON:
             return f"the ${held['amount']:.2f} probe reservation is spent"
     scope, entry = r["scope"], s["scopes"][r["scope"]]
-    if entry["excess"] > 0:
-        return f"scope {scope}: the provider billed ${entry['excess']:.4f} the ledger does not account for"
+    for name, other in s["scopes"].items():  # an anomaly on any key stops all spending
+        if other["excess"] > 0:
+            return f"scope {name}: the provider billed ${other['excess']:.4f} the ledger does not account for"
     if entry["snapshot"] is None or now - entry["snapshot"]["at"] > SNAPSHOT_SECONDS:
         return f"scope {scope}: no reconciliation in the last {SNAPSHOT_SECONDS} s"
     if sum(q["route"] == route and q["state"] == "unresolved" for q in s["requests"].values()) >= r["slots"]:

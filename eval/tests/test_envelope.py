@@ -90,10 +90,12 @@ class GateTest(Fixture):
             env.reserve("job", 1.0)
             env.admit("q1", "r", job="job", attempt="a1")
             env.set_route("r", scope="or", max_charge=1.0, slots=2, policy={}, bootstrap_build_usd=1.0)
+            env.validate_route("r")  # a changed route is validated again
             env.admit("q2", "r", job="job", attempt="a1")  # 6 + 1 = 7
             with self.assertRaises(Refused):
                 env.admit("q3", "r", job="job", attempt="a1")  # the slots are full
             env.set_route("r", scope="or", max_charge=4.0, slots=4, policy={}, bootstrap_build_usd=1.0)
+            env.validate_route("r")
             with self.assertRaises(Refused):  # 6 + 1 + 4 = 11 > 10
                 env.admit("q4", "r", job="job", attempt="a2")
 
@@ -187,7 +189,7 @@ class SettlementTest(Fixture):
             env.set_route("r", scope="or", max_charge=0.1, slots=4, policy={}, bootstrap_build_usd=1.0)
             self.assertEqual(env.state["requests"]["q1"]["bound"], 5.0)
             self.assertEqual(envelope.summary(env.state, self.clock())["unresolved"], 5.0)
-            self.assertFalse(env.release("job"))  # still unresolved: the reservation holds
+            self.assertFalse(env.finish("job"))  # still unresolved: the reservation holds
 
 
 class OwnershipTest(Fixture):
@@ -312,9 +314,10 @@ class StageAndReservationTest(Fixture):
                 env.reserve("j2", 5.0)  # 6 + 5 > 10
             env.reserve("j1", 9.0)  # a resumed job keeps its reservation
             env.admit("q1", "r", job="j1", attempt="a")
-            self.assertFalse(env.release("j1"))  # between turns, a request still unresolved
-            env.settle("q1", 1.0)
-            self.assertTrue(env.release("j1"))
+            self.assertTrue(env.state["reservations"]["j1"]["open"])  # between turns: no finish yet
+            self.assertFalse(env.finish("j1"))  # finished with a request still unresolved: still held
+            env.settle("q1", 1.0)  # its last request settles: the hold closes by itself
+            self.assertFalse(env.state["reservations"]["j1"]["open"])
             env.reserve("j2", 5.0)  # j1's $1 settled + j2's $5 hold fit
 
     def test_an_overrun_counts_in_full(self):
@@ -362,3 +365,71 @@ class SpendCommandTest(Fixture):
         self.assertEqual(self.spend("resolve", "--envelope", "B", "--request", "q1"), 2)  # neither flag
         self.assertEqual(self.spend("resolve", "--envelope", "B", "--request", "q1", "--billed", "0.3"), 0)
         self.assertEqual(envelope.load(self.root / "B.json")["requests"]["q1"]["billed"], 0.3)
+
+
+class ReworkTest(Fixture):
+    """Phase review round 1: holds, envelope-wide trust, invariants on load, immutability, closed owners."""
+
+    def test_a_request_never_eats_into_another_jobs_hold(self):
+        with self.owned() as env:
+            self.ready(env, credit=10.0, fees=0.0, taxes=0.0, allocation=10.0, max_charge=4.0, slots=8)
+            env.reserve("j1", 5.0)
+            env.reserve("j2", 5.0)
+            env.admit("q1", "r", job="j1", attempt="a1")  # j1 holds max(5, 4) = 5
+            with self.assertRaises(Refused):
+                env.admit("q2", "r", job="j1", attempt="a2")  # j1 would hold 8: 8 + 5 > 10
+            self.assertNotIn("q2", env.state["requests"])
+
+    def test_an_excess_on_any_scope_stops_every_request(self):
+        with self.owned() as env:
+            env.fund(credit=10.0)
+            for scope, fp in (("a", "fp-a"), ("b", "fp-b")):
+                env.register_scope(scope, provider="p", fingerprint=fp, opening_usage=0.0, allocation=5.0,
+                                   provider_limit=5.0)
+                env.set_route(scope, scope=scope, max_charge=1.0, slots=4, policy={}, bootstrap_build_usd=1.0)
+                env.validate_route(scope)
+                env.reconcile(scope, 0.0)
+            env.reserve("job", 1.0)
+            env.reconcile("a", 20.0)  # scope a billed $20 the ledger never saw
+            with self.assertRaises(Refused):
+                env.admit("b1", "b", job="job", attempt="x")
+
+    def test_a_ledger_that_breaks_the_financial_invariants_is_not_loaded(self):
+        with self.owned(usd=10.0):
+            pass
+        path = self.root / "B.json"
+        state = json.loads(path.read_text())
+        for broken in ({**state, "funding": [{"credit": 100.0, "fees": 0.0, "taxes": 0.0, "at": 0}]},
+                       {**state, "funding": [{"credit": 5.0, "fees": 0.0, "taxes": 0.0, "at": 0}],
+                        "scopes": {"s": {"provider": "p", "fingerprint": "f", "opening_usage": 0.0, "allocation": 9.0,
+                                         "provider_limit": None, "snapshot": None, "excess": 0.0}}}):
+            with self.subTest(broken=list(broken)[:1]):
+                path.write_text(json.dumps(broken))
+                with self.assertRaises(EnvelopeError):
+                    envelope.load(path)
+
+    def test_a_scope_is_registered_once_and_a_changed_route_needs_validating_again(self):
+        with self.owned() as env:
+            self.ready(env)
+            with self.assertRaises(Refused):
+                env.register_scope("or", provider="openrouter", fingerprint="fp-new", opening_usage=0.0,
+                                   allocation=1.0, provider_limit=None)
+            self.assertEqual(env.route("r").stage, "validated")
+            env.set_route("r", scope="or", max_charge=1.0, slots=4, policy={}, bootstrap_build_usd=2.0)  # unchanged
+            self.assertEqual(env.route("r").stage, "validated")
+            env.set_route("r", scope="or", max_charge=1.0, slots=4, policy={"paths": ["/x"]}, bootstrap_build_usd=2.0)
+            self.assertEqual(env.route("r").stage, "probe")
+
+    def test_route_inputs_are_copied_into_the_ledger(self):
+        with self.owned() as env:
+            self.ready(env)
+            policy = {"paths": ["/v1/messages"]}
+            env.set_route("r2", scope="or", max_charge=1.0, slots=1, policy=policy, bootstrap_build_usd=1.0)
+            policy["paths"].append("/anything")
+            self.assertEqual(env.route("r2").policy, {"paths": ["/v1/messages"]})
+
+    def test_an_owner_that_has_closed_can_write_nothing(self):
+        with self.owned() as env:
+            self.ready(env)
+        with self.assertRaises(EnvelopeError):
+            env.fund(credit=1.0)
