@@ -8,7 +8,9 @@ calibration and retries sit inside the same cumulative bound. The guarantee, in 
   never exceeding funded credit; so provider usage stays within funded credit whatever the
   provider's own balance says;
 - reconciliation, one-sided: a key billed beyond settled + unresolved bounds refuses everything;
-  usage below settled is reporting lag, already counted in full by admission.
+  usage below settled is reporting lag, already counted in full by admission. A usage reading is
+  signed (a metered scope reads −balance) and cumulative, so one that falls (a top-up, a refund, an
+  expired grant) faults its scope, refusing everything until the operator clears it.
 
 One process owns an envelope at a time (an exclusive flock held for its lifetime); every
 transition is check, modify a copy, persist with an atomic replace, then swap in, under one mutex,
@@ -66,6 +68,9 @@ class PendingSettlement:
     upstream: dict | None
     scope: str
     key_fingerprint: str  # the scope's key: settlement is looked up with that key only
+    metered: float | None = None  # the usage the response reported, priced (a metered route)
+    metered_invalid: str | None = None  # why its usage can't be priced: it never settles automatically
+    protocol_complete: bool = False  # the response's protocol ended (not merely its forwarding)
 
 
 class Refused(Exception):
@@ -78,6 +83,11 @@ class EnvelopeError(Exception):
 
 def _money(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+
+
+def _reading(value) -> bool:
+    """A usage reading: finite, and signed (a metered scope reads −balance)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 class Envelope:
@@ -166,7 +176,7 @@ class Envelope:
 
     def register_scope(self, scope: str, *, provider: str, fingerprint: str, opening_usage: float,
                        allocation: float, provider_limit: float | None) -> None:
-        if not (_money(opening_usage) and _money(allocation)) or not fingerprint:
+        if not (_reading(opening_usage) and _money(allocation)) or not fingerprint:
             raise Refused("a scope needs a fingerprint, an opening usage and an allocation")
         registry = open(self.path.parent / "registry.lock", "a")
         try:
@@ -184,7 +194,7 @@ class Envelope:
                     raise Refused("that key already has a scope in this envelope")
                 s["scopes"][scope] = {"provider": provider, "fingerprint": fingerprint, "opening_usage": opening_usage,
                                       "allocation": allocation, "provider_limit": provider_limit,
-                                      "snapshot": None, "excess": 0.0}
+                                      "snapshot": None, "excess": 0.0, "fault": None}
                 _require_allocations(s)
             self._transition(change)
         finally:
@@ -235,20 +245,33 @@ class Envelope:
     # ---- reconciliation
 
     def reconcile(self, scope: str, key_usage: float) -> float:
-        """Record a successful reading of the key's usage; returns the excess (0 when it reconciles)."""
-        if not _money(key_usage):
+        """Record a successful reading of the key's usage; returns the excess (0 when it reconciles).
+        A reading below the last one (or, first, below the opening usage) faults the scope."""
+        if not _reading(key_usage):
             raise Refused(f"key usage {key_usage!r} is not a reading")
 
         def change(s):
             if scope not in s["scopes"]:
                 raise Refused(f"no scope {scope}")
             entry = s["scopes"][scope]
+            previous = entry["opening_usage"] if entry["snapshot"] is None else entry["snapshot"]["usage"]
+            if key_usage < previous - _EPSILON and entry["fault"] is None:
+                entry["fault"] = (f"usage fell from {previous:.4f} to {key_usage:.4f} (a top-up, refund or "
+                                  "expired grant): a top-up can mask an overrun")
             accounted = _settled(s, scope) + _unresolved(s, scope)
             excess = max(0.0, key_usage - entry["opening_usage"] - accounted)
             entry["snapshot"] = {"usage": key_usage, "at": self._now()}
             entry["excess"] = excess if excess > _EPSILON else 0.0
             return entry["excess"]
         return self._transition(change)
+
+    def clear_fault(self, scope: str) -> None:
+        """The operator's release of a faulted scope, after checking the account's billing."""
+        def change(s):
+            if scope not in s["scopes"]:
+                raise Refused(f"no scope {scope}")
+            s["scopes"][scope]["fault"] = None
+        self._transition(change)
 
     # ---- jobs
 
@@ -296,6 +319,8 @@ class Envelope:
                 s["requests"][request] = {"route": route, "scope": r["scope"], "bound": r["max_charge"], "job": job,
                                           "attempt": attempt, "state": "unresolved", "billed": None,
                                           "billing_id": None, "ambiguous": False, "captured": False,
+                                          "metered": None, "metered_invalid": None, "protocol_complete": False,
+                                          "served": [],
                                           "upstream": copy.deepcopy(r["upstream"]), "admitted_at": self._now()}
                 try:
                     _require_reservations_fit(s)  # the request must not eat into another job's hold
@@ -321,13 +346,36 @@ class Envelope:
                 entry["billing_id"], entry["ambiguous"] = None, True
         self._transition(change)
 
+    def record_reading(self, request: str, *, metered: float | None = None, invalid: str | None = None,
+                       served: str | None = None, complete: bool = False) -> None:
+        """What one response event said: a priced usage figure (a second, different one makes the usage
+        unusable), an unusable usage block (sticky), the model that served it, the protocol's end."""
+        if metered is not None and not _money(metered):
+            raise Refused(f"metered {metered!r} is not a charge")
+
+        def change(s):
+            entry = s["requests"][request]
+            if invalid is not None and entry["metered_invalid"] is None:
+                entry["metered_invalid"] = invalid
+            if metered is not None:
+                if entry["metered"] is None:
+                    entry["metered"] = metered
+                elif abs(entry["metered"] - metered) > _EPSILON and entry["metered_invalid"] is None:
+                    entry["metered_invalid"] = "two different usage figures"
+            if served is not None and served not in entry["served"]:
+                entry["served"].append(served)
+            if complete:
+                entry["protocol_complete"] = True
+        self._transition(change)
+
     def capture_complete(self, request: str) -> None:
         """The response has ended: its billing id, if any, is final, and settlement may look it up."""
         def change(s):
             s["requests"][request]["captured"] = True
         self._transition(change)
 
-    def settle_looked_up(self, request: str, billing_id: str, billed: float | None) -> bool:
+    def settle_looked_up(self, request: str, billing_id: str, billed: float | None,
+                         served: str | None = None) -> bool:
         """An automatic settlement: committed only if the request is still unresolved, its capture has
         ended, and `billing_id` is still its one unambiguous id. False (and nothing changed) otherwise."""
         def change(s):
@@ -335,6 +383,8 @@ class Envelope:
             if (entry is None or entry["state"] != "unresolved" or not entry["captured"] or entry["ambiguous"]
                     or entry["billing_id"] != billing_id):
                 return False
+            if served is not None and served not in entry["served"]:
+                entry["served"].append(served)
             return _settle(s, entry, billed)
         if billed is not None and not _money(billed):
             raise Refused(f"billed {billed!r} is not a charge")
@@ -378,7 +428,8 @@ class Envelope:
         """Unresolved requests with a billing id to look up; each keeps the upstream it was admitted under."""
         with self._mutex:
             return [PendingSettlement(rid, r["billing_id"], copy.deepcopy(r["upstream"]), r["scope"],
-                                      self._state["scopes"][r["scope"]]["fingerprint"])
+                                      self._state["scopes"][r["scope"]]["fingerprint"], r["metered"],
+                                      r["metered_invalid"], r["protocol_complete"])
                     for rid, r in self._state["requests"].items()
                     if r["state"] == "unresolved" and r["captured"] and r["billing_id"] and not r["ambiguous"]]
 
@@ -407,9 +458,12 @@ def summary(state: dict, now: float) -> dict:
         "unresolved_requests": sum(r["state"] == "unresolved" for r in state["requests"].values()),
         "open_reservations": {j: r["amount"] for j, r in state["reservations"].items() if r["open"]},
         "scopes": {k: {"allocation": v["allocation"], "settled": _settled(state, k), "excess": v["excess"],
+                       "fault": v["fault"],
                        "snapshot_age": None if v["snapshot"] is None else now - v["snapshot"]["at"]}
                    for k, v in state["scopes"].items()},
         "refusals": dict(state["refusals"]),
+        "served": {route: sorted({m for r in state["requests"].values() if r["route"] == route for m in r["served"]})
+                   for route in state["routes"]},
     }
 
 
@@ -462,10 +516,11 @@ def _check(s: dict) -> None:
         ensure(_money(s["envelope_usd"]) and s["envelope_usd"] > 0, "envelope amount")
         ensure(all(all(_money(f[k]) for k in ("credit", "fees", "taxes")) for f in s["funding"]), "funding")
         for name, scope in s["scopes"].items():
-            ensure(_money(scope["allocation"]) and _money(scope["opening_usage"]) and _money(scope["excess"])
-                   and isinstance(scope["fingerprint"], str) and scope["fingerprint"], f"scope {name}")
+            ensure(_money(scope["allocation"]) and _reading(scope["opening_usage"]) and _money(scope["excess"])
+                   and isinstance(scope["fingerprint"], str) and scope["fingerprint"]
+                   and (scope["fault"] is None or isinstance(scope["fault"], str)), f"scope {name}")
             snap = scope["snapshot"]
-            ensure(snap is None or (_money(snap["usage"]) and _money(snap["at"])), f"scope {name} snapshot")
+            ensure(snap is None or (_reading(snap["usage"]) and _money(snap["at"])), f"scope {name} snapshot")
         for name, route in s["routes"].items():
             ensure(route["scope"] in s["scopes"] and route["stage"] in STAGES and _money(route["max_charge"])
                    and route["max_charge"] > 0
@@ -480,7 +535,12 @@ def _check(s: dict) -> None:
                    and (r["billed"] is None or _money(r["billed"]))
                    and isinstance(r["job"], str) and isinstance(r["attempt"], str)
                    and isinstance(r["ambiguous"], bool) and (r["billing_id"] is None or isinstance(r["billing_id"], str))
-                   and (r["upstream"] is None or isinstance(r["upstream"], dict)), f"request {name}")
+                   and (r["upstream"] is None or isinstance(r["upstream"], dict))
+                   and (r["metered"] is None or _money(r["metered"]))
+                   and (r["metered_invalid"] is None or isinstance(r["metered_invalid"], str))
+                   and isinstance(r["protocol_complete"], bool)
+                   and isinstance(r["served"], list) and all(isinstance(v, str) for v in r["served"]),
+                   f"request {name}")
         ensure(all(_money(r["amount"]) and isinstance(r["open"], bool) and isinstance(r["terminated"], bool)
                    and _money(r["baseline"]) for r in s["reservations"].values()), "reservations")
         ensure(all(isinstance(v, str) for v in s["refusals"].values()), "refusals")
@@ -557,6 +617,8 @@ def _require_reservations_fit(s: dict) -> None:
 
 def _require_trusted(s: dict, now: float) -> None:
     for name, scope in s["scopes"].items():
+        if scope["fault"]:
+            raise Refused(f"scope {name} is faulted: {scope['fault']}")
         if scope["excess"] > 0:
             raise Refused(f"scope {name}: the provider billed ${scope['excess']:.4f} the ledger does not account for")
         if scope["snapshot"] is None or now - scope["snapshot"]["at"] > SNAPSHOT_SECONDS:
@@ -581,6 +643,8 @@ def _admission_problem(s: dict, route: str, job: str, attempt: str, now: float) 
             return f"the ${held['amount']:.2f} probe reservation is spent"
     scope, entry = r["scope"], s["scopes"][r["scope"]]
     for name, other in s["scopes"].items():  # an anomaly on any key stops all spending
+        if other["fault"]:
+            return f"scope {name} is faulted: {other['fault']}"
         if other["excess"] > 0:
             return f"scope {name}: the provider billed ${other['excess']:.4f} the ledger does not account for"
     if entry["snapshot"] is None or now - entry["snapshot"]["at"] > SNAPSHOT_SECONDS:

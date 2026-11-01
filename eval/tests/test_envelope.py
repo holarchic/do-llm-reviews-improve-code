@@ -380,6 +380,31 @@ class SpendCommandTest(Fixture):
         self.assertEqual(envelope.load(self.root / "B.json")["requests"]["q1"]["billed"], 0.3)
 
 
+class MeteredCommandTest(SpendCommandTest):
+    def test_a_deepseek_route_needs_its_priced_model_and_a_fault_is_cleared_by_hand(self):
+        self.assertEqual(self.spend("create", "--envelope", "B", "--usd", "150"), 0)
+        self.assertEqual(self.spend("fund", "--envelope", "B", "--credit", "10"), 0)
+        with self.owned() as env:
+            env.register_scope("ds", provider="deepseek", fingerprint="fp", opening_usage=-10.0, allocation=10.0,
+                               provider_limit=None)
+        policy = json.dumps({"paths": ["/responses"], "models": ["deepseek-flash"], "fields": ["model", "input"],
+                             "tool_types": [], "max_body_bytes": 1000})
+        route = ["route", "--envelope", "B", "--route", "ds--flash", "--scope", "ds", "--max-charge", "0.8",
+                 "--slots", "1", "--policy", policy, "--bootstrap", "1", "--upstream-base", "https://api.deepseek.com",
+                 "--settler", "deepseek"]
+        self.assertEqual(self.spend(*route), 2)  # no model: a metered route can't be priced
+        self.assertEqual(self.spend(*route, "--upstream-model", "deepseek-v4-pro"), 2)  # not the policy's model
+        self.assertEqual(self.spend(*route, "--upstream-model", "deepseek-flash"), 0)
+        self.assertEqual(envelope.load(self.root / "B.json")["routes"]["ds--flash"]["upstream"]["model"], "deepseek-flash")
+        self.assertEqual(self.spend("scope", "--envelope", "B", "--scope", "x", "--provider", "fireworks",
+                                    "--allocation", "1"), 2)
+        with self.owned() as env:
+            env.reconcile("ds", -11.0)  # a top-up
+        self.assertEqual(self.spend("clear-fault", "--envelope", "B"), 2)
+        self.assertEqual(self.spend("clear-fault", "--envelope", "B", "--scope", "ds"), 0)
+        self.assertIsNone(envelope.load(self.root / "B.json")["scopes"]["ds"]["fault"])
+
+
 class ReworkTest(Fixture):
     """Phase review round 1: holds, envelope-wide trust, invariants on load, immutability, closed owners."""
 

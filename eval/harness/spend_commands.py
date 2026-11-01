@@ -9,9 +9,9 @@ import json
 import time
 from dataclasses import dataclass
 
-from . import envelope, openrouter, providers, route_config, settlers
+from . import envelope, prices, providers, route_config, settlers
 
-ACTIONS = ("create", "fund", "scope", "allocate", "route", "validate-route", "status", "resolve")
+ACTIONS = ("create", "fund", "scope", "allocate", "route", "validate-route", "status", "resolve", "clear-fault")
 
 
 class Usage(Exception):
@@ -35,7 +35,8 @@ def add_arguments(parser) -> None:
     for flag in ("--usd", "--credit", "--fees", "--taxes", "--probe", "--allocation", "--provider-limit",
                  "--max-charge", "--bootstrap", "--billed"):
         parser.add_argument(flag, type=float)
-    for flag in ("--scope", "--provider", "--route", "--policy", "--upstream-base", "--settler", "--request"):
+    for flag in ("--scope", "--provider", "--route", "--policy", "--upstream-base", "--settler", "--upstream-model",
+                 "--request"):
         parser.add_argument(flag)
     parser.add_argument("--slots", type=int)
     parser.add_argument("--not-billed", action="store_true")
@@ -76,8 +77,8 @@ def _parse(args):
         raise Usage("needs --credit (with --fees and --taxes) or --probe")
     if action == "scope":
         _need(args, "scope", "provider", "allocation")
-        if args.provider != "openrouter":
-            raise Usage("only an openrouter scope can read its key's usage so far")
+        if args.provider not in providers.PROVIDERS:
+            raise Usage(f"--provider must be one of {', '.join(providers.PROVIDERS)}")
     if action == "allocate":
         _need(args, "scope", "allocation")
     if action == "route":
@@ -87,16 +88,27 @@ def _parse(args):
         except ValueError as exc:
             raise Usage(f"--policy is not JSON: {exc}") from None
         upstream = {"base_url": args.upstream_base, "settler": args.settler}
+        if args.upstream_model is not None:
+            upstream["model"] = args.upstream_model
         try:
-            route_config.parse_policy(policy)  # the proxy's own parsers: what it would refuse is never stored
+            parsed = route_config.parse_policy(policy)  # the proxy's own parsers: what it would refuse is never stored
             route_config.parse_upstream(upstream)
         except ValueError as exc:
             raise Usage(f"--policy or --upstream-base: {exc}") from None
         if args.settler not in settlers.NAMES:
             raise Usage(f"--settler must be one of {', '.join(settlers.NAMES)}")
+        if args.settler == "deepseek":  # metered: priced at its route's one model
+            if parsed.models != {args.upstream_model}:
+                raise Usage("a metered route needs --upstream-model, the policy's one permitted model")
+            try:
+                prices.lookup(prices.DEEPSEEK, args.upstream_model)
+            except prices.UnpricedModel as exc:
+                raise Usage(str(exc)) from None
         return RouteCommand(args.route, args.scope, args.max_charge, args.slots, policy, args.bootstrap, upstream)
     if action == "validate-route":
         _need(args, "route")
+    if action == "clear-fault":
+        _need(args, "scope")
     if action == "resolve":
         _need(args, "request")
         if args.not_billed == (args.billed is not None):
@@ -112,8 +124,8 @@ def _apply(env: envelope.Envelope, args, command) -> None:
         else:
             env.fund(credit=args.credit, fees=args.fees or 0.0, taxes=args.taxes or 0.0)
     elif action == "scope":
-        key = providers.api_key(providers.OPENROUTER)
-        opening = settlers.OpenRouterSettler(openrouter.API_BASE_URL, key).key_usage()
+        key = providers.api_key(args.provider)
+        opening = settlers.opening_usage(args.provider, key)
         env.register_scope(args.scope, provider=args.provider, fingerprint=envelope.fingerprint(key),
                            opening_usage=opening, allocation=args.allocation, provider_limit=args.provider_limit)
     elif action == "allocate":
@@ -123,6 +135,8 @@ def _apply(env: envelope.Envelope, args, command) -> None:
                       policy=command.policy, bootstrap_build_usd=command.bootstrap, upstream=command.upstream)
     elif action == "validate-route":
         env.validate_route(args.route)
+    elif action == "clear-fault":
+        env.clear_fault(args.scope)
     elif action == "resolve":
         if not env.settle(args.request, None if args.not_billed else args.billed):
             raise envelope.Refused(f"{args.request} was already settled")

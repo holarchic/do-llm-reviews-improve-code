@@ -12,7 +12,9 @@ job and attempt it belongs to. For each request, in order:
    settler's fixed paths) as the bytes stream back as they came;
 4. the request stays unresolved until its settler reports the billed charge or that nothing was
    billed. A failed lookup, a 404, an error inside a started stream, no billing id, or two
-   different ones all keep its worst case counted.
+   different ones all keep its worst case counted. A metered route's charge is the usage its
+   response reported, recorded event by event on the request; one whose response never completed
+   with valid usage stays at its worst case.
 
 Shutdown refuses new requests, drains the handlers in flight and the settlement and
 reconciliation workers, and only then lets the envelope's owner close; anything a straggler tries
@@ -150,10 +152,10 @@ class Proxy:
             except settlers_mod.NoSettler as exc:  # it stays counted at its admitted bound
                 self._warn(f"request {pending.request}: no settler: {exc}")
                 continue
-            outcome = settler.settle(pending.billing_id)
+            outcome = settler.settle(pending)
             # Committed only if the request still has exactly this id: the envelope checks it atomically.
             if isinstance(outcome, settlers_mod.Billed):
-                self.env.settle_looked_up(pending.request, pending.billing_id, outcome.usd)
+                self.env.settle_looked_up(pending.request, pending.billing_id, outcome.usd, served=outcome.served)
             elif isinstance(outcome, settlers_mod.NotBilled):
                 self.env.settle_looked_up(pending.request, pending.billing_id, None)
 
@@ -261,7 +263,8 @@ class Proxy:
         target = urllib.parse.urlsplit(route_config.parse_upstream(route.upstream).base_url + rest)
         connection_type = http.client.HTTPSConnection if target.scheme == "https" else http.client.HTTPConnection
         connection = connection_type(target.netloc, timeout=600)
-        reader = _BillingReader(settler, lambda gen: self.env.record_billing_id(request_id, gen))
+        reader = _BillingReader(settler, lambda gen: self.env.record_billing_id(request_id, gen),
+                                lambda reading: self.env.record_reading(request_id, **_fields(reading)))
         try:
             sent = {k.lower() for k in handler.headers.keys()}
             headers = {k: v for k, v in handler.headers.items()
@@ -299,10 +302,11 @@ class Proxy:
 
 class _BillingReader:
     """Parses a response as it streams (SSE `data:` events, or a whole JSON body) and reports each
-    billing id the settler finds at its fixed paths; the envelope makes two different ones ambiguous."""
+    billing id the settler finds at its fixed paths (the envelope makes two different ones
+    ambiguous), and each event's reading for a metered route."""
 
-    def __init__(self, settler: settlers_mod.Settler, report):
-        self.settler, self.report = settler, report
+    def __init__(self, settler: settlers_mod.Settler, report, report_reading):
+        self.settler, self.report, self.report_reading = settler, report, report_reading
         self.content_type, self._line, self._body, self._seen = "", b"", b"", set()
 
     def feed(self, chunk: bytes) -> None:
@@ -332,6 +336,16 @@ class _BillingReader:
             if gen and gen not in self._seen:
                 self._seen.add(gen)
                 self.report(gen)
+            reading = self.settler.read(event)
+            if not reading.empty:
+                self.report_reading(reading)
+
+
+def _fields(reading: settlers_mod.EventReading) -> dict:
+    metered = reading.metered
+    return {"metered": metered.usd if isinstance(metered, settlers_mod.Usage) else None,
+            "invalid": metered.reason if isinstance(metered, settlers_mod.Invalid) else None,
+            "served": reading.served, "complete": reading.complete}
 
 
 def _credential(headers) -> str | None:

@@ -83,14 +83,15 @@ class FakeSettler(settlers.Settler):
     def billing_id(self, event):
         return settlers.OpenRouterSettler("x", "k").billing_id(event)
 
-    def settle(self, billing_id):
+    def settle(self, pending):
+        billing_id = pending.billing_id
         if self.blocker is not None:
             self.blocker.wait()
         if self.provider.lookup == "error":
             raise OSError("HTTP 404 from the billing lookup")
         if self.provider.lookup == "pending":
             return settlers.Pending("not yet")
-        return settlers.Billed(self.provider.billed[billing_id])
+        return settlers.Billed(self.provider.billed[billing_id], getattr(self, "served", None))
 
     def key_usage(self):
         return self.opening + max(0.0, self.provider.usage - self.provider.visible_lag)
@@ -161,6 +162,14 @@ class ForwardingTest(Fixture):
         self.assertEqual((request["billing_id"], request["state"]), ("gen-1", "unresolved"))
         served.settle_now()
         self.assertAlmostEqual(envelope.summary(self.env.state, 0)["settled"], self.provider.billed["gen-1"])
+
+    def test_the_provider_that_served_a_billed_request_is_recorded(self):
+        served = self.start()
+        self.post(served.session("job", "a1")["r"])
+        self.settler.served = "Z.AI"
+        served.settle_now()
+        self.assertEqual(self.requests()[0]["served"], ["Z.AI"])
+        self.assertEqual(envelope.summary(self.env.state, 0)["served"], {"r": ["Z.AI"]})
 
     def test_the_billing_id_is_read_at_fixed_paths_and_two_ids_make_it_ambiguous(self):
         served = self.start()
@@ -516,6 +525,10 @@ def _swallow(work):
         pass
 
 
+def pending(billing_id, **kw):
+    return envelope.PendingSettlement("q", billing_id, None, "or", "fp", **kw)
+
+
 class OpenRouterSettlerTest(unittest.TestCase):
     def setUp(self):
         self.responses = {}
@@ -543,9 +556,11 @@ class OpenRouterSettlerTest(unittest.TestCase):
         self.responses["/api/v1/generation?id=gen-1"] = (200, {"data": {"total_cost": 0.0123}})
         self.responses["/api/v1/generation?id=gen-3"] = (500, {"error": "down"})
         self.responses["/api/v1/generation?id=gen-4"] = (200, {"data": {"total_cost": None}})
-        self.assertEqual(self.settler.settle("gen-1"), settlers.Billed(0.0123))
+        self.responses["/api/v1/generation?id=gen-5"] = (200, {"data": {"total_cost": 0.5, "provider_name": "Z.AI"}})
+        self.assertEqual(self.settler.settle(pending("gen-1")), settlers.Billed(0.0123))  # served unknown, not guessed
+        self.assertEqual(self.settler.settle(pending("gen-5")), settlers.Billed(0.5, "Z.AI"))
         for missing in ("gen-2", "gen-3", "gen-4"):
-            self.assertIsInstance(self.settler.settle(missing), settlers.Pending)
+            self.assertIsInstance(self.settler.settle(pending(missing)), settlers.Pending)
 
     def test_key_usage_reads_or_raises(self):
         self.responses["/api/v1/key"] = (200, {"data": {"usage": 4.5}})

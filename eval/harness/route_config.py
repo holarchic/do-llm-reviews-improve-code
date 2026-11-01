@@ -43,6 +43,7 @@ class Policy:
 class Upstream:
     base_url: str
     settler: str
+    model: str | None = None  # a metered settler's price-table model
 
 
 def parse_policy(raw) -> Policy:
@@ -74,7 +75,10 @@ def parse_upstream(raw) -> Upstream:
         raise ValueError(f"upstream base_url {raw['base_url']!r} is not an http(s) base URL")
     if not raw["settler"]:
         raise ValueError("an upstream names its settler")
-    return Upstream(raw["base_url"].rstrip("/"), raw["settler"])
+    model = raw.get("model")
+    if model is not None and (not isinstance(model, str) or not model):
+        raise ValueError("an upstream's model is a non-empty string")
+    return Upstream(raw["base_url"].rstrip("/"), raw["settler"], model)
 
 
 def request_problem(policy: Policy, path: str, body: bytes) -> str | None:
