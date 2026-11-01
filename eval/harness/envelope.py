@@ -1,0 +1,424 @@
+"""The spend envelope: one authoritative ledger per budget, bounding final billed liability.
+
+Every experiment and preparation step drawing on a budget names its envelope, so probes,
+calibration and retries sit inside the same cumulative bound. The guarantee, in parts:
+- envelope: funded credit + purchase fees + taxes + Σ_routes(slots × max_charge) ≤ envelope;
+- per request, per billing scope (a provider key): settled + Σ(unresolved, each at the bound it
+  was admitted under) + the candidate's bound ≤ the scope's allocation, the allocations together
+  never exceeding funded credit; so provider usage stays within funded credit whatever the
+  provider's own balance says;
+- reconciliation, one-sided: a key billed beyond settled + unresolved bounds refuses everything;
+  usage below settled is reporting lag, already counted in full by admission.
+
+One process owns an envelope at a time (an exclusive flock held for its lifetime); every
+transition is check, modify a copy, persist with an atomic replace, then swap in, under one mutex,
+so a crash or a failed write leaves the last persisted state and never a half-recorded charge.
+Lock order is the envelope's own lock, then the registry lock. State that can't be read or doesn't
+check out refuses everything.
+"""
+
+import copy
+import fcntl
+import json
+import math
+import os
+import threading
+import time
+from contextlib import contextmanager
+from pathlib import Path
+
+DEFAULT_ROOT = Path(__file__).resolve().parents[1] / "data" / "envelopes"
+SNAPSHOT_SECONDS = 600
+RESERVE_FACTOR = 1.5
+PROBE = "probe"  # the job id of a probe reservation
+STAGES = ("probe", "validated")
+_EPSILON = 1e-9
+
+
+class Refused(Exception):
+    """A request, job or funding entry the bound does not admit."""
+
+
+class EnvelopeError(Exception):
+    """An envelope that can't be owned, read or trusted; nothing is admitted."""
+
+
+def _money(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+
+
+class Envelope:
+    """The owner's handle: `with Envelope.owned(name) as env:`; every method is one transition."""
+
+    def __init__(self, path: Path, state: dict, lock_file, now):
+        self.path, self._state, self._lock_file, self._now = path, state, lock_file, now
+        self._mutex = threading.Lock()
+
+    # ---- ownership and persistence
+
+    @classmethod
+    @contextmanager
+    def owned(cls, name: str, *, root: Path = DEFAULT_ROOT, create_usd: float | None = None, now=time.time):
+        root.mkdir(parents=True, exist_ok=True)
+        lock_file = open(root / f"{name}.lock", "a")
+        try:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise EnvelopeError(f"envelope {name} is owned by another process") from None
+            path = root / f"{name}.json"
+            if not path.exists():
+                if create_usd is None:
+                    raise EnvelopeError(f"no envelope {name}")
+                if not _money(create_usd) or create_usd <= 0:
+                    raise EnvelopeError(f"envelope must be a positive amount, not {create_usd!r}")
+                _write(path, _empty(name, create_usd))
+            envelope = cls(path, load(path), lock_file, now)
+            yield envelope
+        finally:
+            lock_file.close()  # releases the flock
+
+    def _transition(self, change) -> object:
+        """Apply `change` to a copy, persist it, then swap it in: the persisted file is always whole."""
+        with self._mutex:
+            draft = copy.deepcopy(self._state)
+            result = change(draft)
+            _check(draft)
+            _write(self.path, draft)
+            self._state = draft
+            return result
+
+    @property
+    def state(self) -> dict:
+        with self._mutex:
+            return copy.deepcopy(self._state)
+
+    # ---- funding, scopes and routes
+
+    def fund(self, credit: float = 0.0, fees: float = 0.0, taxes: float = 0.0) -> None:
+        if not all(_money(v) for v in (credit, fees, taxes)):
+            raise Refused("funding amounts must be non-negative numbers")
+
+        def change(s):
+            s["funding"].append({"credit": credit, "fees": fees, "taxes": taxes, "at": self._now()})
+            _require_bound(s)
+        self._transition(change)
+
+    def fund_probe(self, usd: float) -> None:
+        """Extend the probe reservation, which probe-stage requests draw on."""
+        if not _money(usd) or usd <= 0:
+            raise Refused("a probe reservation must be positive")
+
+        def change(s):
+            held = s["reservations"].setdefault(PROBE, {"amount": 0.0, "open": True})
+            held["amount"] += usd
+            held["open"] = True
+            _require_reservations_fit(s)
+        self._transition(change)
+
+    def register_scope(self, scope: str, *, provider: str, fingerprint: str, opening_usage: float,
+                       allocation: float, provider_limit: float | None) -> None:
+        if not (_money(opening_usage) and _money(allocation)) or not fingerprint:
+            raise Refused("a scope needs a fingerprint, an opening usage and an allocation")
+        registry = open(self.path.parent / "registry.lock", "a")
+        try:
+            fcntl.flock(registry, fcntl.LOCK_EX)  # serialises the scan with the commit, across envelopes
+            for other in sorted(self.path.parent.glob("*.json")):
+                if other == self.path:
+                    continue
+                if any(s["fingerprint"] == fingerprint for s in load(other)["scopes"].values()):
+                    raise Refused(f"that key belongs to envelope {other.stem}")
+
+            def change(s):
+                if any(v["fingerprint"] == fingerprint for k, v in s["scopes"].items() if k != scope):
+                    raise Refused("that key already has a scope in this envelope")
+                s["scopes"][scope] = {"provider": provider, "fingerprint": fingerprint, "opening_usage": opening_usage,
+                                      "allocation": allocation, "provider_limit": provider_limit,
+                                      "snapshot": None, "excess": 0.0}
+                _require_allocations(s)
+            self._transition(change)
+        finally:
+            registry.close()
+
+    def set_route(self, route: str, *, scope: str, max_charge: float, slots: int, policy: dict,
+                  bootstrap_build_usd: float) -> None:
+        if not (_money(max_charge) and max_charge > 0 and isinstance(slots, int) and not isinstance(slots, bool)
+                and slots >= 1 and _money(bootstrap_build_usd) and isinstance(policy, dict)):
+            raise Refused("a route needs a positive max charge, at least one slot, a policy and a bootstrap cost")
+
+        def change(s):
+            if scope not in s["scopes"]:
+                raise Refused(f"no scope {scope}")
+            stage = s["routes"].get(route, {}).get("stage", "probe")
+            s["routes"][route] = {"scope": scope, "max_charge": max_charge, "slots": slots, "policy": policy,
+                                  "bootstrap_build_usd": bootstrap_build_usd, "stage": stage}
+            _require_bound(s)
+        self._transition(change)
+
+    def validate_route(self, route: str) -> None:
+        def change(s):
+            if route not in s["routes"]:
+                raise Refused(f"no route {route}")
+            s["routes"][route]["stage"] = "validated"
+        self._transition(change)
+
+    # ---- reconciliation
+
+    def reconcile(self, scope: str, key_usage: float) -> float:
+        """Record a successful reading of the key's usage; returns the excess (0 when it reconciles)."""
+        if not _money(key_usage):
+            raise Refused(f"key usage {key_usage!r} is not a reading")
+
+        def change(s):
+            if scope not in s["scopes"]:
+                raise Refused(f"no scope {scope}")
+            entry = s["scopes"][scope]
+            accounted = _settled(s, scope) + _unresolved(s, scope)
+            excess = max(0.0, key_usage - entry["opening_usage"] - accounted)
+            entry["snapshot"] = {"usage": key_usage, "at": self._now()}
+            entry["excess"] = excess if excess > _EPSILON else 0.0
+            return entry["excess"]
+        return self._transition(change)
+
+    # ---- jobs
+
+    def reserve(self, job: str, amount: float) -> None:
+        if not _money(amount) or amount <= 0 or job == PROBE:
+            raise Refused("a reservation is a positive amount for a job")
+
+        def change(s):
+            _require_trusted(s, self._now())
+            held = s["reservations"].get(job)
+            if held is not None and held["open"]:
+                return  # a resumed job keeps the reservation it holds
+            s["reservations"][job] = {"amount": amount, "open": True}
+            _require_reservations_fit(s)
+        self._transition(change)
+
+    def release(self, job: str) -> bool:
+        """Release a terminated job's reservation; False while any of its requests is unresolved."""
+        def change(s):
+            if any(r["job"] == job and r["state"] == "unresolved" for r in s["requests"].values()):
+                return False
+            if job in s["reservations"]:
+                s["reservations"][job]["open"] = False
+            return True
+        return self._transition(change)
+
+    # ---- requests
+
+    def admit(self, request: str, route: str, *, job: str, attempt: str) -> float:
+        """Admit one request, or record a refusal against its attempt and raise Refused."""
+        def change(s):
+            if request in s["requests"]:
+                raise Refused(f"request {request} was already admitted")
+            reason = _admission_problem(s, route, job, attempt, self._now())
+            if reason:
+                s["refusals"][attempt] = reason
+                return reason
+            r = s["routes"][route]
+            s["requests"][request] = {"route": route, "scope": r["scope"], "bound": r["max_charge"], "job": job,
+                                      "attempt": attempt, "state": "unresolved", "billed": None, "billing_id": None,
+                                      "admitted_at": self._now()}
+            return None
+        reason = self._transition(change)
+        if reason:
+            raise Refused(reason)
+        return self._state["requests"][request]["bound"]
+
+    def record_billing_id(self, request: str, billing_id: str) -> None:
+        def change(s):
+            if s["requests"][request]["billing_id"] is None:
+                s["requests"][request]["billing_id"] = billing_id
+        self._transition(change)
+
+    def settle(self, request: str, billed: float | None) -> bool:
+        """The provider's billed charge (None: not billed). Idempotent: a settled request stays as it was."""
+        if billed is not None and not _money(billed):
+            raise Refused(f"billed {billed!r} is not a charge")
+
+        def change(s):
+            entry = s["requests"].get(request)
+            if entry is None:
+                raise Refused(f"no request {request}")
+            if entry["state"] != "unresolved":
+                return False
+            entry["state"], entry["billed"] = ("billed", billed) if billed is not None else ("not_billed", 0.0)
+            return True
+        return self._transition(change)
+
+    def refusal(self, attempt: str) -> str | None:
+        with self._mutex:
+            return self._state["refusals"].get(attempt)
+
+
+# ---- reading and checking state
+
+
+def load(path: Path) -> dict:
+    """An envelope's state, read without ownership (status); unreadable or inconsistent state raises."""
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise EnvelopeError(f"{path.name} unreadable: {exc!r}") from None
+    _check(state)
+    return state
+
+
+def summary(state: dict, now: float) -> dict:
+    return {
+        "envelope": state["envelope_usd"], "funded_credit": _funded(state), "fees_and_taxes": _purchase_costs(state),
+        "overdraw": _overdraw(state), "settled": _settled(state), "unresolved": _unresolved(state),
+        "unresolved_requests": sum(r["state"] == "unresolved" for r in state["requests"].values()),
+        "open_reservations": {j: r["amount"] for j, r in state["reservations"].items() if r["open"]},
+        "scopes": {k: {"allocation": v["allocation"], "settled": _settled(state, k), "excess": v["excess"],
+                       "snapshot_age": None if v["snapshot"] is None else now - v["snapshot"]["at"]}
+                   for k, v in state["scopes"].items()},
+        "refusals": dict(state["refusals"]),
+    }
+
+
+def job_estimate(build_highs: list[float], bootstrap_build_usd: float, unknown: bool = False) -> float:
+    """What a job reserves: RESERVE_FACTOR × the dearest calibration build's upper cost, or the route's
+    bootstrap cost when there is none (or when a calibration build's spend is partly unknown)."""
+    base = max(build_highs) if build_highs else bootstrap_build_usd
+    if unknown:
+        base = max(base, bootstrap_build_usd)
+    return RESERVE_FACTOR * base
+
+
+def _empty(name: str, envelope_usd: float) -> dict:
+    return {"name": name, "envelope_usd": envelope_usd, "funding": [], "scopes": {}, "routes": {},
+            "requests": {}, "reservations": {}, "refusals": {}}
+
+
+def _write(path: Path, state: dict) -> None:
+    tmp = path.with_suffix(".json.partial")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(state, indent=1, sort_keys=True))
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+def _check(s: dict) -> None:
+    """Explicit checks, not asserts: `python -O` would strip those and trust a corrupt ledger."""
+    def ensure(ok, what: str) -> None:
+        if not ok:
+            raise EnvelopeError(f"envelope state does not check out: {what}")
+    try:
+        ensure(isinstance(s, dict) and set(s) == {"name", "envelope_usd", "funding", "scopes", "routes", "requests",
+                                                  "reservations", "refusals"}, "top-level fields")
+        ensure(_money(s["envelope_usd"]) and s["envelope_usd"] > 0, "envelope amount")
+        ensure(all(all(_money(f[k]) for k in ("credit", "fees", "taxes")) for f in s["funding"]), "funding")
+        for name, scope in s["scopes"].items():
+            ensure(_money(scope["allocation"]) and _money(scope["opening_usage"]) and _money(scope["excess"])
+                   and isinstance(scope["fingerprint"], str) and scope["fingerprint"], f"scope {name}")
+            snap = scope["snapshot"]
+            ensure(snap is None or (_money(snap["usage"]) and _money(snap["at"])), f"scope {name} snapshot")
+        for name, route in s["routes"].items():
+            ensure(route["scope"] in s["scopes"] and route["stage"] in STAGES and _money(route["max_charge"])
+                   and isinstance(route["slots"], int) and not isinstance(route["slots"], bool) and route["slots"] >= 1
+                   and isinstance(route["policy"], dict), f"route {name}")
+        for name, r in s["requests"].items():
+            ensure(r["scope"] in s["scopes"] and _money(r["bound"])
+                   and r["state"] in ("unresolved", "billed", "not_billed")
+                   and (r["billed"] is None) == (r["state"] == "unresolved")
+                   and (r["billed"] is None or _money(r["billed"]))
+                   and isinstance(r["job"], str) and isinstance(r["attempt"], str), f"request {name}")
+        ensure(all(_money(r["amount"]) and isinstance(r["open"], bool) for r in s["reservations"].values()),
+               "reservations")
+        ensure(all(isinstance(v, str) for v in s["refusals"].values()), "refusals")
+    except (KeyError, TypeError, AttributeError) as exc:
+        raise EnvelopeError(f"envelope state does not check out: {exc!r}") from None
+
+
+def _funded(s: dict) -> float:
+    return sum(f["credit"] for f in s["funding"])
+
+
+def _purchase_costs(s: dict) -> float:
+    return sum(f["fees"] + f["taxes"] for f in s["funding"])
+
+
+def _overdraw(s: dict) -> float:
+    return sum(r["slots"] * r["max_charge"] for r in s["routes"].values())
+
+
+def _settled(s: dict, scope: str | None = None) -> float:
+    return sum(r["billed"] for r in s["requests"].values()
+               if r["state"] != "unresolved" and (scope is None or r["scope"] == scope))
+
+
+def _unresolved(s: dict, scope: str | None = None) -> float:
+    return sum(r["bound"] for r in s["requests"].values()
+               if r["state"] == "unresolved" and (scope is None or r["scope"] == scope))
+
+
+def _require_bound(s: dict) -> None:
+    total = _funded(s) + _purchase_costs(s) + _overdraw(s)
+    if total > s["envelope_usd"] + _EPSILON:
+        raise Refused(f"funded credit + fees + taxes + maximum overdraw ${total:.2f} exceeds the "
+                      f"${s['envelope_usd']:.2f} envelope")
+
+
+def _require_allocations(s: dict) -> None:
+    allocated = sum(v["allocation"] for v in s["scopes"].values())
+    if allocated > _funded(s) + _EPSILON:
+        raise Refused(f"scope allocations ${allocated:.2f} exceed funded credit ${_funded(s):.2f}")
+
+
+def _require_reservations_fit(s: dict) -> None:
+    """Open reservations are full holds: each counts at the larger of its amount and its job's spend."""
+    open_jobs = {j for j, r in s["reservations"].items() if r["open"]}
+    spent_by = {j: 0.0 for j in open_jobs}
+    outside = 0.0
+    for r in s["requests"].values():
+        charge = r["bound"] if r["state"] == "unresolved" else r["billed"]
+        if r["job"] in spent_by:
+            spent_by[r["job"]] += charge
+        else:
+            outside += charge
+    held = sum(max(s["reservations"][j]["amount"], spent_by[j]) for j in open_jobs)
+    if outside + held > _funded(s) + _EPSILON:
+        raise Refused(f"reservations ${held:.2f} and other spend ${outside:.2f} exceed funded credit "
+                      f"${_funded(s):.2f}")
+
+
+def _require_trusted(s: dict, now: float) -> None:
+    for name, scope in s["scopes"].items():
+        if scope["excess"] > 0:
+            raise Refused(f"scope {name}: the provider billed ${scope['excess']:.4f} the ledger does not account for")
+        if scope["snapshot"] is None or now - scope["snapshot"]["at"] > SNAPSHOT_SECONDS:
+            raise Refused(f"scope {name}: no reconciliation in the last {SNAPSHOT_SECONDS} s")
+
+
+def _admission_problem(s: dict, route: str, job: str, attempt: str, now: float) -> str | None:
+    if attempt in s["refusals"]:
+        return f"attempt already refused: {s['refusals'][attempt]}"
+    r = s["routes"].get(route)
+    if r is None:
+        return f"no route {route}"
+    held = s["reservations"].get(job)
+    if held is None or not held["open"]:
+        return f"job {job} holds no open reservation"
+    if r["stage"] == "probe" and job != PROBE:
+        return f"route {route} is not validated; only probes may use it"
+    if job == PROBE:
+        spent = sum(q["bound"] if q["state"] == "unresolved" else q["billed"]
+                    for q in s["requests"].values() if q["job"] == PROBE)
+        if spent + r["max_charge"] > held["amount"] + _EPSILON:
+            return f"the ${held['amount']:.2f} probe reservation is spent"
+    scope, entry = r["scope"], s["scopes"][r["scope"]]
+    if entry["excess"] > 0:
+        return f"scope {scope}: the provider billed ${entry['excess']:.4f} the ledger does not account for"
+    if entry["snapshot"] is None or now - entry["snapshot"]["at"] > SNAPSHOT_SECONDS:
+        return f"scope {scope}: no reconciliation in the last {SNAPSHOT_SECONDS} s"
+    if sum(q["route"] == route and q["state"] == "unresolved" for q in s["requests"].values()) >= r["slots"]:
+        return f"route {route}: all {r['slots']} slots hold unresolved requests"
+    exposure = _settled(s, scope) + _unresolved(s, scope) + r["max_charge"]
+    if exposure > entry["allocation"] + _EPSILON:
+        return f"scope {scope}: ${exposure:.4f} with this request exceeds its ${entry['allocation']:.2f} allocation"
+    if _settled(s) + _unresolved(s) + r["max_charge"] > _funded(s) + _EPSILON:
+        return "the request would exceed funded credit"
+    return None
