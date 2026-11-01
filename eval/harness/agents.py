@@ -188,11 +188,11 @@ def run_codex(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path, p
             proc = procs.run(argv, cwd=cwd, timeout=TIMEOUT_SECONDS[role], stdout_path=inner["transcript.jsonl"],
                              stderr_path=inner["stderr.log"], env={**env, **proxy.env()} if proxy else env,
                              stdin_path=prompt_path)
-        captured = rollout_usage(codex_home)
         shutil.copy2(codex_home / "config.toml", out_dir / "codex-config.toml")
         for name, path in inner.items():
             if path.exists():
                 shutil.copy2(path, out_dir / name)
+        captured = rollout_usage(codex_home)  # after the session's own files are safe
     finally:
         shutil.rmtree(codex_home, ignore_errors=True)
     session = classify_codex(transcript, final_path, proc, role, model)
@@ -205,18 +205,23 @@ def rollout_usage(codex_home: Path) -> dict:
     """Each request's token counts and the first and last rate-limit snapshots from the session's rollout.
 
     The rate limits are the account's, so concurrent sessions and window resets show in them: a
-    snapshot, not this session's quota burn."""
+    snapshot, not this session's quota burn. Capture is optional: a rollout that can't be read
+    leaves the session's totals, which the ledger then prices as such, and says why."""
     requests, limits = [], []
-    for rollout in sorted((codex_home / "sessions").rglob("rollout-*.jsonl")):
-        for event in _events(rollout):
-            payload = event.get("payload")
-            if event.get("type") != "event_msg" or not isinstance(payload, dict) or payload.get("type") != "token_count":
-                continue
-            last = (payload.get("info") or {}).get("last_token_usage")
-            if isinstance(last, dict):
-                requests.append(last)
-            if isinstance(payload.get("rate_limits"), dict):
-                limits.append(payload["rate_limits"])
+    try:
+        for rollout in sorted((codex_home / "sessions").rglob("rollout-*.jsonl")):
+            for event in _events(rollout):
+                payload = event.get("payload")
+                if (event.get("type") != "event_msg" or not isinstance(payload, dict)
+                        or payload.get("type") != "token_count"):
+                    continue
+                info = payload.get("info")
+                if isinstance(info, dict) and isinstance(info.get("last_token_usage"), dict):
+                    requests.append(info["last_token_usage"])
+                if isinstance(payload.get("rate_limits"), dict):
+                    limits.append(payload["rate_limits"])
+    except OSError as exc:
+        return {"capture_error": f"rollout unreadable: {exc!r}"}
     captured = {"requests": requests} if requests else {}
     if limits:
         captured["rate_limits"] = {"first": limits[0], "last": limits[-1]}

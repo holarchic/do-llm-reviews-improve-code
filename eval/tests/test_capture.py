@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from eval.harness import agents, ledger, records
+from eval.harness import agents, ledger, prices, records
 
 
 def token_count(last: dict | None, limits: dict | None = None) -> dict:
@@ -39,6 +39,14 @@ class CaptureTest(unittest.TestCase):
         self.assertEqual(captured["requests"], [request(100, 50, 10), request(300, 200, 20)])
         self.assertEqual(captured["rate_limits"], {"first": first, "last": last})
 
+    def test_a_malformed_or_unreadable_rollout_never_raises(self):
+        rollout = self.write(self.tmp / "home" / "sessions" / "rollout-y.jsonl",
+                             {"type": "event_msg", "payload": {"type": "token_count", "info": "oops"}})
+        self.assertEqual(agents.rollout_usage(self.tmp / "home"), {})
+        rollout.chmod(0)
+        self.addCleanup(rollout.chmod, 0o600)
+        self.assertIn("capture_error", agents.rollout_usage(self.tmp / "home"))
+
     def test_a_home_without_a_rollout_captures_nothing(self):
         self.assertEqual(agents.rollout_usage(self.tmp / "empty-home"), {})
 
@@ -46,8 +54,8 @@ class CaptureTest(unittest.TestCase):
         totals = request(400, 250, 30)
         totals.pop("total_tokens")
         usage = {**totals, "requests": [request(100, 50, 10), request(300, 200, 20)]}
-        cost = ledger.attempt_cost("correctness-review-1", {"usage": usage}, agents.Agent("codex", "gpt-6.1-sol"),
-                                   self.tmp)
+        cost = ledger.attempt_cost("correctness-review-1", {"usage": usage},
+                                   ledger.Seat("codex", prices.OPENAI, "gpt-6.1-sol"), self.tmp)
         self.assertEqual(cost.basis, ledger.PER_REQUEST)
 
     def test_claude_keeps_the_last_cumulative_model_usage(self):
@@ -69,6 +77,7 @@ class CaptureTest(unittest.TestCase):
             return [{"name": "build", "attempts": [{"seconds": 1.0, "usage": usage}]}]
         self.assertTrue(records._valid_steps(steps({"input_tokens": 1, "requests": [request(1, 0, 1)]})))
         for bad in ({"requests": []}, {"requests": [{"input_tokens": -1}]}, {"requests": ["x"]},
+                    {"requests": [{"input_tokens": 1.5}]},
                     {"by_model": {}}, {"by_model": {"m": 3}}, {"rate_limits": []}):
             with self.subTest(bad=bad):
                 self.assertFalse(records._valid_steps(steps(bad)))

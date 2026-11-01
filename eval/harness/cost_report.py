@@ -10,7 +10,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import ledger, loop, manifest, pilot, prices
+from . import ledger, loop, manifest, pilot, prices, spend
 from .experiments import Experiment
 
 
@@ -49,7 +49,7 @@ def collect(data_root: Path, experiment: Experiment, arm_names: list[str] | None
                 run_id = loop.run_id(task_id, arm_name, rep)
                 scored = None if digest is None else pilot.complete_build(data_root / "runs", task_id, arm_name,
                                                                              digest, rep)
-                run = ledger.run_cost(data_root / "runs" / run_id, scored, arm)
+                run = spend.run_cost(data_root / "runs" / run_id, scored, arm)
                 for unscored in run.unscored:
                     cost.unscored.merge(unscored.totals())
                 if run.scored is None:
@@ -76,12 +76,14 @@ def render(report: CostReport) -> str:
     lines += ["## Per arm", ""]
     rows = [[arm, str(cost.builds), _money(cost.total.cost) if cost.builds else "—",
              _money_per(cost.total.cost, cost.builds), f"{cost.total.seconds / 60:.0f}", _flags(cost.total),
-             (_money(cost.unscored.cost) + _unscored(cost)) if cost.unscored.attempts else "—"]
+             "—" if cost.unscored.empty else _money(cost.unscored.cost) + _unscored(cost)]
             for arm, cost in report.arms.items()]
     lines += _table(["Arm", "Builds", "Cost", "Per build", "Minutes", "Unknown / ranged / turn-only",
                      "Not scored"], rows) + [""]
     for arm, cost in report.arms.items():
         if not cost.builds:
+            if cost.missing:
+                lines += [f"## {arm}", "", f"- No scored execution: {', '.join(cost.missing)}", ""]
             continue
         lines += [f"## {arm}", "", "### Per task", ""]
         lines += _table(["Task", "Cost", "Minutes", "Unknown / ranged / turn-only"],
@@ -117,7 +119,7 @@ def _flags(totals: ledger.Totals) -> str:
 
 
 def _unscored(cost: ArmCost) -> str:
-    return f" ({cost.unscored.attempts} attempts, {cost.unscored.unknown} unknown)" if cost.unscored.attempts else ""
+    return f" ({cost.unscored.attempts} attempts, {cost.unscored.unknown} unknown)"
 
 
 def _table(header: list[str], rows: list[list[str]]) -> list[str]:

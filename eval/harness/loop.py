@@ -376,18 +376,23 @@ def _review(run: _Run, name: str, prompt: str) -> Verdict:
 def _step(run: _Run, name: str, agent: agents.Agent, call) -> agents.Session:
     """Run one step, retrying infrastructure failures. Every attempt, retried ones included, is checked for
     routing: a routed session that reports another model is flagged, and the report withholds its verdict."""
-    step_dir = run.exec_dir / "steps" / f"{len(run.steps):02d}-{name}"
-    attempts = []
+    index, attempts = len(run.steps), []
+    agent_record = {"cli": agent.cli, "model": agent.model, "provider": agent.provider}
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        session = guarded_call(call, step_dir / f"attempt-{attempt}")
+        session = guarded_call(call, attempt_dir(run.exec_dir, index, name, attempt))
         attempts.append(session.to_record())
         run.flags += [f"unrouted_model:{name}:{model}" for model in session.unrouted_models(agent)]
         if session.terminal != agents.INFRA:
-            run.steps.append({"name": name, "attempts": attempts})
+            run.steps.append({"name": name, "agent": agent_record, "attempts": attempts})
             return session
         _reset(run.repo, run.last_commit)
-    run.steps.append({"name": name, "attempts": attempts})
+    run.steps.append({"name": name, "agent": agent_record, "attempts": attempts})
     raise InfraExhausted(f"{name}: {session.reason}")
+
+
+def attempt_dir(exec_dir: Path, index: int, name: str, attempt: int) -> Path:
+    """Where the `attempt`-th try (from 1) of the execution's `index`-th step (from 0) keeps its session files."""
+    return exec_dir / "steps" / f"{index:02d}-{name}" / f"attempt-{attempt}"
 
 
 def guarded_call(call, out_dir: Path) -> agents.Session:

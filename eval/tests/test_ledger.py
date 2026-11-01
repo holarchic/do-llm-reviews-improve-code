@@ -6,15 +6,15 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from eval.harness import agents, ledger, prices
+from eval.harness import agents, ledger, prices, spend
 from eval.harness.experiments import EXPERIMENTS
 from eval.harness.ledger import Tokens
 
 REPO = Path(__file__).resolve().parents[2]
 REPLAY_RUNS = REPO / "eval" / "data" / "replay" / "runs"
-OPUS, HAIKU = agents.Agent("claude", "claude-opus-5-5"), agents.Agent("claude", "claude-haiku-5-5")
-SOL = agents.Agent("codex", "gpt-6.1-sol")
-ARM = SimpleNamespace(writer=OPUS, reviewer=SOL)
+OPUS = ledger.Seat("claude", prices.ANTHROPIC, "claude-opus-5-5")
+SOL = ledger.Seat("codex", prices.OPENAI, "gpt-6.1-sol")
+ARM = SimpleNamespace(writer=agents.Agent("claude", "claude-opus-5-5"), reviewer=agents.Agent("codex", "gpt-6.1-sol"))
 
 
 def model_usage(**counters) -> dict:
@@ -129,6 +129,9 @@ class UnusableTest(Fixture):
             "priority tier": {**codex_usage(10), "service_tier": "priority"},
             "fast mode": {**codex_usage(10), "speed": "fast"},
             "us-only inference": {**codex_usage(10), "inference_geo": "us"},
+            "malformed tier": {**codex_usage(10), "service_tier": []},
+            "metadata only": {"service_tier": "standard"},
+            "no output count": {"input_tokens": 1_000, "cached_input_tokens": 0},
         }
         for name, usage in cases.items():
             with self.subTest(name):
@@ -139,7 +142,14 @@ class UnusableTest(Fixture):
 
     def test_an_unpriced_model_raises(self):
         with self.assertRaises(prices.UnpricedModel):
-            ledger.attempt_cost("review", {"usage": codex_usage(10)}, agents.Agent("codex", "gpt-0"), self.tmp)
+            ledger.attempt_cost("review", {"usage": codex_usage(10)}, ledger.Seat("codex", prices.OPENAI, "gpt-0"),
+                                self.tmp)
+
+    def test_an_attempt_without_usage_and_empty_model_counters_are_unknown(self):
+        for raw in ({"seconds": 4}, "not a table", {"usage": {"by_model": {"claude-opus-5-5": {}}}}):
+            with self.subTest(raw=raw):
+                cost = ledger.attempt_cost("build", raw, OPUS, self.tmp)
+                self.assertEqual((cost.basis, cost.cost), (ledger.UNKNOWN, None))
 
 
 class ExecutionTest(Fixture):
@@ -156,7 +166,7 @@ class ExecutionTest(Fixture):
             {"usage": codex_usage(100_000, 0, 0, 1_000), "seconds": 20}]}
         scored = self.write_exec(run, 1, [review])
         self.write_exec(run, 2, [review, {"name": "fix-1", "attempts": [{"usage": {}, "seconds": 5}]}], "invalid")
-        cost = ledger.run_cost(run, scored, ARM)
+        cost = spend.run_cost(run, scored, ARM)
         self.assertEqual(cost.scored.exec_dir, scored)
         totals = cost.scored.totals()
         self.assertEqual((totals.attempts, totals.seconds, totals.unknown), (2, 30, 0))
@@ -169,7 +179,7 @@ class ExecutionTest(Fixture):
         run = self.tmp / "run"
         self.write_exec(run, 1, [{"name": "plan-review-1", "attempts": [{"usage": codex_usage(10), "seconds": 1}]}],
                         "invalid")
-        cost = ledger.run_cost(run, None, ARM)
+        cost = spend.run_cost(run, None, ARM)
         self.assertIsNone(cost.scored)
         self.assertEqual(cost.unscored[0].totals().attempts, 1)
 
@@ -180,11 +190,23 @@ class ExecutionTest(Fixture):
         (broken / "record.json").write_text("{not json", encoding="utf-8")
         mixed = self.write_exec(run, 2, [{"name": "correctness-review-1", "attempts": [
             {"usage": codex_usage(10, 20)}, {"usage": codex_usage(10)}]}])
-        cost = ledger.run_cost(run, mixed, ARM)
+        cost = spend.run_cost(run, mixed, ARM)
         self.assertEqual(cost.unscored[0].totals().unknown, 1)
         totals = cost.scored.totals()
         self.assertEqual((totals.attempts, totals.unknown), (2, 1))
         self.assertGreater(totals.cost.low, 0)
+
+    def test_a_step_without_a_name_is_unknown_and_a_recorded_agent_wins(self):
+        run = self.tmp / "run"
+        sol = {"cli": "codex", "model": "gpt-6.1-sol", "provider": agents.NATIVE}
+        # "build" holds no "review": the legacy rule would take the arm's Claude writer.
+        exec_dir = self.write_exec(run, 1, [{"name": None, "attempts": []},
+                                            {"name": "build", "agent": sol,
+                                             "attempts": [{"usage": codex_usage(100_000, 0, 0, 1_000)}]}])
+        attempts = spend.run_cost(run, exec_dir, ARM).scored.attempts
+        self.assertEqual(attempts[0].basis, ledger.UNKNOWN)
+        self.assertEqual((attempts[1].basis, set(attempts[1].tokens)), (ledger.SESSION, {"gpt-6.1-sol"}))
+        self.assertAlmostEqual(attempts[1].cost.low, (100_000 * 2 + 1_000 * 10) / 1e6, places=12)
 
     def test_step_kinds_strip_the_round(self):
         self.assertEqual([ledger.step_kind(n) for n in ("plan", "plan-review-3", "plan-revise-1", "fix-4", "build")],
@@ -198,7 +220,7 @@ class V1Test(unittest.TestCase):
         for record_path in sorted(REPLAY_RUNS.glob("*/exec-*/record.json")):
             exec_dir = record_path.parent
             record = json.loads(record_path.read_text(encoding="utf-8"))
-            costs = iter(ledger.execution_cost(exec_dir, experiment.arm(record["arm"])).attempts)
+            costs = iter(spend.execution_cost(exec_dir, experiment.arm(record["arm"])).attempts)
             for index, step in enumerate(record["steps"]):
                 for number, _ in enumerate(step["attempts"], start=1):
                     cost = next(costs)

@@ -1,8 +1,9 @@
-"""Tokens and economic cost of every recorded step, at the dated list prices of prices.py.
+"""Tokens and economic cost of one session's recorded usage, at the dated list prices of prices.py.
 
 Exact where the CLIs report enough, a low–high range where they don't, and unknown, never $0,
-where usage is missing or malformed. Parsing raw usage is this module's boundary: each attempt
-becomes an `AttemptCost` whose tokens are typed and checked, or an unknown with its reason.
+where usage is missing or malformed. Parsing raw usage is this module's boundary: an attempt
+becomes an `AttemptCost` whose tokens are typed and checked, or an unknown with its reason. It
+knows CLIs and prices, not runs: `spend.py` walks the recorded executions.
 
 Sources, most authoritative first:
 - Claude Code: the cumulative per-model counters of the session's last `result` event
@@ -12,9 +13,6 @@ Sources, most authoritative first:
 - Codex: the per-request counts from its session rollout (`usage["requests"]`) when they
   reconcile with the session totals; otherwise the session totals, which price a per-request tier
   as a range. Codex's `input_tokens` include its cached and written tokens.
-
-Every saved execution counts: the scored one, and every other, whatever its status, as spend on
-executions that were not scored.
 """
 
 import json
@@ -22,17 +20,25 @@ import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NamedTuple
 
-from . import agents, prices
+from . import prices
 
 PER_REQUEST, SESSION, TURN_ONLY, UNKNOWN = "per_request", "session", "turn_only", "unknown"
 UNDATED = "undated"  # cache writes whose duration the CLI does not report
-_STANDARD_SERVICE = {None, "standard"}
+_STANDARD = {None, "standard"}
 _STANDARD_GEO = {None, "global", "not_available"}
 
 
 class Unusable(Exception):
     """Usage that cannot be priced: missing, malformed or inconsistent."""
+
+
+class Seat(NamedTuple):
+    """Who served a session, as pricing needs it: the CLI, the price-table provider and the model."""
+    cli: str  # "claude" | "codex"
+    provider: str  # a provider of prices.py
+    model: str
 
 
 @dataclass(frozen=True)
@@ -71,7 +77,7 @@ class AttemptCost:
     basis: str  # PER_REQUEST | SESSION | TURN_ONLY | UNKNOWN
     seconds: float
     tokens: dict[str, Tokens] = field(default_factory=dict)  # model -> tokens
-    cost: Cost | None = None  # None when unknown
+    cost: Cost | None = None  # None exactly when basis is UNKNOWN
     reason: str = ""
 
 
@@ -81,7 +87,7 @@ class Totals:
     cost: Cost = Cost(0.0, 0.0)
     seconds: float = 0.0
     attempts: int = 0
-    unknown: int = 0
+    unknown: int = 0  # attempts, or whole executions whose record could not be read
     ranged: int = 0
     turn_only: int = 0
 
@@ -107,32 +113,15 @@ class Totals:
         self.ranged += other.ranged
         self.turn_only += other.turn_only
 
-
-@dataclass(frozen=True)
-class ExecutionCost:
-    exec_dir: Path
-    attempts: tuple[AttemptCost, ...]
-    unreadable: str = ""  # why the record could not be read; its spend is then unknown
-
-    def totals(self) -> Totals:
-        totals = Totals()
-        for attempt in self.attempts:
-            totals.add(attempt)
-        if self.unreadable:
-            totals.unknown += 1
-        return totals
-
-    def by_step_kind(self) -> dict[str, Totals]:
-        kinds: dict[str, Totals] = {}
-        for attempt in self.attempts:
-            kinds.setdefault(step_kind(attempt.step), Totals()).add(attempt)
-        return kinds
+    @property
+    def empty(self) -> bool:
+        return not (self.attempts or self.unknown)
 
 
-@dataclass(frozen=True)
-class RunCost:
-    scored: ExecutionCost | None
-    unscored: tuple[ExecutionCost, ...]
+class _Piece(NamedTuple):
+    model: str
+    tokens: Tokens
+    one_request: bool  # its tier is then known
 
 
 def step_kind(name: str) -> str:
@@ -140,142 +129,112 @@ def step_kind(name: str) -> str:
     return re.sub(r"-\d+$", "", name)
 
 
-def list_provider(agent: agents.Agent) -> str:
-    if agent.provider != agents.NATIVE:
-        return agent.provider
-    return prices.ANTHROPIC if agent.cli == "claude" else prices.OPENAI
-
-
-def run_cost(run_root: Path, scored_exec: Path | None, arm) -> RunCost:
-    """Every saved execution of one run; `scored_exec` is the one the report scores, if any."""
-    execs = sorted((p for p in run_root.glob("exec-*") if p.is_dir()), key=lambda p: int(p.name.split("-")[1]))
-    costs = [execution_cost(exec_dir, arm) for exec_dir in execs]
-    scored = next((c for c in costs if scored_exec is not None and c.exec_dir == scored_exec), None)
-    return RunCost(scored, tuple(c for c in costs if c is not scored))
-
-
-def execution_cost(exec_dir: Path, arm) -> ExecutionCost:
-    try:
-        record = json.loads((exec_dir / "record.json").read_text(encoding="utf-8"))
-        steps = record["steps"]
-        if not isinstance(steps, list):
-            raise TypeError("steps is not a list")
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        return ExecutionCost(exec_dir, (), unreadable=f"{type(exc).__name__}: {exc}")
-    attempts = []
-    for index, step in enumerate(steps):
-        name = step.get("name", "?") if isinstance(step, dict) else "?"
-        agent = arm.reviewer if "review" in name else arm.writer
-        raw_attempts = step.get("attempts") if isinstance(step, dict) else None
-        if not isinstance(raw_attempts, list):
-            attempts.append(AttemptCost(name, UNKNOWN, 0.0, reason="step has no attempts list"))
-            continue
-        for number, raw in enumerate(raw_attempts, start=1):
-            attempt_dir = exec_dir / "steps" / f"{index:02d}-{name}" / f"attempt-{number}"
-            attempts.append(attempt_cost(name, raw, agent, attempt_dir))
-    return ExecutionCost(exec_dir, tuple(attempts))
-
-
-def attempt_cost(step: str, raw: dict, agent: agents.Agent, attempt_dir: Path) -> AttemptCost:
+def attempt_cost(step: str, raw, seat: Seat, attempt_dir: Path) -> AttemptCost:
+    """The cost of one recorded attempt; its session files, the transcript included, are in `attempt_dir`."""
     seconds = raw.get("seconds", 0.0) if isinstance(raw, dict) else 0.0
-    seconds = seconds if isinstance(seconds, (int, float)) and math.isfinite(seconds) and seconds >= 0 else 0.0
+    seconds = seconds if _number(seconds) else 0.0
     try:
-        usage = raw["usage"] if isinstance(raw, dict) else None
+        usage = raw.get("usage") if isinstance(raw, dict) else None
         if not isinstance(usage, dict) or not usage:
             raise Unusable("no usage recorded")
         _check_service(usage)
-        if agent.cli == "claude":
-            basis, pieces, reason = _claude(usage, agent, attempt_dir)
+        if seat.cli == "claude":
+            basis, pieces, reason = _claude(usage, seat, attempt_dir)
+        elif seat.cli == "codex":
+            basis, pieces, reason = _codex(usage, seat)
         else:
-            basis, pieces, reason = _codex(usage, agent)
-        provider = list_provider(agent)
+            raise Unusable(f"no usage format for CLI {seat.cli!r}")
         tokens: dict[str, Tokens] = {}
         cost = Cost(0.0, 0.0)
-        for model, piece_tokens, exact in pieces:
-            cost += price_tokens(piece_tokens, prices.lookup(provider, model), exact=exact)
-            tokens[model] = tokens.get(model, Tokens()) + piece_tokens
+        for piece in pieces:
+            cost += price_tokens(piece.tokens, prices.lookup(seat.provider, piece.model), one_request=piece.one_request)
+            tokens[piece.model] = tokens.get(piece.model, Tokens()) + piece.tokens
     except Unusable as exc:
         return AttemptCost(step, UNKNOWN, seconds, reason=str(exc))
     return AttemptCost(step, basis, seconds, tokens, cost, reason)
 
 
-def price_tokens(tokens: Tokens, price: prices.Price, *, exact: bool) -> Cost:
-    """`exact`: the tokens are one request, so its tier is known. Otherwise a session total whose
-    prompt crosses the tier could be any mix of requests, so it is priced at both tiers."""
-    if exact or price.tier_above is None or tokens.prompt <= price.tier_above:
+def price_tokens(tokens: Tokens, price: prices.Price, *, one_request: bool) -> Cost:
+    """A session total whose prompt crosses a per-request tier could be any mix of requests, so it is
+    priced at both tiers; one request's tier is known."""
+    if one_request or price.tier is None or tokens.prompt <= price.tier.above:
         return _at(tokens, price.for_prompt(tokens.prompt))
-    low, high = _at(tokens, price.rates), _at(tokens, price.tiered)
+    low, high = _at(tokens, price.rates), _at(tokens, price.tier.rates)
     return Cost(min(low.low, high.low), max(low.high, high.high))
 
 
 def _at(tokens: Tokens, rates: prices.Rates) -> Cost:
     fixed = tokens.input * rates.input + tokens.cache_read * rates.cache_read + tokens.output * rates.output
+    writes = dict(rates.cache_write)
     low = high = fixed
     for duration, n in tokens.cache_write:
         if duration == UNDATED:
-            if not rates.cache_write:
+            if not writes:
                 raise Unusable("cache writes on a model with no write price")
-            low += n * min(rates.cache_write.values())
-            high += n * max(rates.cache_write.values())
+            low += n * min(writes.values())
+            high += n * max(writes.values())
+        elif duration in writes:
+            low += n * writes[duration]
+            high += n * writes[duration]
         else:
-            if duration not in rates.cache_write:
-                raise Unusable(f"no {duration} cache-write price")
-            low += n * rates.cache_write[duration]
-            high += n * rates.cache_write[duration]
+            raise Unusable(f"no {duration} cache-write price")
     return Cost(low / 1e6, high / 1e6)
 
 
 def _check_service(usage: dict) -> None:
-    if usage.get("service_tier") not in _STANDARD_SERVICE:
-        raise Unusable(f"service tier {usage.get('service_tier')!r} is not priced")
-    if usage.get("speed") not in _STANDARD_SERVICE:
-        raise Unusable(f"speed {usage.get('speed')!r} (fast mode) is not priced")
-    if usage.get("inference_geo") not in _STANDARD_GEO:
-        raise Unusable(f"inference geography {usage.get('inference_geo')!r} is not priced")
+    for key, allowed in (("service_tier", _STANDARD), ("speed", _STANDARD), ("inference_geo", _STANDARD_GEO)):
+        value = usage.get(key)
+        if not (value is None or isinstance(value, str)) or value not in allowed:
+            raise Unusable(f"{key} {value!r} is not priced (fast mode, priority tier or regional uplift)")
 
 
-def _count(container: dict, key: str) -> int:
-    value = container.get(key, 0)
+def _number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+
+
+def _count(container: dict, key: str, *, required: bool = True) -> int:
+    if key not in container:
+        if required:
+            raise Unusable(f"{key} missing")
+        return 0
+    value = container[key]
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise Unusable(f"{key} is {value!r}, not a token count")
     return value
 
 
-Pieces = list[tuple[str, Tokens, bool]]  # (model, tokens, whether the tokens are one request)
-
-
-def _claude(usage: dict, agent: agents.Agent, attempt_dir: Path) -> tuple[str, Pieces, str]:
+def _claude(usage: dict, seat: Seat, attempt_dir: Path) -> tuple[str, list[_Piece], str]:
     by_model = usage.get("by_model")
     if by_model is None:
-        by_model = last_model_usage(attempt_dir / "transcript.jsonl")
+        by_model = _last_model_usage(attempt_dir / "transcript.jsonl")
     if by_model is not None:
         if not isinstance(by_model, dict) or not by_model:
             raise Unusable("by_model is empty or not a table")
-        return SESSION, [(model, _claude_model_tokens(c), False) for model, c in sorted(by_model.items())], ""
-    return TURN_ONLY, [(agent.model, _claude_turn_tokens(usage), False)], "no per-model counters: the last turn only"
+        return SESSION, [_Piece(model, _claude_model_tokens(c), False) for model, c in sorted(by_model.items())], ""
+    return TURN_ONLY, [_Piece(seat.model, _claude_turn_tokens(usage), False)], "no per-model counters: the last turn only"
 
 
 def _claude_model_tokens(counters) -> Tokens:
     if not isinstance(counters, dict):
         raise Unusable("a model's counters are not a table")
     created = _count(counters, "cacheCreationInputTokens")
-    dated = {"5m": _count(counters, "cacheCreationEphemeral5mInputTokens"),
-             "1h": _count(counters, "cacheCreationEphemeral1hInputTokens")}
+    dated = {"5m": _count(counters, "cacheCreationEphemeral5mInputTokens", required=False),
+             "1h": _count(counters, "cacheCreationEphemeral1hInputTokens", required=False)}
     return _claude_tokens(_count(counters, "inputTokens"), _count(counters, "cacheReadInputTokens"), created, dated,
-                          _count(counters, "outputTokens"), _count(counters, "thinkingTokens"))
+                          _count(counters, "outputTokens"), _count(counters, "thinkingTokens", required=False))
 
 
 def _claude_turn_tokens(usage: dict) -> Tokens:
-    created = _count(usage, "cache_creation_input_tokens")
+    created = _count(usage, "cache_creation_input_tokens", required=False)
     split = usage.get("cache_creation") or {}
-    if not isinstance(split, dict):
-        raise Unusable("cache_creation is not a table")
-    dated = {"5m": _count(split, "ephemeral_5m_input_tokens"), "1h": _count(split, "ephemeral_1h_input_tokens")}
     details = usage.get("output_tokens_details") or {}
-    if not isinstance(details, dict):
-        raise Unusable("output_tokens_details is not a table")
-    return _claude_tokens(_count(usage, "input_tokens"), _count(usage, "cache_read_input_tokens"), created, dated,
-                          _count(usage, "output_tokens"), _count(details, "thinking_tokens"))
+    if not isinstance(split, dict) or not isinstance(details, dict):
+        raise Unusable("cache_creation or output_tokens_details is not a table")
+    dated = {"5m": _count(split, "ephemeral_5m_input_tokens", required=False),
+             "1h": _count(split, "ephemeral_1h_input_tokens", required=False)}
+    return _claude_tokens(_count(usage, "input_tokens"), _count(usage, "cache_read_input_tokens", required=False),
+                          created, dated, _count(usage, "output_tokens"),
+                          _count(details, "thinking_tokens", required=False))
 
 
 def _claude_tokens(uncached: int, read: int, created: int, dated: dict[str, int], output: int,
@@ -288,7 +247,7 @@ def _claude_tokens(uncached: int, read: int, created: int, dated: dict[str, int]
     return Tokens(uncached, read, tuple(sorted((d, n) for d, n in writes.items() if n)), output, reasoning)
 
 
-def last_model_usage(transcript: Path) -> dict | None:
+def _last_model_usage(transcript: Path) -> dict | None:
     """The cumulative `modelUsage` of a Claude transcript's last `result` event, or None."""
     try:
         lines = transcript.read_text(encoding="utf-8").splitlines()
@@ -307,28 +266,28 @@ def last_model_usage(transcript: Path) -> dict | None:
     return last
 
 
-def _codex(usage: dict, agent: agents.Agent) -> tuple[str, Pieces, str]:
+def _codex(usage: dict, seat: Seat) -> tuple[str, list[_Piece], str]:
     total = _codex_tokens(usage)
     requests = usage.get("requests")
     if requests is None:
-        return SESSION, [(agent.model, total, False)], ""
-    if not isinstance(requests, list) or not requests:
-        raise Unusable("requests is empty or not a list")
-    pieces = [_codex_tokens(request) if isinstance(request, dict) else None for request in requests]
-    if None in pieces:
-        raise Unusable("a request is not a table")
+        return SESSION, [_Piece(seat.model, total, False)], ""
+    if not isinstance(requests, list) or not requests or not all(isinstance(r, dict) for r in requests):
+        raise Unusable("requests is not a non-empty list of tables")
+    pieces = [_codex_tokens(request) for request in requests]
     summed = Tokens()
     for piece in pieces:
         summed += piece
     if summed != total:
-        return SESSION, [(agent.model, total, False)], "requests do not reconcile with the session totals"
-    return PER_REQUEST, [(agent.model, piece, True) for piece in pieces], ""
+        return SESSION, [_Piece(seat.model, total, False)], "requests do not reconcile with the session totals"
+    return PER_REQUEST, [_Piece(seat.model, piece, True) for piece in pieces], ""
 
 
 def _codex_tokens(counters: dict) -> Tokens:
     prompt = _count(counters, "input_tokens")
-    cached, written = _count(counters, "cached_input_tokens"), _count(counters, "cache_write_input_tokens")
-    output, reasoning = _count(counters, "output_tokens"), _count(counters, "reasoning_output_tokens")
+    cached = _count(counters, "cached_input_tokens")
+    written = _count(counters, "cache_write_input_tokens", required=False)
+    output = _count(counters, "output_tokens")
+    reasoning = _count(counters, "reasoning_output_tokens", required=False)
     if cached + written > prompt:
         raise Unusable("cached and written tokens exceed input tokens")
     if reasoning > output:

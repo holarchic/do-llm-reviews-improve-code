@@ -61,6 +61,18 @@ class CostReportTest(unittest.TestCase):
         self.assertEqual((report.arms["R"].builds, report.arms["R"].unscored.attempts), (0, 1))
         self.assertIn("No manifest", cost_report.render(report))
 
+    def test_an_unreadable_execution_and_a_never_built_arm_are_on_the_page(self):
+        broken = self.root / "runs" / "t1--R--r1" / "exec-1"
+        broken.mkdir(parents=True)
+        (broken / "record.json").write_text("{not json", encoding="utf-8")
+        with mock.patch.object(cost_report, "frozen_digest", lambda experiment: "d"), \
+                mock.patch.object(pilot, "complete_build", lambda *args: None):
+            report = cost_report.collect(self.root, self.experiment)
+        self.assertEqual((report.arms["R"].unscored.attempts, report.arms["R"].unscored.unknown), (0, 1))
+        text = cost_report.render(report)
+        self.assertIn("(0 attempts, 1 unknown)", text)
+        self.assertIn("No scored execution: t1--R--r1, t2--R--r1", text)
+
     def test_the_cli_refuses_an_unknown_arm(self):
         from eval.__main__ import main
         with mock.patch("sys.stderr"):

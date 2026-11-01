@@ -137,7 +137,7 @@ def _valid_capture(usage: dict) -> bool:
     """The shape of what a session captures beside its totals; ledger.py checks the counts' meaning."""
     requests, by_model, limits = usage.get("requests"), usage.get("by_model"), usage.get("rate_limits")
     return ((requests is None or (isinstance(requests, list) and requests and all(
-                isinstance(r, dict) and all(_count(v) for v in r.values()) for r in requests)))
+                isinstance(r, dict) and all(_token_count(v) for v in r.values()) for r in requests)))
             and (by_model is None or (isinstance(by_model, dict) and by_model
                                       and all(isinstance(c, dict) for c in by_model.values())))
             and (limits is None or isinstance(limits, dict)))
@@ -150,6 +150,10 @@ def _identity(record: dict) -> bool:
 def _count(value) -> bool:
     """A finite, non-negative number."""
     return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value < math.inf
+
+
+def _token_count(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def _fraction(value) -> bool:
