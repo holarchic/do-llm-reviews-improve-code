@@ -1,4 +1,4 @@
-"""OpenRouter's own facts: its API base, pilot 2's prices and its spend record.
+"""OpenRouter's own facts: pilot 2's prices and its spend record.
 
 Key handling and each CLI's routing for every provider, OpenRouter included, live in `providers.py`.
 """
@@ -6,9 +6,6 @@ Key handling and each CLI's routing for every provider, OpenRouter included, liv
 import json
 from dataclasses import dataclass
 from pathlib import Path
-
-API_BASE_URL = "https://openrouter.ai/api/v1"
-
 
 @dataclass(frozen=True)
 class Price:

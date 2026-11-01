@@ -293,10 +293,10 @@ def _balances(infos) -> dict[str, float]:
 
 def _no_server_tools(usage) -> None:
     """Server tools bill per call, outside token prices: a request that used one can't be metered. An
-    absent block means none; a present one must be counters, all zero."""
-    tools = usage.get("server_tool_use") if isinstance(usage, dict) else None
-    if tools is None:
+    absent block means none; a present one (null included) must be counters, all zero."""
+    if not isinstance(usage, dict) or "server_tool_use" not in usage:
         return
+    tools = usage["server_tool_use"]
     if not isinstance(tools, dict) or any(isinstance(v, bool) or not isinstance(v, int) or v < 0
                                           for v in tools.values()):
         raise ValueError(f"server_tool_use is {tools!r}")

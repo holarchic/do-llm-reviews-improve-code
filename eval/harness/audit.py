@@ -62,7 +62,8 @@ def private_roots() -> list[Path]:
 
 def sandbox_deny_roots() -> list[Path]:
     """Roots the Claude Bash sandbox denies. The runs root is left out because each
-    run dir sits inside it; sibling runs are covered by the audit alone."""
+    run dir sits inside it; sibling runs stay unfindable because the root can't be listed
+    and their names are unguessable (`anonymous_workdir`), and the audit records any reach."""
     return _with_resolved(tuple(root for root in PRIVATE_ROOTS if root != RUNS_ROOT))
 
 

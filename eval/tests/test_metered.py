@@ -212,9 +212,9 @@ class MeteredSettlementTest(Fixture):
 
     def test_malformed_or_conflicting_usage_never_settles_automatically(self):
         # Each case stays unresolved by design: give every one its own slot, and the credit to hold it.
-        self.env.fund(credit=8.0)
-        self.env.raise_allocation("ds", 18.0)
-        self.env.set_route("r", scope="ds", max_charge=BOUND, slots=5, policy=POLICY, bootstrap_build_usd=1.0,
+        self.env.fund(credit=11.0)
+        self.env.raise_allocation("ds", 21.0)
+        self.env.set_route("r", scope="ds", max_charge=BOUND, slots=6, policy=POLICY, bootstrap_build_usd=1.0,
                            upstream={"base_url": self.fake.base_url, "settler": "deepseek", "model": MODEL})
         self.env.validate_route("r")
         served = self.start()
@@ -235,6 +235,11 @@ class MeteredSettlementTest(Fixture):
                                      "input_tokens": 1, "output_tokens": 1, "cache_read_input_tokens": 0,
                                      "cache_creation_input_tokens": 0, "server_tool_use": {"web_search_requests": 1}}},
                                  {"type": "message_stop"}]),
+                ("null server tools", [{"type": "message_start", "message": {"id": "m6"}},
+                                       {"type": "message_delta", "usage": {
+                                           "input_tokens": 1, "output_tokens": 1, "cache_read_input_tokens": 0,
+                                           "cache_creation_input_tokens": 0, "server_tool_use": None}},
+                                       {"type": "message_stop"}]),
                 ("no cache counter", [{"type": "message_start", "message": {"id": "m5"}},
                                       {"type": "message_delta", "usage": {"input_tokens": 0, "output_tokens": 1}},
                                       {"type": "message_stop"}])):
@@ -242,7 +247,7 @@ class MeteredSettlementTest(Fixture):
                 self.fake.events_override = lambda *a, events=events: events
                 self.post(served.session("job", name)["r"])
         served.settle_now()
-        self.assertEqual(len(self.requests()), 5)  # every case was admitted and ran
+        self.assertEqual(len(self.requests()), 6)  # every case was admitted and ran
         for request in self.requests():
             self.assertIsNotNone(request["metered_invalid"], request["attempt"])
             self.assertEqual(request["state"], "unresolved", request["attempt"])
@@ -350,10 +355,14 @@ class EventReadingTest(unittest.TestCase):
         zero = {"type": "message_delta", "usage": {**full, "server_tool_use": {"web_search_requests": 0}}}
         self.assertIsInstance(self.settler.read(zero).metered, settlers.Usage)
         for malformed in ({"tool_search": True}, [1], {"web_search_requests": -1}, {"web_search_requests": "1"},
-                          {"web_search_requests": False}, {"tool_search": ""}, {"tool_fetch": 0.0}):  # falsy, still malformed
+                          {"web_search_requests": False}, {"tool_search": ""}, {"tool_fetch": 0.0},  # falsy, still malformed
+                          None):  # present but null: not the same as absent
             with self.subTest(malformed=malformed):
                 event = {"type": "message_delta", "usage": {**full, "server_tool_use": malformed}}
                 self.assertIsInstance(self.settler.read(event).metered, settlers.Invalid)
+        responses_null = {"type": "response.completed", "response": {"usage": {
+            "input_tokens": 1, "output_tokens": 1, "server_tool_use": None}}}
+        self.assertIsInstance(self.settler.read(responses_null).metered, settlers.Invalid)
 
     def test_every_anthropic_counter_is_required_since_input_excludes_cache_hits(self):
         full = {"input_tokens": 10, "output_tokens": 1, "cache_read_input_tokens": 500, "cache_creation_input_tokens": 0}
