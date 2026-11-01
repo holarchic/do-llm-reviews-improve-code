@@ -126,7 +126,9 @@ class UnusableTest(Fixture):
             "reasoning over output": codex_usage(10, 0, 0, 1, 2),
             "empty requests": {**codex_usage(10), "requests": []},
             "empty": {},
-            "fast mode": {**codex_usage(10), "service_tier": "priority"},
+            "priority tier": {**codex_usage(10), "service_tier": "priority"},
+            "fast mode": {**codex_usage(10), "speed": "fast"},
+            "us-only inference": {**codex_usage(10), "inference_geo": "us"},
         }
         for name, usage in cases.items():
             with self.subTest(name):

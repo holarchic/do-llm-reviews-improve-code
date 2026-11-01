@@ -228,6 +228,8 @@ def _at(tokens: Tokens, rates: prices.Rates) -> Cost:
 def _check_service(usage: dict) -> None:
     if usage.get("service_tier") not in _STANDARD_SERVICE:
         raise Unusable(f"service tier {usage.get('service_tier')!r} is not priced")
+    if usage.get("speed") not in _STANDARD_SERVICE:
+        raise Unusable(f"speed {usage.get('speed')!r} (fast mode) is not priced")
     if usage.get("inference_geo") not in _STANDARD_GEO:
         raise Unusable(f"inference geography {usage.get('inference_geo')!r} is not priced")
 

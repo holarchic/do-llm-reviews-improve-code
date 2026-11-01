@@ -29,7 +29,7 @@ import json
 import os
 import shutil
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import audit, egress, openrouter, procs
@@ -188,13 +188,39 @@ def run_codex(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path, p
             proc = procs.run(argv, cwd=cwd, timeout=TIMEOUT_SECONDS[role], stdout_path=inner["transcript.jsonl"],
                              stderr_path=inner["stderr.log"], env={**env, **proxy.env()} if proxy else env,
                              stdin_path=prompt_path)
+        captured = rollout_usage(codex_home)
         shutil.copy2(codex_home / "config.toml", out_dir / "codex-config.toml")
         for name, path in inner.items():
             if path.exists():
                 shutil.copy2(path, out_dir / name)
     finally:
         shutil.rmtree(codex_home, ignore_errors=True)
-    return _finish(classify_codex(transcript, final_path, proc, role, model), cwd)
+    session = classify_codex(transcript, final_path, proc, role, model)
+    if session.usage:  # without session totals the attempt stays unpriced, never priced from a partial capture
+        session = replace(session, usage={**session.usage, **captured})
+    return _finish(session, cwd)
+
+
+def rollout_usage(codex_home: Path) -> dict:
+    """Each request's token counts and the first and last rate-limit snapshots from the session's rollout.
+
+    The rate limits are the account's, so concurrent sessions and window resets show in them: a
+    snapshot, not this session's quota burn."""
+    requests, limits = [], []
+    for rollout in sorted((codex_home / "sessions").rglob("rollout-*.jsonl")):
+        for event in _events(rollout):
+            payload = event.get("payload")
+            if event.get("type") != "event_msg" or not isinstance(payload, dict) or payload.get("type") != "token_count":
+                continue
+            last = (payload.get("info") or {}).get("last_token_usage")
+            if isinstance(last, dict):
+                requests.append(last)
+            if isinstance(payload.get("rate_limits"), dict):
+                limits.append(payload["rate_limits"])
+    captured = {"requests": requests} if requests else {}
+    if limits:
+        captured["rate_limits"] = {"first": limits[0], "last": limits[-1]}
+    return captured
 
 
 def codex_seatbelt_profile(cwd: Path, home: Path, *, writable: bool = False, offline: bool = False) -> str:
@@ -227,7 +253,7 @@ def codex_argv(model: str, final_path: Path) -> list[str]:
     return [
         "codex", "--dangerously-bypass-approvals-and-sandbox", "-m", model,
         "-c", f"model_reasoning_effort={CODEX_EFFORT}",
-        "exec", "--skip-git-repo-check", "--ephemeral", "--json", "-o", str(final_path), "-",
+        "exec", "--skip-git-repo-check", "--json", "-o", str(final_path), "-",
     ]
 
 
@@ -241,6 +267,9 @@ def classify_claude(transcript: Path, proc: procs.ProcResult, role: str) -> Sess
     if result is None:
         return Session(INFRA, f"no result event (exit {proc.exit_code})", "", transcript, proc.seconds)
     usage = result.get("usage") or {}
+    if result.get("modelUsage"):
+        # Cumulative per model; `usage` covers only the last turn of a resumed session.
+        usage = {**usage, "by_model": result["modelUsage"]}
     models = sorted((result.get("modelUsage") or {}).keys())
     if result.get("is_error") or result.get("subtype") != "success" or proc.exit_code != 0:
         reason = f"error result: subtype={result.get('subtype')} exit={proc.exit_code}: {str(result.get('result'))[:300]}"
