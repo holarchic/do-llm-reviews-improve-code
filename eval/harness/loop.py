@@ -385,6 +385,8 @@ def _step(run: _Run, name: str, agent: agents.Agent, call) -> agents.Session:
         if session.terminal != agents.INFRA:
             run.steps.append({"name": name, "agent": agent_record, "attempts": attempts})
             return session
+        if session.reason.startswith(agents.SPEND_REFUSED):
+            break  # the envelope refused it: retrying would only be refused again, or spend past the bound
         _reset(run.repo, run.last_commit)
     run.steps.append({"name": name, "agent": agent_record, "attempts": attempts})
     raise InfraExhausted(f"{name}: {session.reason}")

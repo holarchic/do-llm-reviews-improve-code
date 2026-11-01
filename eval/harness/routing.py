@@ -20,6 +20,7 @@ logged or stored.
 
 import hashlib
 import http.client
+import contextlib
 import http.server
 import json
 import re
@@ -32,7 +33,7 @@ import uuid
 from dataclasses import dataclass, field
 
 from . import envelope as envelope_mod
-from . import prices
+from . import openrouter, prices
 
 RECONCILE_SECONDS = 240
 SETTLE_SECONDS = 5
@@ -42,6 +43,89 @@ _SERVER_TOOL = re.compile(r"web_search|web_fetch|code_execution|computer|file_se
 _IMAGE_PARTS = {"image", "input_image", "image_url"}
 _HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer",
                "transfer-encoding", "upgrade", "host", "content-length"}
+
+
+class RoutingRequired(Exception):
+    """A routed session asked to launch with no routing context active: it would bypass the envelope."""
+
+
+_active: "Proxy | None" = None
+_active_lock = threading.Lock()
+_job = threading.local()
+
+
+@contextlib.contextmanager
+def active(proxy: "Proxy"):
+    """Routed sessions launched inside this block go through `proxy`; outside it they are refused."""
+    global _active
+    with _active_lock:
+        if _active is not None:
+            raise RoutingRequired("a routing context is already active")
+        _active = proxy
+    try:
+        yield proxy
+    finally:
+        with _active_lock:
+            _active = None
+
+
+@contextlib.contextmanager
+def job(job_id: str):
+    """The job (reservation) this thread's routed sessions belong to."""
+    previous = getattr(_job, "value", None)
+    _job.value = job_id
+    try:
+        yield
+    finally:
+        _job.value = previous
+
+
+def route_name(provider: str, model: str) -> str:
+    """A route's name as it appears in a URL path: one route per provider and model."""
+    return f"{provider}--{model.replace('/', '__')}"
+
+
+def session_base(provider: str, model: str, attempt: str) -> str:
+    """The proxy base URL for one attempt's session on this provider and model."""
+    with _active_lock:
+        proxy = _active
+    job_id = getattr(_job, "value", None)
+    if proxy is None or job_id is None:
+        raise RoutingRequired(f"{provider} {model}: no routing context, so no envelope bounds this session")
+    route = route_name(provider, model)
+    if route not in proxy.upstreams:
+        raise RoutingRequired(f"no route {route} in the active envelope")
+    return proxy.session(job_id, attempt)[route]
+
+
+def refusal(attempt: str) -> str | None:
+    """The spend refusal recorded against an attempt, if any."""
+    with _active_lock:
+        proxy = _active
+    return None if proxy is None else proxy.env.refusal(attempt)
+
+
+def upstreams_from(env: envelope_mod.Envelope) -> dict[str, "Upstream"]:
+    """The proxy's upstreams, from the routes the envelope records (every route needs a settler)."""
+    built = {}
+    state = env.state
+    for name, route in state["routes"].items():
+        upstream = route.get("upstream") or {}
+        if upstream.get("settler") != "openrouter":
+            raise RoutingRequired(f"route {name} has no known settler")
+        key = openrouter.api_key()
+        settler = OpenRouterSettler(upstream["base_url"].rstrip("/") + "/v1", key)
+        built[name] = Upstream(upstream["base_url"], settler, route["scope"],
+                               state["scopes"][route["scope"]]["fingerprint"])
+    return built
+
+
+@contextlib.contextmanager
+def for_envelope(name: str, *, root=None):
+    """Own the envelope, serve its proxy and make it the active routing context."""
+    with envelope_mod.Envelope.owned(name, root=root) as env, Proxy(env, upstreams_from(env)) as proxy, \
+            active(proxy):
+        yield env
 
 
 def fingerprint(credential: str) -> str:

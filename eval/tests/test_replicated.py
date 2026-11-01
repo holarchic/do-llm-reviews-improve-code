@@ -161,7 +161,10 @@ class EndToEndTest(unittest.TestCase):
                 return {"run_id": loop.run_id(task.id, arm.name, rep), "exec": "exec-0", "status": "invalid"}
             return real_execute(task, arm, runs_root, rep=rep, manifest_hash=manifest_hash, offline=offline)
 
+        import contextlib
+        # Spend is not this test's subject: run the scheduler without an envelope.
         with mock.patch.object(pilot, "scored_tasks", lambda experiment: [self.task]), \
+                mock.patch.object(pilot, "routing_context", lambda experiment: contextlib.nullcontext(None)), \
                 mock.patch.object(manifest, "verify", return_value="d"), \
                 mock.patch.object(openrouter, "credit_used", return_value=0.0), \
                 mock.patch.object(openrouter, "scrub", return_value=[]), \

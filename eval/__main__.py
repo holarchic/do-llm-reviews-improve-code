@@ -17,6 +17,7 @@ COMMANDS = {
     "report": "regenerate the experiment's report from raw run records",
     "rounds": "score each code-review round of a replay experiment's reviewed builds; apply the round rule",
     "cost": "price every recorded step of the experiment at the dated list prices (descriptive)",
+    "spend": "a spend envelope: create, fund, scope, route, validate-route, status, resolve",
 }
 EXPERIMENT_COMMANDS = ("probe", "calibrate", "freeze", "run", "judge", "report", "rounds", "cost")
 
@@ -38,6 +39,16 @@ def main(argv: list[str]) -> int:
     parsers["judge"].add_argument("--pair", nargs=2, metavar="ARM", help="with --task: judge two arms' builds")
     parsers["rounds"].add_argument("--arm", required=True, help="a reviewed arm of the experiment")
     parsers["cost"].add_argument("--arm", action="append", help="one of the experiment's arms, repeatable (default: all)")
+    spend = parsers["spend"]
+    spend.add_argument("action", choices=["create", "fund", "scope", "route", "validate-route", "status", "resolve"])
+    spend.add_argument("--envelope", required=True, help="the budget's name, e.g. B")
+    for flag in ("--usd", "--credit", "--fees", "--taxes", "--probe", "--allocation", "--provider-limit",
+                 "--max-charge", "--bootstrap", "--billed"):
+        spend.add_argument(flag, type=float)
+    for flag in ("--scope", "--provider", "--route", "--policy", "--upstream-base", "--settler", "--request"):
+        spend.add_argument(flag)
+    spend.add_argument("--slots", type=int)
+    spend.add_argument("--not-billed", action="store_true")
     parsers["validate"].add_argument("--task", action="append", help="validate only this task, repeatable "
                                      "(default: every task no manifest freezes; a frozen task is refused)")
     args = parser.parse_args(argv)
@@ -89,9 +100,17 @@ def _validate(args) -> int:
 
 
 def _probe(args) -> int:
-    from .harness import probe
+    from .harness import envelope, pilot, probe, routing
 
-    problems = probe.run_probes(_data_root(args.experiment) / "probes", args.experiment)
+    def run() -> list[str]:
+        # A routed experiment's probes draw on its envelope's probe reservation.
+        with pilot.routing_context(args.experiment), routing.job(envelope.PROBE):
+            return probe.run_probes(_data_root(args.experiment) / "probes", args.experiment)
+    try:
+        problems = run()
+    except (routing.RoutingRequired, envelope.EnvelopeError) as exc:
+        print(f"probe: refused: {exc}", file=sys.stderr)
+        return 3
     for problem in problems:
         print(problem, file=sys.stderr)
     print("probe: FAIL" if problems else "probe: ok")
@@ -118,7 +137,15 @@ def _run(args) -> int:
         return 2
     arm = experiment.arm(args.arm)
     runs_root = _data_root(experiment) / "runs"
-    record = loop.execute_run(task, arm, runs_root, manifest_hash=None, offline=experiment.offline)
+    calibration = _data_root(experiment) / "calibration" / "runs"
+    with pilot.routing_context(experiment) as env:
+        record = pilot.reserved(env, f"dev:{loop.run_id(task.id, arm.name, None)}",
+                                lambda: pilot.job_estimate(env, experiment, arm.name, calibration),
+                                lambda: loop.execute_run(task, arm, runs_root, manifest_hash=None,
+                                                         offline=experiment.offline))
+    if record is None:
+        print("run: not admitted by the spend envelope", file=sys.stderr)
+        return 1
     print(json.dumps({k: record.get(k) for k in ("run_id", "exec", "status", "flags", "rounds", "scores")}))
     if record["status"] != "complete":
         return 1
@@ -131,7 +158,7 @@ def _run(args) -> int:
 
 
 def _calibrate(args) -> int:
-    from .harness import openrouter, pilot, replicated
+    from .harness import pilot, spend
 
     experiment = args.experiment
     task_ids = args.task or list(experiment.tasks)
@@ -145,11 +172,12 @@ def _calibrate(args) -> int:
     data_root = _data_root(experiment)
     built = pilot.run_calibration(data_root, experiment, task_ids, arm, args.reps)
     for record in built:
-        cost = f" est=${replicated.build_cost(record, experiment):.3f}" if experiment.routed else ""
+        # Priced by the ledger: an unpriced model raises rather than counting as $0.
+        priced = spend.execution_cost(data_root / "calibration" / "runs" / record["run_id"] / record["exec"],
+                                      experiment.arm(arm)).totals()
+        cost = f" list=${priced.cost.low:.3f}–{priced.cost.high:.3f} unknown={priced.unknown}"
         print(f"{record['run_id']} {record['exec']}: {record['status']} {_score_line(record.get('scores') or {})}"
               f"{cost} flags={record.get('flags')}")
-    if experiment.routed:
-        print(f"calibration spend so far: {openrouter.spent(data_root / pilot.SPEND_LEDGER, 'calibration')}")
     # A job that crashed or wasn't admitted leaves no record, so success needs every requested build.
     complete = sum(record["status"] == "complete" for record in built)
     return 0 if complete == len(task_ids) * args.reps else 1
@@ -276,8 +304,53 @@ def _cost(args) -> int:
     return 0
 
 
+def _spend(args) -> int:
+    import json
+    import time
+
+    from .harness import envelope, openrouter, routing
+
+    if args.action == "status":  # read-only: no ownership, so it works while a run owns the envelope
+        state = envelope.load(envelope.DEFAULT_ROOT / f"{args.envelope}.json")
+        print(json.dumps(envelope.summary(state, time.time()), indent=2))
+        return 0
+    try:
+        with envelope.Envelope.owned(args.envelope, create_usd=args.usd if args.action == "create" else None) as env:
+            if args.action == "fund":
+                if args.probe is not None:
+                    env.fund_probe(args.probe)
+                else:
+                    env.fund(credit=args.credit or 0.0, fees=args.fees or 0.0, taxes=args.taxes or 0.0)
+            elif args.action == "scope":
+                if args.provider != "openrouter":
+                    print("spend scope: only an openrouter scope can read its key's usage so far", file=sys.stderr)
+                    return 2
+                key = openrouter.api_key()
+                env.register_scope(args.scope, provider=args.provider, fingerprint=routing.fingerprint(key),
+                                   opening_usage=openrouter.credit_used(), allocation=args.allocation,
+                                   provider_limit=args.provider_limit)
+            elif args.action == "route":
+                env.set_route(args.route, scope=args.scope, max_charge=args.max_charge, slots=args.slots,
+                              policy=json.loads(args.policy or "{}"), bootstrap_build_usd=args.bootstrap,
+                              upstream={"base_url": args.upstream_base, "settler": args.settler})
+            elif args.action == "validate-route":
+                env.validate_route(args.route)
+            elif args.action == "resolve":
+                if args.not_billed == (args.billed is not None):
+                    print("spend resolve: exactly one of --billed USD or --not-billed", file=sys.stderr)
+                    return 2
+                if not env.settle(args.request, None if args.not_billed else args.billed):
+                    print(f"spend resolve: {args.request} was already settled", file=sys.stderr)
+            print(json.dumps(envelope.summary(env.state, time.time()), indent=2))
+    except (envelope.Refused, envelope.EnvelopeError, openrouter.CreditUnavailable, ValueError, TypeError) as exc:
+        print(f"spend {args.action}: refused: {exc}", file=sys.stderr)
+        return 3
+    return 0
+
+
 HANDLERS = {"validate": _validate, "probe": _probe, "calibrate": _calibrate, "freeze": _freeze, "run": _run,
-            "judge": _judge, "report": _report, "rounds": _rounds, "cost": _cost}
+            "judge": _judge, "report": _report, "rounds": _rounds, "cost": _cost,
+            "spend": _spend}
 
 
 if __name__ == "__main__":

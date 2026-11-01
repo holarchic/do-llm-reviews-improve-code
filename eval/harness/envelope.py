@@ -58,7 +58,8 @@ class Envelope:
 
     @classmethod
     @contextmanager
-    def owned(cls, name: str, *, root: Path = DEFAULT_ROOT, create_usd: float | None = None, now=time.time):
+    def owned(cls, name: str, *, root: Path | None = None, create_usd: float | None = None, now=time.time):
+        root = DEFAULT_ROOT if root is None else root  # resolved per call, so a test can point it elsewhere
         root.mkdir(parents=True, exist_ok=True)
         lock_file = open(root / f"{name}.lock", "a")
         try:
@@ -141,9 +142,11 @@ class Envelope:
             registry.close()
 
     def set_route(self, route: str, *, scope: str, max_charge: float, slots: int, policy: dict,
-                  bootstrap_build_usd: float) -> None:
+                  bootstrap_build_usd: float, upstream: dict | None = None) -> None:
+        """`upstream` is where the proxy forwards: {"base_url": ..., "settler": "openrouter"}."""
         if not (_money(max_charge) and max_charge > 0 and isinstance(slots, int) and not isinstance(slots, bool)
-                and slots >= 1 and _money(bootstrap_build_usd) and isinstance(policy, dict)):
+                and slots >= 1 and _money(bootstrap_build_usd) and isinstance(policy, dict)
+                and (upstream is None or isinstance(upstream, dict))):
             raise Refused("a route needs a positive max charge, at least one slot, a policy and a bootstrap cost")
 
         def change(s):
@@ -151,7 +154,7 @@ class Envelope:
                 raise Refused(f"no scope {scope}")
             stage = s["routes"].get(route, {}).get("stage", "probe")
             s["routes"][route] = {"scope": scope, "max_charge": max_charge, "slots": slots, "policy": policy,
-                                  "bootstrap_build_usd": bootstrap_build_usd, "stage": stage}
+                                  "bootstrap_build_usd": bootstrap_build_usd, "stage": stage, "upstream": upstream}
             _require_bound(s)
         self._transition(change)
 

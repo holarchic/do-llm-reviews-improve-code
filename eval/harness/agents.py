@@ -32,7 +32,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from . import audit, egress, openrouter, procs
+from . import audit, egress, openrouter, procs, routing
 
 CLAUDE_JUDGE_MODEL = "claude-fable-5-1"
 CODEX_JUDGE_MODEL = "gpt-6-astra"
@@ -42,6 +42,7 @@ WRITER, REVIEWER, JUDGE = "writer", "reviewer", "judge"
 TIMEOUT_SECONDS = {WRITER: 1800, REVIEWER: 1200, JUDGE: 900}
 
 COMPLETED, TIMEOUT, INFRA = "completed", "timeout", "infra"
+SPEND_REFUSED = "spend refused"  # the reason of a session the envelope refused; the loop never retries it
 NATIVE, OPENROUTER = "native", "openrouter"
 
 _FILE_TOOLS = ("Read", "Edit", "Write", "Glob", "Grep")
@@ -140,6 +141,8 @@ def run_claude(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path, 
                offline: bool = False) -> Session:
     # Absolute: the CLI runs in cwd, where a relative settings path would not resolve.
     out_dir = out_dir.resolve()
+    # A routed session launches only inside a routing context, through its proxy: before anything is written.
+    base_url = routing.session_base(provider, model, str(out_dir)) if provider == OPENROUTER else None
     out_dir.mkdir(parents=True, exist_ok=True)
     settings_path = out_dir / "settings.json"
     settings_path.write_text(json.dumps(claude_settings(role, cwd, provider, offline), indent=2), encoding="utf-8")
@@ -148,15 +151,16 @@ def run_claude(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path, 
     prompt_path.write_text(prompt, encoding="utf-8")
     (out_dir / "argv.json").write_text(json.dumps(argv, indent=2), encoding="utf-8")
     transcript = out_dir / "transcript.jsonl"
-    env = openrouter.claude_env(model) if provider == OPENROUTER else None
+    env = openrouter.claude_env(model, base_url) if provider == OPENROUTER else None
     proc = procs.run(argv, cwd=cwd, timeout=TIMEOUT_SECONDS[role], stdout_path=transcript,
                      stderr_path=out_dir / "stderr.log", env=env, stdin_path=prompt_path)
-    return _finish(classify_claude(transcript, proc, role), cwd)
+    return _finish(_spend_checked(classify_claude(transcript, proc, role), out_dir), cwd)
 
 
 def run_codex(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path, provider: str = NATIVE,
               offline: bool = False) -> Session:
     out_dir = out_dir.resolve()
+    base_url = routing.session_base(provider, model, str(out_dir)) if provider == OPENROUTER else None
     out_dir.mkdir(parents=True, exist_ok=True)
     final_path = out_dir / "final.txt"
     transcript = out_dir / "transcript.jsonl"
@@ -168,7 +172,7 @@ def run_codex(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path, p
         if offline:
             config += 'web_search = "disabled"\n'
         if provider == OPENROUTER:
-            config += openrouter.CODEX_PROVIDER_CONFIG
+            config += openrouter.codex_provider_config(base_url + "/v1")
             env = openrouter.codex_env(codex_home)
         else:
             shutil.copy2(Path.home() / ".codex" / "auth.json", codex_home / "auth.json")
@@ -195,7 +199,7 @@ def run_codex(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path, p
         captured = rollout_usage(codex_home)  # after the session's own files are safe
     finally:
         shutil.rmtree(codex_home, ignore_errors=True)
-    session = classify_codex(transcript, final_path, proc, role, model)
+    session = _spend_checked(classify_codex(transcript, final_path, proc, role, model), out_dir)
     if session.usage:  # without session totals the attempt stays unpriced, never priced from a partial capture
         session = replace(session, usage={**session.usage, **captured})
     return _finish(session, cwd)
@@ -305,6 +309,15 @@ def _timed_out(transcript: Path, proc: procs.ProcResult, role: str, *, final_tex
     # A judge has no partial artifact to score, so its timeout is an infrastructure failure.
     terminal = INFRA if role == JUDGE else TIMEOUT
     return Session(terminal, f"wall clock {TIMEOUT_SECONDS[role]}s", final_text, transcript, proc.seconds)
+
+
+def _spend_checked(session: Session, out_dir: Path) -> Session:
+    """A session the envelope refused ends INFRA whatever its exit: a CLI that retried and then got
+    through must not hide the refusal."""
+    refused = routing.refusal(str(out_dir))
+    if refused is None:
+        return session
+    return replace(session, terminal=INFRA, reason=f"{SPEND_REFUSED}: {refused}")
 
 
 def _finish(session: Session, cwd: Path) -> Session:

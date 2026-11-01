@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from eval.harness import agents, openrouter, procs
+from eval.harness import agents, openrouter, procs, routing
 
 KEY = "sk-or-v1-SYNTHETIC0123456789abcdef"
 MODEL = "qwen/qwen3-coder-30b-a3b-instruct"
@@ -28,6 +28,18 @@ class _KeyFile(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
 
+class StubProxy:
+    """Stands in for routing.Proxy: every routed session needs an active routing context."""
+    BASE = "http://127.0.0.1:9/s/token"
+
+    def __init__(self, *models):
+        self.upstreams = {routing.route_name(agents.OPENROUTER, m): None for m in models}
+        self.env = mock.Mock(refusal=lambda attempt: None)
+
+    def session(self, job, attempt):
+        return {route: f"{self.BASE}/{route}" for route in self.upstreams}
+
+
 class RoutedSessionTest(_KeyFile):
     """The key reaches a routed session only through its own process: never argv, files or a tool shell."""
 
@@ -44,7 +56,8 @@ class RoutedSessionTest(_KeyFile):
             return procs.ProcResult(0, False, 0.1)
 
         with mock.patch.object(procs, "run", fake_run), \
-                mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "parent", "CLAUDE_EFFORT": "max"}):
+                mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "parent", "CLAUDE_EFFORT": "max"}), \
+                routing.active(StubProxy(model)), routing.job("j"):
             run(model, "do it", role=agents.WRITER, cwd=self.tmp, out_dir=self.tmp / "out", provider=agents.OPENROUTER)
         return calls[0]
 
@@ -63,7 +76,8 @@ class RoutedSessionTest(_KeyFile):
         for name in openrouter.KEY_VARIABLES:
             self.assertNotIn(name, call["env"])
         self.assertNotIn("CLAUDE_EFFORT", call["env"])
-        self.assertEqual(call["env"]["ANTHROPIC_BASE_URL"], openrouter.ANTHROPIC_BASE_URL)
+        self.assertEqual(call["env"]["ANTHROPIC_BASE_URL"],
+                         f"{StubProxy.BASE}/{routing.route_name(agents.OPENROUTER, MODEL)}")  # the proxy, never the provider
         for name in openrouter._CLAUDE_MODEL_VARIABLES:
             self.assertEqual(call["env"][name], MODEL)
         settings = json.loads(call["files"]["settings.json"])
@@ -82,6 +96,8 @@ class RoutedSessionTest(_KeyFile):
         self.assertNotIn("auth.json", call["files"])
         config = tomllib.loads(call["files"]["config.toml"])
         self.assertEqual(config["model_provider"], "openrouter")
+        self.assertEqual(config["model_providers"]["openrouter"]["base_url"],
+                         f"{StubProxy.BASE}/{routing.route_name(agents.OPENROUTER, 'z-ai/glm-4.7-flash')}/v1")
         self.assertEqual(config["model_providers"]["openrouter"]["env_key"], "OPENROUTER_API_KEY")
         self.assertEqual(config["model_reasoning_effort"], agents.CODEX_EFFORT)
         self.assertEqual(set(config["shell_environment_policy"]["exclude"]), set(openrouter.KEY_VARIABLES))

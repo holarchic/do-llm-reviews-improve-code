@@ -32,11 +32,13 @@ _AGENT_PREFIXES = ("CLAUDE", "CODEX_", "AI_AGENT")
 _CLAUDE_MODEL_VARIABLES = ("ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
                            "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL",
                            "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL")
-CODEX_PROVIDER_CONFIG = f"""model_provider = "openrouter"
+def codex_provider_config(base_url: str = API_BASE_URL) -> str:
+    """Codex's provider block; a routed session's `base_url` is the routing proxy's (routing.py)."""
+    return f"""model_provider = "openrouter"
 
 [model_providers.openrouter]
 name = "OpenRouter"
-base_url = "{API_BASE_URL}"
+base_url = "{base_url}"
 env_key = "OPENROUTER_API_KEY"
 wire_api = "responses"
 
@@ -84,18 +86,19 @@ def claude_key_helper() -> str:
     return f"/bin/cat {KEY_PATH}"
 
 
-def claude_env(model: str) -> dict[str, str]:
-    """The environment of a Claude Code session routed to `model`; its key comes from claude_key_helper()."""
+def claude_env(model: str, base_url: str = ANTHROPIC_BASE_URL) -> dict[str, str]:
+    """The environment of a Claude Code session routed to `model`; its key comes from claude_key_helper().
+    A routed session's `base_url` is the routing proxy's (routing.py)."""
     return {
         **_inherited(),
-        "ANTHROPIC_BASE_URL": ANTHROPIC_BASE_URL,
+        "ANTHROPIC_BASE_URL": base_url,
         **{name: model for name in _CLAUDE_MODEL_VARIABLES},
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
     }
 
 
 def codex_env(codex_home: Path) -> dict[str, str]:
-    """The environment of a Codex session whose home holds CODEX_PROVIDER_CONFIG."""
+    """The environment of a Codex session whose home holds `codex_provider_config()`."""
     return {**_inherited(), "CODEX_HOME": str(codex_home), "OPENROUTER_API_KEY": api_key()}
 
 

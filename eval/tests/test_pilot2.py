@@ -75,25 +75,70 @@ class SpendCapTest(unittest.TestCase):
         self.assertIsNone(openrouter.spent(self.tmp / "missing.json", "scored"))
 
 
-class RunBuildsCapTest(unittest.TestCase):
-    def test_no_job_is_admitted_past_the_cap(self):
+class RunBuildsEnvelopeTest(unittest.TestCase):
+    """A routed run reserves each job's estimate in its envelope before the job starts."""
+
+    def test_no_job_starts_past_funded_credit_and_each_releases_after(self):
+        import contextlib
+        from eval.harness import envelope, routing
         root = Path(tempfile.mkdtemp(prefix="eval-test-"))
         self.addCleanup(shutil.rmtree, root)
-        experiment = dataclasses.replace(PILOT2, tasks=("dev-intervals",), reps=2, parallel=1, budget_usd=1.0)
-        usage = iter([0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0])
-        started = []
+        experiment = dataclasses.replace(PILOT2, tasks=("dev-intervals",), reps=2, parallel=1, envelope="T",
+                                         arms=(PILOT2.arm("A1"),))
+        owned = envelope.Envelope.owned("T", root=root / "envelopes", create_usd=50.0)
+        env = owned.__enter__()
+        self.addCleanup(owned.__exit__, None, None, None)
+        env.fund(credit=5.0)
+        env.register_scope("or", provider="openrouter", fingerprint="fp", opening_usage=0.0, allocation=5.0,
+                           provider_limit=5.0)
+        writer = PILOT2.arm("A1").writer
+        env.set_route(routing.route_name(writer.provider, writer.model), scope="or", max_charge=0.5, slots=2,
+                      policy={}, bootstrap_build_usd=2.0)  # each job reserves 1.5 × $2
+        env.reconcile("or", 0.0)
+        started, held = [], []
 
         def fake_execute(task, arm, runs_root, *, rep=None, manifest_hash, offline=False):
-            started.append((arm.name, rep))
+            started.append(rep)
+            held.append(sorted(j for j, r in env.state["reservations"].items() if r["open"]))
             return {"run_id": loop.run_id(task.id, arm.name, rep), "exec": "exec-1", "status": "invalid"}
 
         with mock.patch.object(manifest, "verify", return_value="d"), \
-                mock.patch.object(openrouter, "credit_used", side_effect=lambda: next(usage)), \
+                mock.patch.object(pilot, "routing_context", lambda e: contextlib.nullcontext(env)), \
                 mock.patch.object(pilot.loop, "execute_run", fake_execute):
             self.assertEqual(pilot.run_builds(root, experiment), 1)
-        self.assertEqual(len(started), 2)  # admitted at 0.0 and 0.5; refused from 1.0 on
-        ledger = json.loads((root / pilot.SPEND_LEDGER).read_text())
-        self.assertEqual(ledger["scored"]["baseline"], 0.0)
+        self.assertEqual(len(started), 2)  # each $3 hold is released before the next job: both fit in turn
+        self.assertEqual([len(h) for h in held], [1, 1])
+        env.reserve("other", 3.0)  # nothing is left held
+        self.assertFalse(any(r["open"] for j, r in env.state["reservations"].items() if j != "other"))
+
+    def test_a_job_whose_reservation_does_not_fit_never_starts(self):
+        import contextlib
+        from eval.harness import envelope, routing
+        root = Path(tempfile.mkdtemp(prefix="eval-test-"))
+        self.addCleanup(shutil.rmtree, root)
+        experiment = dataclasses.replace(PILOT2, tasks=("dev-intervals",), reps=2, parallel=1, envelope="T",
+                                         arms=(PILOT2.arm("A1"),))
+        owned = envelope.Envelope.owned("T", root=root / "envelopes", create_usd=50.0)
+        env = owned.__enter__()
+        self.addCleanup(owned.__exit__, None, None, None)
+        env.fund(credit=2.5)
+        env.register_scope("or", provider="openrouter", fingerprint="fp", opening_usage=0.0, allocation=2.5,
+                           provider_limit=2.5)
+        writer = PILOT2.arm("A1").writer
+        env.set_route(routing.route_name(writer.provider, writer.model), scope="or", max_charge=0.5, slots=2,
+                      policy={}, bootstrap_build_usd=2.0)  # 1.5 × $2 = $3 > $2.50
+        env.reconcile("or", 0.0)
+        started = []
+        with mock.patch.object(manifest, "verify", return_value="d"), \
+                mock.patch.object(pilot, "routing_context", lambda e: contextlib.nullcontext(env)), \
+                mock.patch.object(pilot.loop, "execute_run", lambda *a, **k: started.append(1)):
+            self.assertEqual(pilot.run_builds(root, experiment), 1)
+        self.assertEqual(started, [])
+
+    def test_a_routed_experiment_without_an_envelope_is_refused(self):
+        from eval.harness import routing
+        with mock.patch.object(manifest, "verify", return_value="d"), self.assertRaises(routing.RoutingRequired):
+            pilot.run_builds(Path(tempfile.mkdtemp(prefix="eval-test-")), PILOT2)
 
 
 class RoutedRunTest(unittest.TestCase):

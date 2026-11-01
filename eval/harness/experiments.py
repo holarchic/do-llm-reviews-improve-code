@@ -56,7 +56,8 @@ class Experiment:
     tasks: tuple[str, ...] = PILOT_TASKS
     reps: int = 1  # replicates per task × arm; above 1, run ids end in --r<n>
     parallel: int = 3
-    budget_usd: float | None = None  # OpenRouter spend cap for the scored runs
+    budget_usd: float | None = None  # pilot 2's OpenRouter spend cap (history; new routed runs use `envelope`)
+    envelope: str | None = None  # the spend envelope a routed experiment draws on (envelope.py)
     report: str = "judged"  # "judged" (report.py) | "replicated" (replicated.py) | "replay" (replay.py)
     offline: bool = False  # tool commands reach no network beyond localhost (agents.py); a source task requires it
 

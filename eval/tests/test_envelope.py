@@ -335,3 +335,30 @@ class StageAndReservationTest(Fixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SpendCommandTest(Fixture):
+    def spend(self, *argv):
+        from eval.__main__ import main
+        with mock.patch.object(envelope, "DEFAULT_ROOT", self.root), mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+            return main(["spend", *argv])
+
+    def test_create_fund_resolve_and_status_from_the_command_line(self):
+        self.assertEqual(self.spend("create", "--envelope", "B", "--usd", "150"), 0)
+        self.assertEqual(self.spend("fund", "--envelope", "B", "--credit", "100", "--fees", "2", "--taxes", "3"), 0)
+        self.assertEqual(self.spend("fund", "--envelope", "B", "--credit", "60"), 3)  # 165 > 150
+        self.assertEqual(self.spend("status", "--envelope", "B"), 0)
+        with self.owned() as env:
+            env.register_scope("or", provider="openrouter", fingerprint="fp", opening_usage=0.0, allocation=10.0,
+                               provider_limit=10.0)
+            env.set_route("r", scope="or", max_charge=1.0, slots=2, policy={}, bootstrap_build_usd=1.0)
+            env.validate_route("r")
+            env.reconcile("or", 0.0)
+            env.reserve("job", 1.0)
+            env.admit("q1", "r", job="job", attempt="a1")
+            # A mutating command is refused while a run owns the envelope; status still reads.
+            self.assertEqual(self.spend("resolve", "--envelope", "B", "--request", "q1", "--billed", "0.3"), 3)
+            self.assertEqual(self.spend("status", "--envelope", "B"), 0)
+        self.assertEqual(self.spend("resolve", "--envelope", "B", "--request", "q1"), 2)  # neither flag
+        self.assertEqual(self.spend("resolve", "--envelope", "B", "--request", "q1", "--billed", "0.3"), 0)
+        self.assertEqual(envelope.load(self.root / "B.json")["requests"]["q1"]["billed"], 0.3)
