@@ -15,6 +15,14 @@ DEV = tasks.Task(tasks.TASKS_ROOT / "dev-intervals")
 PILOT = experiments.PILOT
 
 
+class AgentTest(unittest.TestCase):
+    def test_an_agent_names_a_known_provider_and_routed_means_not_native(self):
+        self.assertFalse(agents.Agent("claude", "claude-opus-5-5").routed)
+        self.assertTrue(experiments.QWEN_WRITER.routed)
+        with self.assertRaises(ValueError):
+            agents.Agent("claude", "m", "deepseek")
+
+
 class PilotUnchangedTest(unittest.TestCase):
     """The pilot experiment reproduces the frozen pilot (commit 071f3d0) exactly."""
 

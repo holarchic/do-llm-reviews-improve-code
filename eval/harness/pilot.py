@@ -39,7 +39,7 @@ RESERVE_FACTOR = 1.5  # a job reserves this times its estimated cost
 
 
 def routed_seats(arm) -> list:
-    return [a for a in (arm.writer, arm.reviewer) if a is not None and a.provider != "native"]
+    return [a for a in (arm.writer, arm.reviewer) if a is not None and a.routed]
 
 
 def job_id(experiment: Experiment, purpose: str, run_id: str) -> str:
@@ -52,7 +52,7 @@ def job_estimate(env: envelope.Envelope, experiment: Experiment, arm_name: str, 
     its routed seats (the envelope funds no native seat), or × its routes' bootstrap cost when there is
     none (or when a calibration build's routed spend is partly unknown)."""
     arm = experiment.arm(arm_name)
-    routed = {spend.seat(a) for a in routed_seats(arm)}
+    routed = frozenset(spend.seat(a) for a in routed_seats(arm))
     names = [routing.route_name(a.provider, a.model) for a in routed_seats(arm)]
     routes = {n: env.route(n) for n in names}
     missing = [n for n, r in routes.items() if r is None]
@@ -61,11 +61,15 @@ def job_estimate(env: envelope.Envelope, experiment: Experiment, arm_name: str, 
     bootstrap = sum(r.bootstrap_build_usd for r in routes.values())
     highs, unknown = [], False
     for run_root in sorted(calibration_runs.glob(f"*--{arm_name}--r*")) if calibration_runs.is_dir() else []:
-        for execution in spend.run_cost(run_root, None, arm).unscored:
-            on_routes = [a for a in execution.attempts if a.seat is None or a.seat in routed]
-            highs.append(sum(a.cost.high for a in on_routes if a.cost is not None))
-            # An unreadable record, or an attempt of unknown seat or cost, may hide routed spend.
-            unknown = unknown or bool(execution.unreadable) or any(a.cost is None for a in on_routes)
+        # Only routed attempts are priced: a native seat's price (or its absence) never moves a reservation.
+        for execution in spend.run_cost(run_root, None, arm, routed).unscored:
+            cost = sum(a.cost.high for a in execution.attempts if a.cost is not None)
+            # An unreadable record, an attempt of unknown seat or cost, or a build that never reached a
+            # routed seat (a native writer that timed out) is no measurement of the routed cost.
+            if execution.unreadable or not execution.attempts or any(a.cost is None for a in execution.attempts):
+                unknown = True
+            elif cost > 0:
+                highs.append(cost)
     base = max(highs) if highs else bootstrap
     return RESERVE_FACTOR * (max(base, bootstrap) if unknown else base)
 

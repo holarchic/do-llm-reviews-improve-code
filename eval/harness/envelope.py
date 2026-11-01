@@ -13,7 +13,7 @@ calibration and retries sit inside the same cumulative bound. The guarantee, in 
 One process owns an envelope at a time (an exclusive flock held for its lifetime); every
 transition is check, modify a copy, persist with an atomic replace, then swap in, under one mutex,
 so a crash or a failed write leaves the last persisted state and never a half-recorded charge.
-Lock order is the envelope's own lock, then the registry lock. State that can't be read or doesn't
+Lock order is the envelope's own flock, then the registry lock, then the in-process mutex. State that can't be read or doesn't
 check out refuses everything.
 """
 
@@ -125,7 +125,13 @@ class Envelope:
             draft = copy.deepcopy(self._state)
             result = change(draft)
             _check(draft)
-            _write(self.path, draft)
+            try:
+                _write(self.path, draft)
+            except OSError as exc:
+                # The file may hold either state (a failure after the replace has committed the new one):
+                # this owner can no longer tell, so it writes nothing more; a new owner reloads the file.
+                self._closed = True
+                raise EnvelopeError(f"the ledger write failed ({type(exc).__name__}); reopen the envelope") from None
             self._state = draft
             return result
 
@@ -151,7 +157,8 @@ class Envelope:
             raise Refused("a probe reservation must be positive")
 
         def change(s):
-            held = s["reservations"].setdefault(PROBE, {"amount": 0.0, "open": True, "terminated": False})
+            held = s["reservations"].setdefault(PROBE, {"amount": 0.0, "open": True, "terminated": False,
+                                                        "baseline": 0.0})  # cumulative: probe funding vs spend
             held["amount"] += usd
             held["open"], held["terminated"] = True, False
             _require_reservations_fit(s)
@@ -255,7 +262,10 @@ class Envelope:
             if held is not None and held["open"]:
                 held["terminated"] = False  # a resumed job keeps the reservation it holds
                 return
-            s["reservations"][job] = {"amount": amount, "open": True, "terminated": False}
+            # A job id reopened for a fresh execution starts a fresh hold: what it spent before (all settled,
+            # since its reservation closed) counts as other spend, not inside the new amount.
+            s["reservations"][job] = {"amount": amount, "open": True, "terminated": False,
+                                      "baseline": _job_spend(s, job) if held is not None else 0.0}
             _require_reservations_fit(s)
         self._transition(change)
 
@@ -472,7 +482,7 @@ def _check(s: dict) -> None:
                    and isinstance(r["ambiguous"], bool) and (r["billing_id"] is None or isinstance(r["billing_id"], str))
                    and (r["upstream"] is None or isinstance(r["upstream"], dict)), f"request {name}")
         ensure(all(_money(r["amount"]) and isinstance(r["open"], bool) and isinstance(r["terminated"], bool)
-                   for r in s["reservations"].values()), "reservations")
+                   and _money(r["baseline"]) for r in s["reservations"].values()), "reservations")
         ensure(all(isinstance(v, str) for v in s["refusals"].values()), "refusals")
         # The financial invariants, not only the shapes: a ledger that breaks them is not trusted.
         ensure(_funded(s) + _purchase_costs(s) + _overdraw(s) <= s["envelope_usd"] + _EPSILON,
@@ -518,8 +528,14 @@ def _require_allocations(s: dict) -> None:
         raise Refused(f"scope allocations ${allocated:.2f} exceed funded credit ${_funded(s):.2f}")
 
 
+def _job_spend(s: dict, job: str) -> float:
+    return sum(r["bound"] if r["state"] == "unresolved" else r["billed"] for r in s["requests"].values()
+               if r["job"] == job)
+
+
 def _require_reservations_fit(s: dict) -> None:
-    """Open reservations are full holds: each counts at the larger of its amount and its job's spend."""
+    """Open reservations are full holds: each counts at the larger of its amount and its job's spend
+    since the hold opened (its baseline, spent under an earlier hold, counts as other spend)."""
     open_jobs = {j for j, r in s["reservations"].items() if r["open"]}
     spent_by = {j: 0.0 for j in open_jobs}
     outside = 0.0
@@ -529,6 +545,10 @@ def _require_reservations_fit(s: dict) -> None:
             spent_by[r["job"]] += charge
         else:
             outside += charge
+    for j in open_jobs:
+        baseline = s["reservations"][j]["baseline"]
+        spent_by[j] -= baseline
+        outside += baseline
     held = sum(max(s["reservations"][j]["amount"], spent_by[j]) for j in open_jobs)
     if outside + held > _funded(s) + _EPSILON:
         raise Refused(f"reservations ${held:.2f} and other spend ${outside:.2f} exceed funded credit "

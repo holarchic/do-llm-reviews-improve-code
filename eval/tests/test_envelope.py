@@ -172,17 +172,30 @@ class SettlementTest(Fixture):
             self.assertFalse(env.settle("q1", None))
             self.assertEqual(envelope.summary(env.state, self.clock())["settled"], 0.4)
 
-    def test_a_failed_write_leaves_the_last_persisted_state(self):
+    def test_a_write_that_fails_before_the_replace_fences_the_owner_and_leaves_the_last_state(self):
         with self.owned() as env:
             self.ready(env)
             env.reserve("job", 1.0)
             env.admit("q1", "r", job="job", attempt="a1")
             with mock.patch.object(envelope.os, "replace", side_effect=OSError("disk full")):
-                with self.assertRaises(OSError):
+                with self.assertRaises(EnvelopeError):
                     env.settle("q1", 0.4)
-            self.assertEqual(env.state["requests"]["q1"]["state"], "unresolved")
             self.assertEqual(envelope.load(env.path)["requests"]["q1"]["state"], "unresolved")
-            self.assertTrue(env.settle("q1", 0.4))  # settled again after the crash: once
+            with self.assertRaises(EnvelopeError):
+                env.settle("q1", 0.4)  # fenced: it can no longer tell what the file holds
+        with self.owned() as env:  # a new owner reloads the file
+            self.assertTrue(env.settle("q1", 0.4))  # settled once
+
+    def test_a_write_that_fails_after_the_replace_fences_the_owner_and_the_new_state_stands(self):
+        with self.owned() as env:
+            self.ready(env)
+            with mock.patch.object(envelope.os, "fsync", side_effect=[None, OSError("dir fsync")]):
+                with self.assertRaises(EnvelopeError):
+                    env.fund(credit=1.0)
+            with self.assertRaises(EnvelopeError):
+                env.fund(credit=1.0)  # a stale copy can't overwrite the committed state
+        with self.owned() as env:
+            self.assertEqual(sum(f["credit"] for f in env.state["funding"]), 101.0)
 
     def test_a_restart_keeps_unresolved_obligations_after_a_route_is_changed(self):
         with self.owned() as env:
@@ -370,6 +383,18 @@ class SpendCommandTest(Fixture):
 class ReworkTest(Fixture):
     """Phase review round 1: holds, envelope-wide trust, invariants on load, immutability, closed owners."""
 
+    def test_a_job_id_reopened_for_a_fresh_execution_gets_a_fresh_hold(self):
+        with self.owned() as env:
+            self.ready(env, credit=5.0, fees=0.0, taxes=0.0, allocation=5.0, max_charge=4.0, slots=1)
+            env.reserve("job", 4.0)
+            env.admit("q1", "r", job="job", attempt="a1")
+            env.settle("q1", 4.0)
+            self.assertTrue(env.finish("job"))
+            with self.assertRaises(Refused):
+                env.reserve("job", 3.0)  # $4 already spent + a fresh $3 hold > $5 funded
+            env.reserve("job", 1.0)
+            self.assertEqual(env.state["reservations"]["job"]["baseline"], 4.0)
+
     def test_a_request_never_eats_into_another_jobs_hold(self):
         with self.owned() as env:
             self.ready(env, credit=10.0, fees=0.0, taxes=0.0, allocation=10.0, max_charge=4.0, slots=8)
@@ -445,7 +470,7 @@ class RoundTwoTest(Fixture):
                 with self.subTest(bad=bad), self.assertRaises(Refused):
                     env.raise_allocation("or", bad)
 
-    def test_a_zero_bound_route_or_a_request_without_its_route_is_not_loaded(self):
+    def test_a_zero_bound_route_an_orphan_request_or_a_negative_baseline_is_not_loaded(self):
         with self.owned() as env:
             self.ready(env)
             env.reserve("job", 1.0)
@@ -456,7 +481,9 @@ class RoundTwoTest(Fixture):
         zero["routes"]["r"]["max_charge"] = 0.0
         orphan = json.loads(json.dumps(state))
         orphan["requests"]["q1"]["route"] = "gone"
-        for broken in (zero, orphan):
+        negative = json.loads(json.dumps(state))
+        negative["reservations"]["job"]["baseline"] = -5.0  # would hide spend from the job's hold
+        for broken in (zero, orphan, negative):
             path.write_text(json.dumps(broken))
             with self.assertRaises(EnvelopeError):
                 envelope.load(path)

@@ -78,8 +78,7 @@ class Experiment:
 
     @property
     def routed(self) -> bool:
-        return any(agent is not None and agent.provider == OPENROUTER
-                   for arm in self.arms for agent in (arm.writer, arm.reviewer))
+        return any(agent is not None and agent.routed for arm in self.arms for agent in (arm.writer, arm.reviewer))
 
 
 def _families(name: str, title: str, writer: Agent, same: Agent, cross: Agent, seed: int, prereg: str,

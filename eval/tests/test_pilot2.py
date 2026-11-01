@@ -111,6 +111,39 @@ class JobEstimateTest(unittest.TestCase):
             with mock.patch.dict(prices.PRICES, {("openrouter", routed.model): prices.Price(
                     "openrouter", routed.model, prices.Rates(1.0, 0.1, 5.0), "test")}):
                 self.assertAlmostEqual(pilot.job_estimate(env, experiment, "M", calibration), 1.5)  # 1.5 × $1
+                # A build whose native writer never reached the routed reviewer measures nothing routed.
+                stopped = calibration / "dev-intervals--M--r2" / "exec-1"
+                stopped.mkdir(parents=True)
+                (stopped / "record.json").write_text(json.dumps({"steps": [step("build", native, native.model, True)]}))
+                self.assertAlmostEqual(pilot.job_estimate(env, experiment, "M", calibration), 3.0)  # 1.5 × $2 bootstrap
+
+    def test_an_unpriced_native_seat_never_reaches_the_estimate(self):
+        from eval.harness import envelope, routing
+        root = Path(tempfile.mkdtemp(prefix="eval-test-"))
+        self.addCleanup(shutil.rmtree, root)
+        native = agents.Agent("codex", "gpt-6-luna", agents.NATIVE)  # not in the price table
+        routed = experiments.QWEN_WRITER
+        experiment = dataclasses.replace(PILOT2, envelope="T", arms=(experiments.Arm("M", routed, native),))
+        with envelope.Envelope.owned("T", root=root / "envelopes", create_usd=50.0) as env:
+            env.fund(credit=10.0)
+            env.register_scope("or", provider="openrouter", fingerprint="fp", opening_usage=0.0, allocation=10.0,
+                               provider_limit=None)
+            env.set_route(routing.route_name(routed.provider, routed.model), scope="or", max_charge=0.5,
+                          slots=1, policy={}, bootstrap_build_usd=2.0)
+            calibration = root / "calibration" / "runs"
+            exec_dir = calibration / "dev-intervals--M--r1" / "exec-1"
+            exec_dir.mkdir(parents=True)
+            usage = {"input_tokens": 10, "cached_input_tokens": 0, "output_tokens": 1}
+            (exec_dir / "record.json").write_text(json.dumps({"steps": [
+                {"name": "build", "agent": {"cli": "claude", "model": routed.model, "provider": routed.provider},
+                 "attempts": [{"seconds": 1, "usage": {"by_model": {routed.model: {
+                     "inputTokens": 1_000_000, "outputTokens": 0, "cacheReadInputTokens": 0,
+                     "cacheCreationInputTokens": 0}}}}]},
+                {"name": "review-1", "agent": {"cli": "codex", "model": native.model, "provider": native.provider},
+                 "attempts": [{"seconds": 1, "usage": usage}]}]}))
+            with mock.patch.dict(prices.PRICES, {("openrouter", routed.model): prices.Price(
+                    "openrouter", routed.model, prices.Rates(1.0, 0.1, 5.0), "test")}):
+                self.assertAlmostEqual(pilot.job_estimate(env, experiment, "M", calibration), 1.5)
 
     def test_experiments_sharing_an_envelope_never_share_a_jobs_hold(self):
         from eval.harness import envelope, routing

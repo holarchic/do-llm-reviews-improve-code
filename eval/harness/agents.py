@@ -60,6 +60,15 @@ class Agent:
     model: str
     provider: str = NATIVE  # NATIVE: the CLI's own login | OPENROUTER
 
+    def __post_init__(self):
+        if self.provider not in (NATIVE, OPENROUTER):
+            raise ValueError(f"unknown provider {self.provider!r}")
+
+    @property
+    def routed(self) -> bool:
+        """Served through a spend envelope's proxy rather than the CLI's own login."""
+        return self.provider != NATIVE
+
 
 def run(agent: Agent, prompt: str, *, role: str, cwd: Path, out_dir: Path, offline: bool = False) -> "Session":
     session = {"claude": run_claude, "codex": run_codex}[agent.cli]

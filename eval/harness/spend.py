@@ -47,16 +47,17 @@ def seat(agent: agents.Agent) -> ledger.Seat:
     return ledger.Seat(agent.cli, prices.ANTHROPIC if agent.cli == "claude" else prices.OPENAI, agent.model)
 
 
-def run_cost(run_root: Path, scored_exec: Path | None, arm) -> RunCost:
-    """Every saved execution of one run; `scored_exec` is the one the report scores, if any."""
+def run_cost(run_root: Path, scored_exec: Path | None, arm, seats: frozenset | None = None) -> RunCost:
+    """Every saved execution of one run; `scored_exec` is the one the report scores, if any. With
+    `seats`, only attempts on those seats are priced (and kept), plus any whose seat is unknown."""
     execs = sorted((p for p in run_root.glob("exec-*") if p.is_dir() and p.name[5:].isdigit()),
                    key=lambda p: int(p.name[5:]))
-    costs = [execution_cost(exec_dir, arm) for exec_dir in execs]
+    costs = [execution_cost(exec_dir, arm, seats) for exec_dir in execs]
     scored = next((c for c in costs if scored_exec is not None and c.exec_dir == scored_exec), None)
     return RunCost(scored, tuple(c for c in costs if c is not scored))
 
 
-def execution_cost(exec_dir: Path, arm) -> ExecutionCost:
+def execution_cost(exec_dir: Path, arm, seats: frozenset | None = None) -> ExecutionCost:
     try:
         steps = json.loads((exec_dir / "record.json").read_text(encoding="utf-8"))["steps"]
         if not isinstance(steps, list):
@@ -73,6 +74,8 @@ def execution_cost(exec_dir: Path, arm) -> ExecutionCost:
                                                reason="step without a name or with no attempts"))
             continue
         served, problem = _step_seat(step, name, arm)
+        if seats is not None and served is not None and served not in seats:
+            continue  # another seat's attempts are neither priced nor kept
         for number, raw in enumerate(raw_attempts, start=1):
             if served is None:
                 attempts.append(ledger.AttemptCost(name, ledger.UNKNOWN, 0.0, reason=problem))
@@ -86,7 +89,10 @@ def _step_seat(step: dict, name: str, arm) -> tuple[ledger.Seat | None, str]:
     if "agent" in step:
         recorded = step["agent"]
         if isinstance(recorded, dict) and all(isinstance(recorded.get(k), str) for k in ("cli", "model", "provider")):
-            return seat(agents.Agent(recorded["cli"], recorded["model"], recorded["provider"])), ""
+            try:
+                return seat(agents.Agent(recorded["cli"], recorded["model"], recorded["provider"])), ""
+            except ValueError as exc:  # an unknown provider
+                return None, f"the step's recorded agent is malformed: {exc}"
         return None, "the step's recorded agent is malformed"
     agent = arm.reviewer if "review" in name else arm.writer
     return (None, "no agent for this step") if agent is None else (seat(agent), "")

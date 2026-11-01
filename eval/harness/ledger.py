@@ -82,7 +82,6 @@ class AttemptCost:
     tokens: dict[str, Tokens] = field(default_factory=dict)  # model -> tokens
     cost: Cost | None = None  # None exactly when basis is UNKNOWN
     reason: str = ""
-    seat: Seat | None = None  # who served it, when the record says
 
     def __post_init__(self):
         if (self.cost is None) != (self.basis == UNKNOWN):
@@ -158,8 +157,8 @@ def attempt_cost(step: str, raw, seat: Seat, attempt_dir: Path) -> AttemptCost:
             cost += price_tokens(piece.tokens, prices.lookup(seat.provider, piece.model), one_request=piece.one_request)
             tokens[piece.model] = tokens.get(piece.model, Tokens()) + piece.tokens
     except Unusable as exc:
-        return AttemptCost(step, UNKNOWN, seconds, reason=str(exc), seat=seat)
-    return AttemptCost(step, basis, seconds, tokens, cost, reason, seat)
+        return AttemptCost(step, UNKNOWN, seconds, reason=str(exc))
+    return AttemptCost(step, basis, seconds, tokens, cost, reason)
 
 
 def price_tokens(tokens: Tokens, price: prices.Price, *, one_request: bool) -> Cost:
