@@ -67,22 +67,26 @@ def execution_cost(exec_dir: Path, arm) -> ExecutionCost:
     for index, step in enumerate(steps):
         name = step.get("name") if isinstance(step, dict) else None
         raw_attempts = step.get("attempts") if isinstance(step, dict) else None
-        if not isinstance(name, str) or not isinstance(raw_attempts, list):
+        if not isinstance(name, str) or not isinstance(raw_attempts, list) or not raw_attempts:
+            # The loop records a step only after at least one attempt.
             attempts.append(ledger.AttemptCost(name if isinstance(name, str) else "?", ledger.UNKNOWN, 0.0,
-                                               reason="step without a name or an attempts list"))
+                                               reason="step without a name or with no attempts"))
             continue
-        served = _step_seat(step, name, arm)
+        served, problem = _step_seat(step, name, arm)
         for number, raw in enumerate(raw_attempts, start=1):
             if served is None:
-                attempts.append(ledger.AttemptCost(name, ledger.UNKNOWN, 0.0, reason="no agent for this step"))
+                attempts.append(ledger.AttemptCost(name, ledger.UNKNOWN, 0.0, reason=problem))
                 continue
             attempts.append(ledger.attempt_cost(name, raw, served, loop.attempt_dir(exec_dir, index, name, number)))
     return ExecutionCost(exec_dir, tuple(attempts))
 
 
-def _step_seat(step: dict, name: str, arm) -> ledger.Seat | None:
-    recorded = step.get("agent")
-    if isinstance(recorded, dict) and all(isinstance(recorded.get(k), str) for k in ("cli", "model", "provider")):
-        return seat(agents.Agent(recorded["cli"], recorded["model"], recorded["provider"]))
-    agent = arm.reviewer if "review" in name else arm.writer  # records made before steps named their agent
-    return None if agent is None else seat(agent)
+def _step_seat(step: dict, name: str, arm) -> tuple[ledger.Seat | None, str]:
+    """The step's recorded agent; a record made before steps named one resolves it by the step's name."""
+    if "agent" in step:
+        recorded = step["agent"]
+        if isinstance(recorded, dict) and all(isinstance(recorded.get(k), str) for k in ("cli", "model", "provider")):
+            return seat(agents.Agent(recorded["cli"], recorded["model"], recorded["provider"])), ""
+        return None, "the step's recorded agent is malformed"
+    agent = arm.reviewer if "review" in name else arm.writer
+    return (None, "no agent for this step") if agent is None else (seat(agent), "")

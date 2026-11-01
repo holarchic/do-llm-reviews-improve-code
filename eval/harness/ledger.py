@@ -80,6 +80,10 @@ class AttemptCost:
     cost: Cost | None = None  # None exactly when basis is UNKNOWN
     reason: str = ""
 
+    def __post_init__(self):
+        if (self.cost is None) != (self.basis == UNKNOWN):
+            raise ValueError(f"{self.step}: basis {self.basis} with cost {self.cost}")
+
 
 @dataclass
 class Totals:
@@ -189,7 +193,9 @@ def _check_service(usage: dict) -> None:
 
 
 def _number(value) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return value >= 0 and (isinstance(value, int) or math.isfinite(value))
 
 
 def _count(container: dict, key: str, *, required: bool = True) -> int:
@@ -226,8 +232,8 @@ def _claude_model_tokens(counters) -> Tokens:
 
 def _claude_turn_tokens(usage: dict) -> Tokens:
     created = _count(usage, "cache_creation_input_tokens", required=False)
-    split = usage.get("cache_creation") or {}
-    details = usage.get("output_tokens_details") or {}
+    split = {} if usage.get("cache_creation") is None else usage["cache_creation"]
+    details = {} if usage.get("output_tokens_details") is None else usage["output_tokens_details"]
     if not isinstance(split, dict) or not isinstance(details, dict):
         raise Unusable("cache_creation or output_tokens_details is not a table")
     dated = {"5m": _count(split, "ephemeral_5m_input_tokens", required=False),

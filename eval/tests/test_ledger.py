@@ -140,13 +140,27 @@ class UnusableTest(Fixture):
                 self.assertIsNone(cost.cost)
                 self.assertTrue(cost.reason)
 
+    def test_a_huge_or_malformed_duration_counts_as_zero_seconds(self):
+        for seconds in (10 ** 400, -1, math.inf, "x", True):
+            with self.subTest(seconds=seconds):
+                self.assertEqual(ledger.attempt_cost("review", {"usage": {}, "seconds": seconds}, SOL, self.tmp).seconds,
+                                 0.0 if seconds != 10 ** 400 else 10 ** 400)
+
+    def test_an_attempt_cost_cannot_be_unknown_and_priced(self):
+        with self.assertRaises(ValueError):
+            ledger.AttemptCost("build", ledger.UNKNOWN, 0.0, cost=ledger.Cost(1.0, 1.0))
+        with self.assertRaises(ValueError):
+            ledger.AttemptCost("build", ledger.SESSION, 0.0)
+
     def test_an_unpriced_model_raises(self):
         with self.assertRaises(prices.UnpricedModel):
             ledger.attempt_cost("review", {"usage": codex_usage(10)}, ledger.Seat("codex", prices.OPENAI, "gpt-0"),
                                 self.tmp)
 
     def test_an_attempt_without_usage_and_empty_model_counters_are_unknown(self):
-        for raw in ({"seconds": 4}, "not a table", {"usage": {"by_model": {"claude-opus-5-5": {}}}}):
+        turn = {"input_tokens": 1, "output_tokens": 1}
+        for raw in ({"seconds": 4}, "not a table", {"usage": {"by_model": {"claude-opus-5-5": {}}}},
+                    {"usage": {**turn, "cache_creation": []}}, {"usage": {**turn, "output_tokens_details": []}}):
             with self.subTest(raw=raw):
                 cost = ledger.attempt_cost("build", raw, OPUS, self.tmp)
                 self.assertEqual((cost.basis, cost.cost), (ledger.UNKNOWN, None))
@@ -207,6 +221,16 @@ class ExecutionTest(Fixture):
         self.assertEqual(attempts[0].basis, ledger.UNKNOWN)
         self.assertEqual((attempts[1].basis, set(attempts[1].tokens)), (ledger.SESSION, {"gpt-6.1-sol"}))
         self.assertAlmostEqual(attempts[1].cost.low, (100_000 * 2 + 1_000 * 10) / 1e6, places=12)
+
+    def test_a_malformed_recorded_agent_and_an_empty_attempts_list_are_unknowns(self):
+        run = self.tmp / "run"
+        bad = {"cli": "codex", "model": "gpt-6.1-sol", "provider": []}
+        exec_dir = self.write_exec(run, 1, [{"name": "build", "agent": bad, "attempts": [{"usage": codex_usage(10)}]},
+                                            {"name": "fix-1", "attempts": []}])
+        attempts = spend.run_cost(run, exec_dir, ARM).scored.attempts
+        self.assertEqual([a.basis for a in attempts], [ledger.UNKNOWN, ledger.UNKNOWN])
+        self.assertIn("malformed", attempts[0].reason)
+        self.assertEqual(spend.run_cost(run, exec_dir, ARM).scored.totals().unknown, 2)
 
     def test_step_kinds_strip_the_round(self):
         self.assertEqual([ledger.step_kind(n) for n in ("plan", "plan-review-3", "plan-revise-1", "fix-4", "build")],

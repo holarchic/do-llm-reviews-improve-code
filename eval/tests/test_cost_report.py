@@ -39,7 +39,7 @@ class CostReportTest(unittest.TestCase):
         complete = {("t1", 1): scored}
         with mock.patch.object(cost_report, "frozen_digest", lambda experiment: "d"), \
                 mock.patch.object(pilot, "complete_build",
-                                  lambda runs, task, arm, digest, rep: complete.get((task, rep))):
+                                  lambda runs, task, arm, digest, rep, **_: complete.get((task, rep))):
             report = cost_report.collect(self.root, self.experiment)
         cost = report.arms["R"]
         self.assertEqual((cost.builds, cost.missing), (1, ["t2--R--r1"]))
@@ -62,12 +62,17 @@ class CostReportTest(unittest.TestCase):
         self.assertIn("No manifest", cost_report.render(report))
 
     def test_an_unreadable_execution_and_a_never_built_arm_are_on_the_page(self):
+        """Through the real selector: a record the filesystem refuses is spend, not a crash."""
         broken = self.root / "runs" / "t1--R--r1" / "exec-1"
         broken.mkdir(parents=True)
-        (broken / "record.json").write_text("{not json", encoding="utf-8")
-        with mock.patch.object(cost_report, "frozen_digest", lambda experiment: "d"), \
-                mock.patch.object(pilot, "complete_build", lambda *args: None):
+        record = broken / "record.json"
+        record.write_text("{}", encoding="utf-8")
+        record.chmod(0)
+        self.addCleanup(record.chmod, 0o600)
+        with mock.patch.object(cost_report, "frozen_digest", lambda experiment: "d"):
             report = cost_report.collect(self.root, self.experiment)
+        with self.assertRaises(PermissionError):  # the runner itself must not take it for absent
+            pilot.complete_build(self.root / "runs", "t1", "R", "d", 1)
         self.assertEqual((report.arms["R"].unscored.attempts, report.arms["R"].unscored.unknown), (0, 1))
         text = cost_report.render(report)
         self.assertIn("(0 attempts, 1 unknown)", text)

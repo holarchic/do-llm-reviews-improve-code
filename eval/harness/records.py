@@ -1,9 +1,10 @@
 """Reading run and judgement records from disk, validated once at the boundary.
 
-Every consumer — resume, follow-ups, judging and the report — reads records
-through these loaders, so a record one of them would reject is never reused by
-another. A malformed record reads as absent: its job runs again, and the report
-counts it as missing.
+Every scoring consumer — resume, follow-ups, judging and the report — reads
+records through these loaders, so a record one of them would reject is never
+reused by another. A malformed record reads as absent: its job runs again, and
+the report counts it as missing. Accounting (`spend.py`) reads records on its
+own, because spend counts whether or not a record would score.
 """
 
 import json

@@ -48,7 +48,7 @@ def collect(data_root: Path, experiment: Experiment, arm_names: list[str] | None
             for rep in experiment.rep_ids:
                 run_id = loop.run_id(task_id, arm_name, rep)
                 scored = None if digest is None else pilot.complete_build(data_root / "runs", task_id, arm_name,
-                                                                             digest, rep)
+                                                                             digest, rep, skip_unreadable=True)
                 run = spend.run_cost(data_root / "runs" / run_id, scored, arm)
                 for unscored in run.unscored:
                     cost.unscored.merge(unscored.totals())

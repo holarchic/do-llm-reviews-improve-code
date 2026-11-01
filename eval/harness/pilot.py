@@ -67,12 +67,20 @@ def judge_schedule(experiment: Experiment) -> list[JudgeJob]:
     return jobs
 
 
-def complete_build(runs_root: Path, task_id: str, arm: str, digest: str, rep: int | None = None) -> Path | None:
-    """The newest complete exec of task × arm (× rep) under this manifest, if any."""
+def complete_build(runs_root: Path, task_id: str, arm: str, digest: str, rep: int | None = None, *,
+                   skip_unreadable: bool = False) -> Path | None:
+    """The newest complete exec of task × arm (× rep) under this manifest, if any.
+
+    A record the filesystem refuses to read raises: the runner must not take it for absent and
+    build again. Accounting passes `skip_unreadable`, which passes over it to an older exec."""
     run_root = runs_root / loop.run_id(task_id, arm, rep)
     for exec_dir in sorted(run_root.glob("exec-*"), key=lambda p: int(p.name.split("-")[1]), reverse=True):
-        if records.build(exec_dir / "record.json", digest) is not None:
-            return exec_dir
+        try:
+            if records.build(exec_dir / "record.json", digest) is not None:
+                return exec_dir
+        except OSError:
+            if not skip_unreadable:
+                raise
     return None
 
 
