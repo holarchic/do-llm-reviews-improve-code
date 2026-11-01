@@ -64,12 +64,12 @@ def job_estimate(env: envelope.Envelope, experiment: Experiment, arm_name: str, 
         # Only routed attempts are priced: a native seat's price (or its absence) never moves a reservation.
         for execution in spend.run_cost(run_root, None, arm, routed).unscored:
             cost = sum(a.cost.high for a in execution.attempts if a.cost is not None)
+            if cost > 0:
+                highs.append(cost)  # known spend is a floor, whatever else the execution hides
             # An unreadable record, an attempt of unknown seat or cost, or a build that never reached a
-            # routed seat (a native writer that timed out) is no measurement of the routed cost.
+            # routed seat (a native writer that timed out) is an incomplete measurement: floor at bootstrap.
             if execution.unreadable or not execution.attempts or any(a.cost is None for a in execution.attempts):
                 unknown = True
-            elif cost > 0:
-                highs.append(cost)
     base = max(highs) if highs else bootstrap
     return RESERVE_FACTOR * (max(base, bootstrap) if unknown else base)
 

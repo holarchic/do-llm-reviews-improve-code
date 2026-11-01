@@ -116,6 +116,13 @@ class JobEstimateTest(unittest.TestCase):
                 stopped.mkdir(parents=True)
                 (stopped / "record.json").write_text(json.dumps({"steps": [step("build", native, native.model, True)]}))
                 self.assertAlmostEqual(pilot.job_estimate(env, experiment, "M", calibration), 3.0)  # 1.5 × $2 bootstrap
+                # Known routed spend above the bootstrap stands even when the same execution has an unknown attempt.
+                partial = calibration / "dev-intervals--M--r3" / "exec-1"
+                partial.mkdir(parents=True)
+                (partial / "record.json").write_text(json.dumps({"steps": [
+                    step("review-1", routed, routed.model, True), step("review-2", routed, routed.model, True),
+                    step("review-3", routed, routed.model, True), step("review-4", routed, routed.model, False)]}))
+                self.assertAlmostEqual(pilot.job_estimate(env, experiment, "M", calibration), 4.5)  # 1.5 × max($3, $2)
 
     def test_an_unpriced_native_seat_never_reaches_the_estimate(self):
         from eval.harness import envelope, routing
