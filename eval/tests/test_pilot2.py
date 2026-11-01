@@ -124,6 +124,29 @@ class JobEstimateTest(unittest.TestCase):
                     step("review-3", routed, routed.model, True), step("review-4", routed, routed.model, False)]}))
                 self.assertAlmostEqual(pilot.job_estimate(env, experiment, "M", calibration), 4.5)  # 1.5 × max($3, $2)
 
+    def test_a_routed_glm_calibration_build_gives_a_usable_estimate(self):
+        """With the table's own GLM price (no patching): a GLM 5.3 calibration build reserves 1.5 × its cost."""
+        from eval.harness import envelope, routing
+        root = Path(tempfile.mkdtemp(prefix="eval-test-"))
+        self.addCleanup(shutil.rmtree, root)
+        glm = agents.Agent("claude", "z-ai/glm-5.3", agents.OPENROUTER)
+        experiment = dataclasses.replace(PILOT2, envelope="T", arms=(experiments.Arm("W", glm),))
+        with envelope.Envelope.owned("T", root=root / "envelopes", create_usd=50.0) as env:
+            env.fund(credit=10.0)
+            env.register_scope("or", provider="openrouter", fingerprint="fp", opening_usage=0.0, allocation=10.0,
+                               provider_limit=None)
+            env.set_route(routing.route_name(glm.provider, glm.model), scope="or", max_charge=0.5,
+                          slots=1, policy={}, bootstrap_build_usd=2.0)
+            exec_dir = root / "calibration" / "runs" / "dev-intervals--W--r1" / "exec-1"
+            exec_dir.mkdir(parents=True)
+            usage = {"inputTokens": 1_000_000, "outputTokens": 100_000, "cacheReadInputTokens": 0,
+                     "cacheCreationInputTokens": 0}
+            (exec_dir / "record.json").write_text(json.dumps({"steps": [
+                {"name": "build", "agent": {"cli": "claude", "model": glm.model, "provider": glm.provider},
+                 "attempts": [{"seconds": 1, "usage": {"by_model": {glm.model: usage}}}]}]}))
+            self.assertAlmostEqual(pilot.job_estimate(env, experiment, "W", root / "calibration" / "runs"),
+                                   1.5 * (1.40 + 0.44))
+
     def test_an_unpriced_native_seat_never_reaches_the_estimate(self):
         from eval.harness import envelope, routing
         root = Path(tempfile.mkdtemp(prefix="eval-test-"))

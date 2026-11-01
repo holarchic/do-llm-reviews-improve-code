@@ -282,3 +282,29 @@ def _events(transcript: Path) -> list[dict]:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RoutedPriceTest(Fixture):
+    """Every routed model B uses prices through the production path, cached input and writes included."""
+
+    def test_each_routed_model_prices_for_both_clis(self):
+        for provider, model, rates in (("deepseek", "deepseek-v4-pro", (1.32, 0.044, 3.96)),
+                                       ("deepseek", "deepseek-flash", (0.30, 0.006, 1.20)),
+                                       ("openrouter", "z-ai/glm-5.3", (1.40, 0.26, 4.40)),
+                                       ("openrouter", "z-ai/glm-5.3-flash", (0.15, 0.03, 0.50))):
+            fresh, cached, out = rates
+            with self.subTest(model=model):
+                codex = spend.seat(agents.Agent("codex", model, provider))
+                cost = ledger.attempt_cost("review", {"usage": codex_usage(1_000_000, 600_000, 100_000, 10_000)},
+                                           codex, self.tmp)
+                expected = (300_000 * fresh + 600_000 * cached + 100_000 * fresh + 10_000 * out) / 1e6
+                self.assertAlmostEqual(cost.cost.high, expected, places=9)
+                self.assertAlmostEqual(cost.cost.low, expected, places=9)
+                claude = spend.seat(agents.Agent("claude", model, provider))
+                usage = {"by_model": {model: model_usage(inputTokens=300_000, cacheReadInputTokens=600_000,
+                                                         cacheCreationInputTokens=100_000,
+                                                         cacheCreationEphemeral5mInputTokens=100_000,
+                                                         outputTokens=10_000)}}
+                cost = ledger.attempt_cost("build", {"usage": usage}, claude, self.attempt_dir())
+                self.assertIsNotNone(cost.cost, cost.reason)
+                self.assertAlmostEqual(cost.cost.high, expected, places=9)

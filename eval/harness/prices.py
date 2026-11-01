@@ -7,6 +7,12 @@ A model absent from the table is an error, never a free model.
 Anthropic prices standard (non-fast, global) inference and offers 5-minute and 1-hour cache
 writes. OpenAI prices Standard-tier requests and offers 30-minute and 12-hour cache writes. Both
 tiers below are per request, decided by the request's whole prompt (every input bucket).
+
+Routed models are priced as their route bills them. DeepSeek's own API is priced at its peak rates
+(01:00–04:00 and 06:00–10:00 UTC on weekdays; every other hour is half price), so a metered
+settlement is never below the real charge at any hour. GLM through OpenRouter is priced at Z.AI's
+endpoint, the only provider the route admits. Neither charges a cache write apart from input, so a
+write is priced as input.
 """
 
 import hashlib
@@ -16,9 +22,11 @@ from pathlib import Path
 AS_OF = "2026-11-01"
 TABLE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
-ANTHROPIC, OPENAI = "anthropic", "openai"
+ANTHROPIC, OPENAI, OPENROUTER, DEEPSEEK = "anthropic", "openai", "openrouter", "deepseek"
 _ANTHROPIC_SOURCE = "https://platform.claude.com/docs/en/about-claude/pricing"
 _OPENAI_SOURCE = "https://developers.openai.com/api/docs/pricing"
+_DEEPSEEK_SOURCE = "https://api-docs.deepseek.com/quick_start/pricing (peak rates)"
+_ZAI_ON_OPENROUTER_SOURCE = "https://openrouter.ai/api/v1/models/{model}/endpoints (provider Z.AI)"
 
 
 @dataclass(frozen=True)
@@ -65,6 +73,12 @@ def _openai(model: str, short: Rates, long: Rates) -> Price:
     return Price(OPENAI, model, short, _OPENAI_SOURCE, Tier(272_000, long))
 
 
+def _no_write_charge(provider: str, model: str, *, input: float, cached: float, output: float, source: str) -> Price:
+    # Whatever duration a CLI reports a write under, it is billed as input.
+    return Price(provider, model, Rates(input, cached, output, tuple((d, input) for d in ("5m", "1h", "30m", "12h"))),
+                 source)
+
+
 _HAIKU = _anthropic("claude-haiku-5-5", 0.10, 0.125, 0.20, 0.01, 0.50)
 
 PRICES: dict[tuple[str, str], Price] = {(price.provider, price.model): price for price in (
@@ -79,6 +93,13 @@ PRICES: dict[tuple[str, str], Price] = {(price.provider, price.model): price for
     _openai("gpt-6-astra",
             _openai_rates(input=10.0, cached=1.0, write_30m=12.50, write_12h=25.0, output=50.0),
             _openai_rates(input=20.0, cached=2.0, write_30m=25.0, write_12h=50.0, output=75.0)),
+    # Off-peak: Pro $0.66 / $0.022 / $1.98, Flash $0.15 / $0.003 / $0.60.
+    _no_write_charge(DEEPSEEK, "deepseek-v4-pro", input=1.32, cached=0.044, output=3.96, source=_DEEPSEEK_SOURCE),
+    _no_write_charge(DEEPSEEK, "deepseek-flash", input=0.30, cached=0.006, output=1.20, source=_DEEPSEEK_SOURCE),
+    _no_write_charge(OPENROUTER, "z-ai/glm-5.3", input=1.40, cached=0.26, output=4.40,
+                     source=_ZAI_ON_OPENROUTER_SOURCE.format(model="z-ai/glm-5.3")),
+    _no_write_charge(OPENROUTER, "z-ai/glm-5.3-flash", input=0.15, cached=0.03, output=0.50,
+                     source=_ZAI_ON_OPENROUTER_SOURCE.format(model="z-ai/glm-5.3-flash")),
 )}
 
 
