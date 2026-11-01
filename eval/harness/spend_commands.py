@@ -9,7 +9,7 @@ import json
 import time
 from dataclasses import dataclass
 
-from . import envelope, openrouter, route_config, settlers
+from . import envelope, openrouter, providers, route_config, settlers
 
 ACTIONS = ("create", "fund", "scope", "allocate", "route", "validate-route", "status", "resolve")
 
@@ -112,7 +112,7 @@ def _apply(env: envelope.Envelope, args, command) -> None:
         else:
             env.fund(credit=args.credit, fees=args.fees or 0.0, taxes=args.taxes or 0.0)
     elif action == "scope":
-        key = openrouter.api_key()
+        key = providers.api_key(providers.OPENROUTER)
         opening = settlers.OpenRouterSettler(openrouter.API_BASE_URL, key).key_usage()
         env.register_scope(args.scope, provider=args.provider, fingerprint=envelope.fingerprint(key),
                            opening_usage=opening, allocation=args.allocation, provider_limit=args.provider_limit)

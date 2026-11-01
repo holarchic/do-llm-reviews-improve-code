@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from eval.harness import agents, loop, openrouter, procs, routing
+from eval.harness import agents, loop, procs, providers, routing
 from eval.tests.test_replay import StubAgentCase
 
 MODEL = "qwen/qwen3-coder-30b-a3b-instruct"
@@ -26,7 +26,7 @@ class Fixture(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp)
         key = self.tmp / "key"
         key.write_text("sk-or-v1-SYNTHETIC\n")
-        patcher = mock.patch.object(openrouter, "KEY_PATH", key)
+        patcher = mock.patch.dict(providers.KEY_PATHS, {"openrouter": key})
         patcher.start()
         self.addCleanup(patcher.stop)
 

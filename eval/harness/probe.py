@@ -21,7 +21,7 @@ from pathlib import Path
 
 from dataclasses import dataclass
 
-from . import agents, audit, openrouter
+from . import agents, audit, providers
 
 INSTRUCTION_FILES = (Path.home() / ".claude" / "CLAUDE.md", Path.home() / ".codex" / "AGENTS.md")
 QUOTE_PROMPT = (
@@ -45,7 +45,7 @@ def probe_plan(experiment) -> list[Probe]:
     """The probes an experiment's agents need: instructions for each distinct session, the canaries
     on its writer and first Codex reviewer, the reviewer control when a Claude session reviews, the
     Codex-writer control when a Codex session writes, judges when it judges, the key and
-    pass-through probes for each routed CLI, and the network probe for each writer and reviewer
+    pass-through probes for each routed CLI and provider, and the network probe for each writer and reviewer
     configuration when offline."""
     writer = experiment.arms[0].writer
     reviewers = list(dict.fromkeys(arm.reviewer for arm in experiment.arms if arm.reviewer is not None))
@@ -74,12 +74,17 @@ def probe_plan(experiment) -> list[Probe]:
     if writer.cli == "codex":
         add("codex_writer", "codex_writer", writer, agents.WRITER)
     routed = [(writer, agents.WRITER)] + [(r, agents.REVIEWER) for r in reviewers]
+    # One key and one pass-through probe per CLI and routed provider: each has its own key and path.
+    first: dict[tuple[str, str], tuple[agents.Agent, str]] = {}
+    for agent, role in routed:
+        if agent.routed:
+            first.setdefault((agent.cli, agent.provider), (agent, role))
     for cli in ("claude", "codex"):
-        agent, role = next(((a, role) for a, role in routed if a.cli == cli and a.provider == agents.OPENROUTER),
-                           (None, None))
-        if agent is not None:
-            add(f"{cli}_key", "key", agent, role)
-            add(f"{cli}_passthrough", "passthrough", agent, role)
+        for (agent_cli, provider), (agent, role) in first.items():
+            if agent_cli == cli:
+                suffix = "" if provider == agents.OPENROUTER else f"_{provider}"
+                add(f"{cli}_key{suffix}", "key", agent, role)
+                add(f"{cli}_passthrough{suffix}", "passthrough", agent, role)
     if experiment.offline:
         for agent, role in [(writer, agents.WRITER)] + [(r, agents.REVIEWER) for r in reviewers]:
             add(f"{agent.cli}_network_{role}", "network", agent, role)
@@ -89,14 +94,14 @@ def probe_plan(experiment) -> list[Probe]:
 def run_probes(probe_root: Path, experiment) -> list[str]:
     """Run the experiment's probes; return the failures (empty means isolation holds)."""
     if experiment.routed and probe_root.exists():
-        openrouter.scrub(probe_root)  # a probe run that died mid-way left files its own scrub never reached
+        providers.scrub(probe_root)  # a probe run that died mid-way left files its own scrub never reached
     stamp = probe_root / time.strftime("%Y%m%dT%H%M%S")
     stamp.mkdir(parents=True)
     try:
         return _run_probes(stamp, experiment)
     finally:
         if experiment.routed:
-            openrouter.scrub(stamp)
+            providers.scrub(stamp)
 
 
 def _run_probes(stamp: Path, experiment) -> list[str]:
@@ -126,14 +131,9 @@ def _run_probes(stamp: Path, experiment) -> list[str]:
     problems = [f"{name}: {problem}" for name, found in results.items() for problem in found["problems"]]
     if experiment.routed:
         # After summary.json: every saved file of the probe run is scanned, and the scan must leave none behind.
-        openrouter.scrub(stamp)
-        problems += [f"key still in {path} after scrubbing" for path in _files_holding_key(stamp)]
+        providers.scrub(stamp)
+        problems += [f"key still in {path} after scrubbing" for path in providers.files_holding_keys(stamp)]
     return problems  # run_probes scrubs once more on the way out, whether or not this got here
-
-
-def _files_holding_key(root: Path) -> list[str]:
-    secret = openrouter.api_key().encode()
-    return [str(p.relative_to(root)) for p in root.rglob("*") if p.is_file() and secret in p.read_bytes()]
 
 
 def instruction_markers() -> list[str]:
@@ -371,7 +371,7 @@ def _key_probe_once(probe: Probe, out_dir: Path) -> dict:
     permitted_token = f"PERMITTED-{secrets.token_hex(8)}"
     (run_dir / "permitted.txt").write_text(permitted_token + "\n", encoding="utf-8")
     (run_dir / "envcheck.py").write_text(KEY_SCRIPT, encoding="utf-8")
-    prompt = (f"Run exactly `python3 envcheck.py {openrouter.KEY_PATH}` with your shell tool, once, and report its "
+    prompt = (f"Run exactly `python3 envcheck.py {providers.key_path(probe.agent.provider)}` with your shell tool, once, and report its "
               "full raw output.")
     try:
         session = agents.run(probe.agent, prompt, role=probe.role, cwd=run_dir, out_dir=out_dir,
@@ -410,7 +410,7 @@ def key_problems(transcript_text: str, permitted_token: str, routing: list[str])
     if names is None or permitted_token not in transcript_text:
         problems.append("the check script's output never reached the transcript; the probe is vacuous")
     else:
-        visible = sorted(set(names.group(1).split()) & set(openrouter.KEY_VARIABLES))
+        visible = sorted(set(names.group(1).split()) & set(providers.CREDENTIAL_VARIABLES))
         if visible:
             problems.append(f"credential variables visible to the tool shell: {visible}")
     if "KEY-READ-OK" in transcript_text:

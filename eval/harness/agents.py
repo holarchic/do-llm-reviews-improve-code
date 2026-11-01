@@ -15,8 +15,9 @@ Isolation:
   sandbox bypassed, as Codex documents for externally sandboxed runs) that
   denies reads and writes of the private roots and other runs; it may write
   its own home, and its cwd only in the writer role.
-- Routed sessions (provider "openrouter") get their routing and key from
-  openrouter.py; the operator's Codex login is not copied into their home.
+- Routed sessions (a provider of providers.py) get their routing and key from
+  providers.py, and reach the provider only through the routing proxy; the
+  operator's Codex login is not copied into their home.
 - Offline sessions (the replay's) reach no network beyond localhost from their
   tool commands. Claude's Bash sandbox allows no domain. Codex's Seatbelt
   profile denies every outbound connection but localhost, its model calls go
@@ -32,7 +33,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from . import audit, egress, openrouter, procs, routing
+from . import audit, egress, procs, providers, routing
 
 CLAUDE_JUDGE_MODEL = "claude-fable-5-1"
 CODEX_JUDGE_MODEL = "gpt-6-astra"
@@ -43,7 +44,8 @@ TIMEOUT_SECONDS = {WRITER: 1800, REVIEWER: 1200, JUDGE: 900}
 
 COMPLETED, TIMEOUT, INFRA = "completed", "timeout", "infra"
 SPEND_REFUSED = "spend refused"  # the reason of a session the envelope refused; the loop never retries it
-NATIVE, OPENROUTER = "native", "openrouter"
+NATIVE = "native"
+OPENROUTER, DEEPSEEK = providers.OPENROUTER, providers.DEEPSEEK
 
 _FILE_TOOLS = ("Read", "Edit", "Write", "Glob", "Grep")
 _CLAUDE_TOOLS = {
@@ -58,10 +60,10 @@ class Agent:
     """Which CLI runs a session, on which model, served by whom."""
     cli: str  # "claude" | "codex"
     model: str
-    provider: str = NATIVE  # NATIVE: the CLI's own login | OPENROUTER
+    provider: str = NATIVE  # NATIVE: the CLI's own login | a provider of providers.py
 
     def __post_init__(self):
-        if self.provider not in (NATIVE, OPENROUTER):
+        if self.provider != NATIVE and self.provider not in providers.PROVIDERS:
             raise ValueError(f"unknown provider {self.provider!r}")
 
     @property
@@ -90,7 +92,7 @@ class Session:
 
     def unrouted_models(self, agent: "Agent") -> list[str]:
         """Models a routed session reported besides its own (e.g. a background call to an Anthropic model)."""
-        if agent.provider != OPENROUTER:
+        if not agent.routed:
             return []
         return [model for model in self.reported_models if model != agent.model]
 
@@ -113,7 +115,7 @@ def claude_settings(role: str, cwd: Path, provider: str = NATIVE, offline: bool 
     if role == REVIEWER:
         # Read-only like the Codex reviewer: any shell command, no writes to the repo.
         filesystem["denyWrite"] = [os.path.realpath(cwd)]
-    routing = {"apiKeyHelper": openrouter.claude_key_helper()} if provider == OPENROUTER else {}
+    routing = {"apiKeyHelper": providers.claude_key_helper(provider)} if provider != NATIVE else {}
     # The CLI's own model traffic is outside the Bash sandbox; tool commands get localhost only.
     network = {"network": {"allowedDomains": [], "allowLocalBinding": True}} if offline else {}
     return {
@@ -153,7 +155,7 @@ def run_claude(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path, 
     # Absolute: the CLI runs in cwd, where a relative settings path would not resolve.
     out_dir = out_dir.resolve()
     # A routed session launches only inside a routing context, through its proxy: before anything is written.
-    base_url = routing.session_base(provider, model, str(out_dir)) if provider == OPENROUTER else None
+    base_url = routing.session_base(provider, model, str(out_dir)) if provider != NATIVE else None
     out_dir.mkdir(parents=True, exist_ok=True)
     settings_path = out_dir / "settings.json"
     settings_path.write_text(json.dumps(claude_settings(role, cwd, provider, offline), indent=2), encoding="utf-8")
@@ -162,7 +164,7 @@ def run_claude(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path, 
     prompt_path.write_text(prompt, encoding="utf-8")
     (out_dir / "argv.json").write_text(json.dumps(argv, indent=2), encoding="utf-8")
     transcript = out_dir / "transcript.jsonl"
-    env = openrouter.claude_env(model, base_url) if provider == OPENROUTER else None
+    env = providers.claude_env(provider, model, base_url) if provider != NATIVE else None
     proc = procs.run(argv, cwd=cwd, timeout=TIMEOUT_SECONDS[role], stdout_path=transcript,
                      stderr_path=out_dir / "stderr.log", env=env, stdin_path=prompt_path)
     return _finish(_spend_checked(classify_claude(transcript, proc, role), out_dir), cwd)
@@ -171,7 +173,7 @@ def run_claude(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path, 
 def run_codex(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path, provider: str = NATIVE,
               offline: bool = False) -> Session:
     out_dir = out_dir.resolve()
-    base_url = routing.session_base(provider, model, str(out_dir)) if provider == OPENROUTER else None
+    base_url = routing.session_base(provider, model, str(out_dir)) if provider != NATIVE else None
     out_dir.mkdir(parents=True, exist_ok=True)
     final_path = out_dir / "final.txt"
     transcript = out_dir / "transcript.jsonl"
@@ -182,9 +184,9 @@ def run_codex(model: str, prompt: str, *, role: str, cwd: Path, out_dir: Path, p
         config = f'model_reasoning_effort = "{CODEX_EFFORT}"\n'
         if offline:
             config += 'web_search = "disabled"\n'
-        if provider == OPENROUTER:
-            config += openrouter.codex_provider_config(base_url + "/v1")
-            env = openrouter.codex_env(codex_home)
+        if provider != NATIVE:
+            config += providers.codex_provider_config(provider, base_url)
+            env = providers.codex_env(provider, codex_home)
         else:
             shutil.copy2(Path.home() / ".codex" / "auth.json", codex_home / "auth.json")
             env = {**os.environ, "CODEX_HOME": str(codex_home)}

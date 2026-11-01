@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from eval.harness import agents, experiments, loop, manifest, openrouter, pilot, prices, tasks
+from eval.harness import agents, experiments, loop, manifest, openrouter, pilot, prices, providers, tasks
 
 DEV = tasks.Task(tasks.TASKS_ROOT / "dev-intervals")
 PILOT2 = experiments.PILOT2
@@ -277,7 +277,7 @@ class RunBuildsEnvelopeTest(unittest.TestCase):
                 mock.patch.object(pilot, "routing_context", lambda e: contextlib.nullcontext(env)), \
                 mock.patch.object(pilot.loop, "execute_run", fake_execute), \
                 mock.patch.object(pilot.loop, "execute_followup", fake_followup), \
-                mock.patch.object(openrouter, "scrub", return_value=[]):
+                mock.patch.object(providers, "scrub", return_value=[]):
             pilot.run_builds(root, experiment)
             # A resumed run: the build is complete, only its follow-up is still owed.
             with mock.patch.object(pilot, "complete_build", lambda *a, **k: root / "runs" / "x" / "exec-1"):
@@ -300,7 +300,7 @@ class RoutedRunTest(unittest.TestCase):
         key_dir = Path(tempfile.mkdtemp(prefix="eval-test-key-"))
         self.addCleanup(shutil.rmtree, key_dir)
         (key_dir / "key").write_text(KEY)
-        patcher = mock.patch.object(openrouter, "KEY_PATH", key_dir / "key")
+        patcher = mock.patch.dict(providers.KEY_PATHS, {"openrouter": key_dir / "key"})
         patcher.start()
         self.addCleanup(patcher.stop)
 

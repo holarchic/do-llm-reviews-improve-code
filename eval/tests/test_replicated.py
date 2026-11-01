@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from eval.harness import agents, experiments, loop, manifest, openrouter, pilot, replicated, tasks
+from eval.harness import agents, experiments, loop, manifest, openrouter, pilot, providers, replicated, tasks
 
 PILOT2 = experiments.PILOT2
 TASKS = list(PILOT2.tasks)
@@ -166,7 +166,7 @@ class EndToEndTest(unittest.TestCase):
         with mock.patch.object(pilot, "scored_tasks", lambda experiment: [self.task]), \
                 mock.patch.object(pilot, "routing_context", lambda experiment: contextlib.nullcontext(None)), \
                 mock.patch.object(manifest, "verify", return_value="d"), \
-                mock.patch.object(openrouter, "scrub", return_value=[]), \
+                mock.patch.object(providers, "scrub", return_value=[]), \
                 mock.patch.object(pilot.loop, "execute_run", execute), \
                 mock.patch.object(agents, "run_claude", self.writer), \
                 mock.patch.object(agents, "run_codex", self.writer):

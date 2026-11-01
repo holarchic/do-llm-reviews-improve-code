@@ -10,7 +10,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from eval.harness import envelope, openrouter, prices, proxy, route_config, settlers
+from eval.harness import envelope, prices, providers, proxy, route_config, settlers
 from eval.harness.envelope import Envelope
 
 KEY = "sk-fake-key"
@@ -309,7 +309,7 @@ class SettlerScopeTest(Fixture):
         key_file = self.root / "key"
         key_file.write_text("sk-or-current\n")
         upstream = route_config.Upstream("https://openrouter.ai/api", "openrouter")
-        with unittest.mock.patch.object(openrouter, "KEY_PATH", key_file):
+        with unittest.mock.patch.dict(providers.KEY_PATHS, {"openrouter": key_file}):
             settler = settlers.from_upstream(upstream, envelope.fingerprint("sk-or-current"))
             self.assertEqual(settler.api_base, "https://openrouter.ai/api/v1")
             with self.assertRaises(settlers.NoSettler):

@@ -12,7 +12,7 @@ import re
 import secrets
 from pathlib import Path
 
-from .openrouter import KEY_DIR
+from .providers import key_dirs
 
 HOME = Path.home()
 RUNS_ROOT = Path("/private/tmp/eval-runs")
@@ -25,7 +25,7 @@ PRIVATE_ROOTS = (
     HOME / ".codex",
     # The operator's global instructions: ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md link here.
     HOME / ".agents",
-    KEY_DIR,
+    *key_dirs(),
     RUNS_ROOT,
 )
 # Per tool, the input fields that name what it touches. Grep's pattern is search text, not a path.

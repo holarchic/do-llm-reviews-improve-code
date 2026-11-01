@@ -20,7 +20,7 @@ class AgentTest(unittest.TestCase):
         self.assertFalse(agents.Agent("claude", "claude-opus-5-5").routed)
         self.assertTrue(experiments.QWEN_WRITER.routed)
         with self.assertRaises(ValueError):
-            agents.Agent("claude", "m", "deepseek")
+            agents.Agent("claude", "m", "fireworks")
 
 
 class PilotUnchangedTest(unittest.TestCase):

@@ -20,7 +20,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import NamedTuple
 
-from . import envelope, judge, loop, manifest, openrouter, records, routing, spend, tasks
+from . import envelope, judge, loop, manifest, providers, records, routing, spend, tasks
 from .experiments import Experiment
 
 SPEND_LEDGER = "spend.json"  # pilot 2's spend-cap ledger: read for its report only
@@ -201,7 +201,7 @@ def run_builds(data_root: Path, experiment: Experiment, only_arm: str | None = N
     by_id = {task.id: task for task in scored_tasks(experiment)}
     jobs = [job for job in build_schedule(experiment) if only_arm is None or job.arm == only_arm]
     if experiment.routed and runs_root.exists():
-        openrouter.scrub(runs_root)  # a run killed mid-way leaves files the end-of-run scrub never reached
+        providers.scrub(runs_root)  # a run killed mid-way leaves files the end-of-run scrub never reached
 
     task_locks = {task_id: threading.Lock() for task_id in by_id}
 
@@ -251,7 +251,7 @@ def run_calibration(data_root: Path, experiment: Experiment, task_ids: list[str]
     experiment's calibration draws on the same envelope as its scored runs."""
     runs_root = data_root / "calibration" / "runs"
     if experiment.routed and runs_root.exists():
-        openrouter.scrub(runs_root)  # a calibration killed mid-way leaves files the end-of-run scrub never reached
+        providers.scrub(runs_root)  # a calibration killed mid-way leaves files the end-of-run scrub never reached
     by_id = {task.id: task for task in scored_tasks(experiment)}
 
     def job_for(env):

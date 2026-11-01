@@ -1,7 +1,7 @@
 import json
 import unittest
 
-from eval.harness import agents, experiments, openrouter, probe
+from eval.harness import agents, experiments, probe, providers
 
 
 class ProbePlanTest(unittest.TestCase):
@@ -26,6 +26,20 @@ class ProbePlanTest(unittest.TestCase):
         self.assertTrue(all(p.agent.provider == agents.OPENROUTER for p in plan.values()))
         self.assertEqual(plan["claude_key"].agent, experiments.QWEN_WRITER)
         self.assertEqual(plan["codex_key"].role, agents.REVIEWER)
+
+    def test_each_routed_provider_gets_its_own_key_and_passthrough_probes(self):
+        import dataclasses
+        from eval.harness import agents
+        writer = agents.Agent("claude", "z-ai/glm-5.3", agents.OPENROUTER)
+        reviewer = agents.Agent("codex", "deepseek-v4-pro", agents.DEEPSEEK)
+        other = agents.Agent("codex", "deepseek-flash", agents.DEEPSEEK)
+        experiment = dataclasses.replace(experiments.PILOT2, arms=(
+            experiments.Arm("W", writer), experiments.Arm("WR", writer, reviewer), experiments.Arm("A5", writer, other)))
+        plan = {p.name: p for p in probe.probe_plan(experiment)}
+        self.assertEqual(plan["claude_key"].agent, writer)
+        self.assertEqual(plan["codex_key_deepseek"].agent, reviewer)  # one per CLI and provider: the first seen
+        self.assertIn("codex_passthrough_deepseek", plan)
+        self.assertNotIn("codex_key", plan)
 
     def test_the_replay_probes_every_configuration_offline(self):
         plan = {p.name: p for p in probe.probe_plan(experiments.REPLAY)}
@@ -148,7 +162,7 @@ class KeyProblemsTest(unittest.TestCase):
         self.assertTrue(probe.key_problems(json.dumps({"out": probe.KEY_SCRIPT}), self.TOKEN, [])["problems"])
 
     def test_each_failure(self):
-        for name in openrouter.KEY_VARIABLES:
+        for name in providers.CREDENTIAL_VARIABLES:
             self.assertTrue(probe.key_problems(self.output(names=f"HOME {name} PATH"), self.TOKEN, [])["problems"])
         self.assertIn("the key file was readable",
                       probe.key_problems(self.output(read="KEY-READ-OK"), self.TOKEN, [])["problems"])

@@ -16,7 +16,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 
-from . import envelope, openrouter
+from . import envelope, providers
 from .route_config import Upstream
 
 NAMES = ("openrouter",)
@@ -118,7 +118,7 @@ def from_upstream(upstream: Upstream, fingerprint: str) -> Settler:
     if upstream.settler != "openrouter":
         raise NoSettler(f"no settler {upstream.settler!r}")
     try:
-        key = openrouter.api_key()
+        key = providers.api_key(providers.OPENROUTER)
     except (OSError, ValueError) as exc:
         raise NoSettler(f"the key file can't be read: {type(exc).__name__}") from None
     if envelope.fingerprint(key) != fingerprint:
