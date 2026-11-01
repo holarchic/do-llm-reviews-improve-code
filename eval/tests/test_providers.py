@@ -150,6 +150,14 @@ class ProviderTableTest(unittest.TestCase):
         self.assertEqual(upstream("openrouter", "claude"), "https://openrouter.ai/api/v1/messages")
         self.assertEqual(upstream("openrouter", "codex"), "https://openrouter.ai/api/v1/responses")
 
+    def test_no_provider_host_is_admitted_by_the_offline_egress_proxy(self):
+        """Routed CLIs reach their provider only through the routing proxy on loopback, never egress."""
+        import urllib.parse
+        from eval.harness import egress
+        hosts = {target.rsplit(":", 1)[0] for target in egress.ALLOWED_TARGETS}
+        for provider in providers.PROVIDERS.values():
+            self.assertNotIn(urllib.parse.urlsplit(provider.upstream).hostname, hosts, provider.name)
+
     def test_an_unknown_provider_is_refused(self):
         with self.assertRaises(ValueError):
             providers.get("fireworks")

@@ -67,7 +67,7 @@ class FakeDeepSeek:
                     n = len(fake.charges) + 1
                     fake.charges.append(fake.rate * peak(prompt - cached, cached, output))
                 reported = max(0, output - fake.hidden)
-                anthropic = self.path == "/anthropic/v1/messages"
+                anthropic = self.path.split("?", 1)[0] == "/anthropic/v1/messages"  # Claude adds ?beta=true
                 events = (fake.events_override or (fake.anthropic if anthropic else fake.responses))(
                     n, prompt, cached, reported)
                 self.send_response(200)
