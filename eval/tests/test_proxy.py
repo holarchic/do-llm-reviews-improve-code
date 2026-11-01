@@ -229,7 +229,8 @@ class ForwardingTest(Fixture):
         self.assertEqual(self.provider.calls, 0)
         self.assertEqual(self.requests(), [])
         self.assertEqual(self.post(base, {**ok, "tools": [{"name": "Bash", "input_schema": {}}]})[0], 200)
-        # A tool call's own arguments are the model's output, not provider input: never walked.
+        # A tool call's arguments are resent as text (input tokens, within the window), never content
+        # the provider dereferences: they are not walked.
         call = {"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "Write",
                                                   "input": {"type": "document", "schema": {"type": "object"}}}]}
         self.assertEqual(self.post(base, {**ok, "messages": [call]})[0], 200)
