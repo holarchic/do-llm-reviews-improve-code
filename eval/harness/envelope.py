@@ -433,6 +433,11 @@ class Envelope:
                     for rid, r in self._state["requests"].items()
                     if r["state"] == "unresolved" and r["captured"] and r["billing_id"] and not r["ambiguous"]]
 
+    def answered(self, attempt: str) -> int:
+        """How many of an attempt's admitted requests came back with a billing id: the routed model answered."""
+        with self._mutex:
+            return sum(r["attempt"] == attempt and r["billing_id"] is not None for r in self._state["requests"].values())
+
     def refusal(self, attempt: str) -> str | None:
         with self._mutex:
             return self._state["refusals"].get(attempt)

@@ -65,6 +65,14 @@ def session_base(provider: str, model: str, attempt: str) -> str:
     return current.session(job_id, attempt)[route]
 
 
+def answered(attempt: str) -> int | None:
+    """How many of an attempt's requests the active envelope's proxy admitted and the model answered;
+    None with no routing context."""
+    with _active_lock:
+        current = _active
+    return None if current is None else current.env.answered(attempt)
+
+
 def refusal(attempt: str) -> str | None:
     """The spend refusal recorded against an attempt, if any."""
     with _active_lock:

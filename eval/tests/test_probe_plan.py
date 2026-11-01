@@ -62,17 +62,27 @@ class NetworkProblemsTest(unittest.TestCase):
     }
     EGRESS = "ALLOW CONNECT chatgpt.com:443\nDENY CONNECT github.com:443\n"
 
-    def problems(self, outputs=None, *, egress_log=EGRESS, search=None, drop=()):
+    def problems(self, outputs=None, *, egress_log=EGRESS, search=None, drop=(), routed_answered=None):
         outputs = {**self.CLEAN, **(outputs or {})}
         commands = [{"command": f"bash -lc '{self.STEPS[name]}'", "output": outputs[name]}
                     for name in self.STEPS if name not in drop]
         search = {"config_disabled": True, "web_search_items": 0} if search is None else search
         return probe.network_problems(commands, self.STEPS, permitted="PERMITTED-1", local="LOCAL-1",
-                                      egress_log=egress_log, search=search)
+                                      egress_log=egress_log, search=search, routed_answered=routed_answered)
 
     def test_clean_codex_and_claude_evidence_passes(self):
         self.assertEqual(self.problems(), [])
         self.assertEqual(self.problems(egress_log=None, search={"tools": ["Bash", "Read"]}), [])
+
+    def test_a_routed_codex_session_proves_its_model_call_through_the_routing_proxy(self):
+        routed_egress = "DENY CONNECT github.com:443\n"  # its model call never touches the egress proxy
+        self.assertEqual(self.problems(egress_log=routed_egress, routed_answered=2), [])
+        self.assertIn("no model call through the routing proxy",
+                      self.problems(egress_log=routed_egress, routed_answered=0))
+        self.assertIn("a routed session's egress proxy admitted a connection",
+                      self.problems(egress_log=self.EGRESS, routed_answered=1))
+        self.assertIn("no model call through the egress proxy", self.problems(egress_log=routed_egress))  # native
+        self.assertEqual(self.problems(egress_log=None, search={"tools": ["Bash"]}, routed_answered=1), [])  # Claude
 
     def test_each_escape_or_missing_control_is_a_problem(self):
         cases = {

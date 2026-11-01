@@ -21,7 +21,7 @@ from pathlib import Path
 
 from dataclasses import dataclass
 
-from . import agents, audit, providers
+from . import agents, audit, providers, routing
 
 INSTRUCTION_FILES = (Path.home() / ".claude" / "CLAUDE.md", Path.home() / ".codex" / "AGENTS.md")
 QUOTE_PROMPT = (
@@ -486,6 +486,8 @@ def _network_probe(probe: Probe, stamp: Path) -> dict:
         session = agents.run(probe.agent, prompt, role=probe.role, cwd=run_dir, out_dir=out_dir, offline=True)
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)
+    # A routed session's model calls go through its envelope's proxy on loopback, not the egress proxy.
+    answered = routing.answered(str(out_dir.resolve())) if probe.agent.routed else None
     if probe.agent.cli == "codex":
         commands = codex_commands(session.transcript)
         egress_log = (out_dir / "egress.log").read_text(encoding="utf-8") if (out_dir / "egress.log").exists() else ""
@@ -499,8 +501,9 @@ def _network_probe(probe: Probe, stamp: Path) -> dict:
         search = {"tools": _claude_tools(session.transcript)}
     problems = [] if session.terminal == agents.COMPLETED else [f"session did not complete: {session.reason}"]
     problems += network_problems(commands, steps, permitted=token, local=local_token, egress_log=egress_log,
-                                 search=search)
-    return {"ip": ip, "commands": commands, "egress_log": egress_log, "search": search, "problems": problems}
+                                 search=search, routed_answered=answered)
+    return {"ip": ip, "commands": commands, "egress_log": egress_log, "search": search, "routed_answered": answered,
+            "problems": problems}
 
 
 def network_steps(ip: str, local_token: str) -> dict[str, str]:
@@ -516,10 +519,12 @@ def network_steps(ip: str, local_token: str) -> dict[str, str]:
 
 
 def network_problems(commands: list[dict], steps: dict[str, str], *, permitted: str, local: str,
-                     egress_log: str | None, search: dict) -> list[str]:
+                     egress_log: str | None, search: dict, routed_answered: int | None = None) -> list[str]:
     """Each step must have run; the controls must succeed and every way out must be refused, with the
     refusal's own evidence: empty output or a DNS failure proves nothing. A step that never ran is
-    reported once, as unproven."""
+    reported once, as unproven. The model-call control: a native Codex session's call passes the
+    egress proxy; a routed session's (`routed_answered`, its proxy-admitted requests that the model
+    answered) passes its envelope's proxy, and its egress proxy admits nothing."""
     runs = {name: [c["output"] for c in commands if command in c["command"]] for name, command in steps.items()}
     problems = [f"{name} step never ran; unproven" for name, ran in runs.items() if not ran]
     outputs = {name: "\n".join(ran) for name, ran in runs.items()}
@@ -544,8 +549,13 @@ def network_problems(commands: list[dict], steps: dict[str, str], *, permitted: 
         if any(not found or any(result not in _DENIED for result in found) for found in results):
             shown = "; ".join(", ".join(found) or "no result" for found in results)
             problems.append(f"{label.lower()} socket not denied by the sandbox: {shown}")
+    if routed_answered is not None:
+        if routed_answered < 1:
+            problems.append("no model call through the routing proxy")
+        if egress_log is not None and "ALLOW CONNECT" in egress_log:
+            problems.append("a routed session's egress proxy admitted a connection")
     if egress_log is not None:
-        if "ALLOW CONNECT chatgpt.com:443" not in egress_log:
+        if routed_answered is None and "ALLOW CONNECT chatgpt.com:443" not in egress_log:
             problems.append("no model call through the egress proxy")
         if f"DENY CONNECT {SOURCE_HOST}:443" not in egress_log:
             problems.append("the egress proxy never refused the source")

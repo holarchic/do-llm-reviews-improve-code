@@ -184,6 +184,7 @@ class MeteredSettlementTest(Fixture):
         prompt = 200 + OVERHEAD
         self.assertAlmostEqual(request["billed"], peak(prompt - prompt // 2, prompt // 2, 1000), places=12)
         self.assertAlmostEqual(request["billed"], self.fake.billed, places=12)  # at peak: exactly the charge
+        self.assertEqual((self.env.answered("a1"), self.env.answered("other")), (1, 0))  # the network probe's control
 
     def test_a_responses_stream_counts_cached_input_inside_input_and_reasoning_inside_output(self):
         served = self.start()
