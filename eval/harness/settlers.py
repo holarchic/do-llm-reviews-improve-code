@@ -218,7 +218,7 @@ class DeepSeekSettler(Settler):
             _no_server_tools(usage)
             fresh = _count(usage, "input_tokens") + _count(usage, "cache_creation_input_tokens")
             return self._priced(fresh, _count(usage, "cache_read_input_tokens"), _count(usage, "output_tokens"))
-        except ValueError as exc:
+        except (ValueError, OverflowError) as exc:
             return Invalid(str(exc))
 
     def _responses(self, usage) -> Usage | Invalid:
@@ -231,7 +231,7 @@ class DeepSeekSettler(Settler):
             if cached > total:
                 raise ValueError("cached tokens exceed input tokens")
             return self._priced(total - cached, cached, _count(usage, "output_tokens"))
-        except (ValueError, AttributeError) as exc:
+        except (ValueError, AttributeError, OverflowError) as exc:
             return Invalid(str(exc))
 
     def _priced(self, fresh: int, cached: int, output: int) -> Usage:
@@ -283,7 +283,7 @@ def _balances(infos) -> dict[str, float]:
             raise UsageUnavailable(f"{currency} balance is {total!r}")
         try:
             amount = float(total)
-        except ValueError:
+        except (ValueError, OverflowError):
             raise UsageUnavailable(f"{currency} balance is {total!r}") from None
         if not math.isfinite(amount):
             raise UsageUnavailable(f"{currency} balance is {total!r}")

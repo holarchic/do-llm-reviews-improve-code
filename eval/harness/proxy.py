@@ -11,8 +11,9 @@ job and attempt it belongs to. For each request, in order:
    response is asked for unencoded, so its billing id can be read from the parsed events (at the
    settler's fixed paths) as the bytes stream back as they came;
 4. the request stays unresolved until its settler reports the billed charge or that nothing was
-   billed. A failed lookup, a 404, an error inside a started stream, no billing id, or two
-   different ones all keep its worst case counted. A metered route's charge is the usage its
+   billed. A failed lookup, a 404, no billing id, or two different ones all keep its worst case
+   counted; a billed route's request whose stream broke after its id arrived settles from the
+   provider's own lookup. A metered route's charge is the usage its
    response reported, recorded event by event on the request; one whose response never completed
    with valid usage stays at its worst case.
 

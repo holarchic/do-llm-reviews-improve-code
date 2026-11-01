@@ -364,6 +364,14 @@ class EventReadingTest(unittest.TestCase):
             "input_tokens": 1, "output_tokens": 1, "server_tool_use": None}}}
         self.assertIsInstance(self.settler.read(responses_null).metered, settlers.Invalid)
 
+    def test_an_absurd_counter_is_unusable_not_a_crash(self):
+        huge = 10 ** 400
+        for event in ({"type": "message_delta", "usage": {"input_tokens": huge, "output_tokens": 1,
+                                                          "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}},
+                      {"type": "response.completed", "response": {"usage": {"input_tokens": huge, "output_tokens": 1}}}):
+            with self.subTest(event=event["type"]):
+                self.assertIsInstance(self.settler.read(event).metered, settlers.Invalid)
+
     def test_every_anthropic_counter_is_required_since_input_excludes_cache_hits(self):
         full = {"input_tokens": 10, "output_tokens": 1, "cache_read_input_tokens": 500, "cache_creation_input_tokens": 0}
         self.assertIsInstance(self.settler.read({"type": "message_delta", "usage": full}).metered, settlers.Usage)
@@ -416,7 +424,7 @@ class BalanceReadingTest(unittest.TestCase):
                     {"balance_infos": []},  # no USD row: unavailable, never a zero balance
                     {"balance_infos": [{"currency": "USD", "total_balance": "10"}, {"currency": "CNY", "total_balance": "25"},
                                        {"currency": "CNY", "total_balance": "0"}]},  # a later row can't hide one
-                    {"balance_infos": "USD 4"}):
+                    {"balance_infos": "USD 4"}, {"balance_infos": [{"currency": "USD", "total_balance": 10 ** 400}]}):
             with self.subTest(bad=bad), self.assertRaises(settlers.UsageUnavailable):
                 self.reading(bad)
 

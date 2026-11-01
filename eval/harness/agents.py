@@ -20,8 +20,9 @@ Isolation:
   operator's Codex login is not copied into their home.
 - Offline sessions (the replay's) reach no network beyond localhost from their
   tool commands. Claude's Bash sandbox allows no domain. Codex's Seatbelt
-  profile denies every outbound connection but localhost, its model calls go
-  through a per-session allowlist proxy (egress.py), and its web search is off.
+  profile denies every outbound connection but localhost; a native session's
+  model calls go through a per-session allowlist proxy (egress.py), a routed
+  one's to the routing proxy on localhost; its web search is off.
 - The transcript audit is a diagnostic: access is denied by the OS, and the
   probes prove it. Audit hits are recorded, not counted as contamination.
 """
