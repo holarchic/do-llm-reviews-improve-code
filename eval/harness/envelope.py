@@ -65,6 +65,7 @@ class PendingSettlement:
     billing_id: str
     upstream: dict | None
     scope: str
+    key_fingerprint: str  # the scope's key: settlement is looked up with that key only
 
 
 class Refused(Exception):
@@ -366,7 +367,8 @@ class Envelope:
     def pending_settlements(self) -> list["PendingSettlement"]:
         """Unresolved requests with a billing id to look up; each keeps the upstream it was admitted under."""
         with self._mutex:
-            return [PendingSettlement(rid, r["billing_id"], copy.deepcopy(r["upstream"]), r["scope"])
+            return [PendingSettlement(rid, r["billing_id"], copy.deepcopy(r["upstream"]), r["scope"],
+                                      self._state["scopes"][r["scope"]]["fingerprint"])
                     for rid, r in self._state["requests"].items()
                     if r["state"] == "unresolved" and r["captured"] and r["billing_id"] and not r["ambiguous"]]
 

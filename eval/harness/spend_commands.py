@@ -9,7 +9,7 @@ import json
 import time
 from dataclasses import dataclass
 
-from . import envelope, openrouter, proxy
+from . import envelope, openrouter, route_config, settlers
 
 ACTIONS = ("create", "fund", "scope", "allocate", "route", "validate-route", "status", "resolve")
 
@@ -56,7 +56,7 @@ def run(args, out) -> int:
     except Usage as exc:
         out(f"spend {args.action}: {exc}", error=True)
         return 2
-    except (envelope.Refused, envelope.EnvelopeError, openrouter.CreditUnavailable) as exc:
+    except (envelope.Refused, envelope.EnvelopeError, settlers.UsageUnavailable) as exc:
         out(f"spend {args.action}: refused: {exc}", error=True)
         return 3
 
@@ -86,12 +86,15 @@ def _parse(args):
             policy = json.loads(args.policy)
         except ValueError as exc:
             raise Usage(f"--policy is not JSON: {exc}") from None
+        upstream = {"base_url": args.upstream_base, "settler": args.settler}
         try:
-            proxy.parse_policy(policy)  # the proxy's own parser: a policy it would refuse is never stored
+            route_config.parse_policy(policy)  # the proxy's own parsers: what it would refuse is never stored
+            route_config.parse_upstream(upstream)
         except ValueError as exc:
-            raise Usage(f"--policy: {exc}") from None
-        return RouteCommand(args.route, args.scope, args.max_charge, args.slots, policy, args.bootstrap,
-                            {"base_url": args.upstream_base, "settler": args.settler})
+            raise Usage(f"--policy or --upstream-base: {exc}") from None
+        if args.settler not in settlers.NAMES:
+            raise Usage(f"--settler must be one of {', '.join(settlers.NAMES)}")
+        return RouteCommand(args.route, args.scope, args.max_charge, args.slots, policy, args.bootstrap, upstream)
     if action == "validate-route":
         _need(args, "route")
     if action == "resolve":
@@ -110,9 +113,9 @@ def _apply(env: envelope.Envelope, args, command) -> None:
             env.fund(credit=args.credit, fees=args.fees or 0.0, taxes=args.taxes or 0.0)
     elif action == "scope":
         key = openrouter.api_key()
+        opening = settlers.OpenRouterSettler(openrouter.API_BASE_URL, key).key_usage()
         env.register_scope(args.scope, provider=args.provider, fingerprint=envelope.fingerprint(key),
-                           opening_usage=openrouter.credit_used(), allocation=args.allocation,
-                           provider_limit=args.provider_limit)
+                           opening_usage=opening, allocation=args.allocation, provider_limit=args.provider_limit)
     elif action == "allocate":
         env.raise_allocation(args.scope, args.allocation)
     elif action == "route":

@@ -166,7 +166,6 @@ class EndToEndTest(unittest.TestCase):
         with mock.patch.object(pilot, "scored_tasks", lambda experiment: [self.task]), \
                 mock.patch.object(pilot, "routing_context", lambda experiment: contextlib.nullcontext(None)), \
                 mock.patch.object(manifest, "verify", return_value="d"), \
-                mock.patch.object(openrouter, "credit_used", return_value=0.0), \
                 mock.patch.object(openrouter, "scrub", return_value=[]), \
                 mock.patch.object(pilot.loop, "execute_run", execute), \
                 mock.patch.object(agents, "run_claude", self.writer), \

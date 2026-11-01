@@ -79,6 +79,39 @@ class JobEstimateTest(unittest.TestCase):
                     "openrouter", arm.writer.model, prices.Rates(4.0, 0.4, 20.0), "test")}):
                 self.assertAlmostEqual(pilot.job_estimate(env, experiment, "A1", calibration), 6.0)  # 1.5 × $4
 
+    def test_a_mixed_arm_reserves_for_its_routed_seats_only(self):
+        """The envelope funds no native seat: a native writer's list-price cost, known or not, reserves nothing."""
+        from eval.harness import envelope, routing
+        root = Path(tempfile.mkdtemp(prefix="eval-test-"))
+        self.addCleanup(shutil.rmtree, root)
+        native = agents.Agent("claude", "claude-opus-5-5", agents.NATIVE)
+        routed = experiments.QWEN_WRITER
+        experiment = dataclasses.replace(PILOT2, envelope="T", arms=(experiments.Arm("M", native, routed),))
+        with envelope.Envelope.owned("T", root=root / "envelopes", create_usd=50.0) as env:
+            env.fund(credit=10.0)
+            env.register_scope("or", provider="openrouter", fingerprint="fp", opening_usage=0.0, allocation=10.0,
+                               provider_limit=None)
+            env.set_route(routing.route_name(routed.provider, routed.model), scope="or", max_charge=0.5,
+                          slots=1, policy={}, bootstrap_build_usd=2.0)
+            calibration = root / "calibration" / "runs"
+            exec_dir = calibration / "dev-intervals--M--r1" / "exec-1"
+            exec_dir.mkdir(parents=True)
+
+            def step(name, agent, model, usage):
+                attempt = {"seconds": 1}
+                if usage:
+                    attempt["usage"] = {"by_model": {model: {"inputTokens": 1_000_000, "outputTokens": 0,
+                                                             "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}}}
+                return {"name": name, "agent": {"cli": agent.cli, "model": agent.model, "provider": agent.provider},
+                        "attempts": [attempt]}
+            (exec_dir / "record.json").write_text(json.dumps({"steps": [
+                step("build", native, native.model, True),  # $4 at Opus list price
+                step("fix-1", native, native.model, False),  # unknown, but native
+                step("review-1", routed, routed.model, True)]}))  # $1 at the routed price below
+            with mock.patch.dict(prices.PRICES, {("openrouter", routed.model): prices.Price(
+                    "openrouter", routed.model, prices.Rates(1.0, 0.1, 5.0), "test")}):
+                self.assertAlmostEqual(pilot.job_estimate(env, experiment, "M", calibration), 1.5)  # 1.5 × $1
+
     def test_experiments_sharing_an_envelope_never_share_a_jobs_hold(self):
         from eval.harness import envelope, routing
         root = Path(tempfile.mkdtemp(prefix="eval-test-"))

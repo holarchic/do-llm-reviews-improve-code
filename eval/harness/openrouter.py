@@ -1,4 +1,4 @@
-"""Sessions routed through OpenRouter: the key, each CLI's routing, spend, and the leak scan.
+"""Sessions routed through OpenRouter: the key, each CLI's routing, and the leak scan.
 
 The key lives in a 0600 file whose dir is a private root, so no tool call can
 read it. It never appears in argv, settings or config files:
@@ -15,7 +15,6 @@ import json
 import os
 import shutil
 import subprocess
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -62,10 +61,6 @@ PRICES = {
 }
 
 
-class CreditUnavailable(Exception):
-    """OpenRouter's usage could not be read; no job may start on an unknown spend."""
-
-
 def api_key() -> str:
     key = KEY_PATH.read_text(encoding="utf-8").strip()
     if not key:
@@ -99,20 +94,6 @@ def claude_env(model: str, base_url: str = ANTHROPIC_BASE_URL) -> dict[str, str]
 def codex_env(codex_home: Path) -> dict[str, str]:
     """The environment of a Codex session whose home holds `codex_provider_config()`."""
     return {**_inherited(), "CODEX_HOME": str(codex_home), "OPENROUTER_API_KEY": api_key()}
-
-
-def credit_used() -> float:
-    """Dollars spent on the key so far."""
-    request = urllib.request.Request(f"{API_BASE_URL}/key", headers={"Authorization": f"Bearer {api_key()}"})
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            usage = json.load(response)["data"]["usage"]
-    except Exception as exc:
-        # The message never includes the request, so the key stays out of logs.
-        raise CreditUnavailable(f"{type(exc).__name__}: {exc}") from None
-    if not isinstance(usage, (int, float)) or isinstance(usage, bool):
-        raise CreditUnavailable(f"usage is {usage!r}")
-    return float(usage)
 
 
 def scrub(root: Path, key: str | None = None) -> list[str]:

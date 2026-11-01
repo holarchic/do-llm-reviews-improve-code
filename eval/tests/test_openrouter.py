@@ -1,4 +1,3 @@
-import io
 import json
 import os
 import shutil
@@ -183,24 +182,6 @@ class ScrubTest(_KeyFile):
         (self.tmp / "a.txt").write_text("plain")
         self.assertEqual(openrouter.scrub(self.tmp), [])
         self.assertEqual((self.tmp / "a.txt").read_text(), "plain")
-
-
-class CreditTest(_KeyFile):
-    def respond(self, body):
-        return mock.patch("urllib.request.urlopen", return_value=io.BytesIO(json.dumps(body).encode()))
-
-    def test_reads_usage(self):
-        with self.respond({"data": {"usage": 1.25}}):
-            self.assertEqual(openrouter.credit_used(), 1.25)
-
-    def test_unreadable_usage_raises(self):
-        for body in ({"data": {}}, {"data": {"usage": True}}, {"data": {"usage": "1"}}):
-            with self.respond(body), self.assertRaises(openrouter.CreditUnavailable):
-                openrouter.credit_used()
-        with mock.patch("urllib.request.urlopen", side_effect=OSError("down")), \
-                self.assertRaises(openrouter.CreditUnavailable) as caught:
-            openrouter.credit_used()
-        self.assertNotIn(KEY, str(caught.exception))
 
 
 if __name__ == "__main__":

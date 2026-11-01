@@ -4,21 +4,30 @@ A settler reads a request's billing id from the response's parsed events, at fix
 nested id elsewhere in the body is never taken), reports its billed charge, and reads the key's
 usage for reconciliation. Every outcome is typed: a lookup that fails or answers without a usable
 charge is `Pending`, which keeps the request's worst case counted; nothing short of the provider's
-own figure settles it.
+own figure settles it. A settler belongs to one billing scope: it holds that scope's key, checked
+against the fingerprint the scope was registered with.
 """
 
 import json
+import math
 import re
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 
-from . import openrouter
+from . import envelope, openrouter
+from .route_config import Upstream
+
+NAMES = ("openrouter",)
 
 
 class UsageUnavailable(Exception):
     """The key's usage could not be read: reconciliation has no snapshot."""
+
+
+class NoSettler(Exception):
+    """No settler can serve this scope: an unknown adapter, or a key file holding another key."""
 
 
 @dataclass(frozen=True)
@@ -94,7 +103,7 @@ class OpenRouterSettler(Settler):
             raise UsageUnavailable(f"key lookup answered {exc.code}") from None
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise UsageUnavailable(f"key lookup failed: {type(exc).__name__}") from None
-        if isinstance(usage, bool) or not isinstance(usage, (int, float)):
+        if isinstance(usage, bool) or not isinstance(usage, (int, float)) or not math.isfinite(usage) or usage < 0:
             raise UsageUnavailable(f"usage is {usage!r}")
         return float(usage)
 
@@ -104,8 +113,14 @@ class OpenRouterSettler(Settler):
             return json.load(response)
 
 
-def from_upstream(upstream: dict) -> Settler:
-    """The settler an upstream names; the credential comes from its provider's key file, at call time."""
-    if upstream.get("settler") == "openrouter":
-        return OpenRouterSettler(str(upstream["base_url"]).rstrip("/") + "/v1", openrouter.api_key())
-    raise ValueError(f"no settler {upstream.get('settler')!r}")
+def from_upstream(upstream: Upstream, fingerprint: str) -> Settler:
+    """The settler an upstream names, for the scope whose key has `fingerprint`."""
+    if upstream.settler != "openrouter":
+        raise NoSettler(f"no settler {upstream.settler!r}")
+    try:
+        key = openrouter.api_key()
+    except (OSError, ValueError) as exc:
+        raise NoSettler(f"the key file can't be read: {type(exc).__name__}") from None
+    if envelope.fingerprint(key) != fingerprint:
+        raise NoSettler("the key file holds a different key from the scope's")
+    return OpenRouterSettler(upstream.base_url + "/v1", key)

@@ -2,13 +2,14 @@
 
 A routed session's CLI calls `http://127.0.0.1:<port>/s/<token>/<route>/...`; the token names the
 job and attempt it belongs to. For each request, in order:
-1. the route's policy, an allowlist: an exact endpoint path, an exact model, only the top-level
-   fields and tool types the route allows, no image input, and an output limit where the route
-   requires one; then the credential must be the route's key. Anything else is a 403 with no
-   upstream call;
+1. the route's policy (`route_config`), an allowlist: an exact endpoint path, an exact model, only
+   the top-level fields and tool types the route allows, text and tool content only, and an output
+   limit where the route requires one; then the credential, which every credential header must
+   carry identically, must be the route's key. Anything else is a 403 with no upstream call;
 2. admission through the envelope (a 429, and a refusal stuck to the attempt, otherwise);
-3. forwarding unchanged, except that the response is asked for unencoded so its billing id can be
-   read from the parsed events (at the settler's fixed paths) as the bytes stream back as they came;
+3. forwarding unchanged, except that the credential headers carry exactly the checked key and the
+   response is asked for unencoded, so its billing id can be read from the parsed events (at the
+   settler's fixed paths) as the bytes stream back as they came;
 4. the request stays unresolved until its settler reports the billed charge or that nothing was
    billed. A failed lookup, a 404, an error inside a started stream, no billing id, or two
    different ones all keep its worst case counted.
@@ -29,86 +30,16 @@ import urllib.parse
 from dataclasses import dataclass
 
 from . import envelope as envelope_mod
+from . import route_config
 from . import settlers as settlers_mod
 
 RECONCILE_SECONDS = 240
 SETTLE_SECONDS = 5
 SHUTDOWN_SECONDS = 60
 _JSON_LIMIT = 16 * 1024 * 1024
-_IMAGE_PARTS = {"image", "input_image", "image_url"}
 _HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer",
                "transfer-encoding", "upgrade", "host", "content-length", "accept-encoding"}
-
-
-@dataclass(frozen=True)
-class Policy:
-    """A route's request allowlist. `max_body_bytes` bounds a request's input: a byte-level tokenizer
-    makes at least one byte per token, so it is also a bound on the request's input tokens."""
-    paths: frozenset[str]
-    models: frozenset[str]
-    fields: frozenset[str]
-    tool_types: frozenset[str]
-    max_body_bytes: int
-    output_limit: tuple[str, int] | None  # (field, cap) where the provider enforces a requested maximum
-
-
-def parse_policy(raw) -> Policy:
-    """A route's policy record, checked: raises ValueError for anything malformed."""
-    def strings(key):
-        value = raw.get(key)
-        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
-            raise ValueError(f"policy {key} must be a list of strings")
-        return frozenset(value)
-    if not isinstance(raw, dict):
-        raise ValueError("a policy is a table")
-    size = raw.get("max_body_bytes")
-    if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
-        raise ValueError("policy max_body_bytes must be a positive integer")
-    limit = raw.get("output_limit")
-    if limit is not None:
-        if not (isinstance(limit, dict) and isinstance(limit.get("field"), str) and isinstance(limit.get("cap"), int)
-                and not isinstance(limit.get("cap"), bool) and limit["cap"] > 0):
-            raise ValueError("policy output_limit must be {field: str, cap: positive int}")
-        limit = (limit["field"], limit["cap"])
-    return Policy(strings("paths"), strings("models"), strings("fields"), strings("tool_types"), size, limit)
-
-
-def policy_problem(policy: Policy, path: str, body: bytes) -> str | None:
-    """Why a request falls outside its route's policy, or None. `path` is the part after the route."""
-    if path.split("?", 1)[0] not in policy.paths:
-        return f"path {path.split('?', 1)[0]!r} is not allowed"
-    if len(body) > policy.max_body_bytes:
-        return f"the body is over {policy.max_body_bytes} bytes"
-    try:
-        request = json.loads(body)
-    except ValueError:
-        return "the body is not JSON"
-    if not isinstance(request, dict):
-        return "the body is not a JSON object"
-    extra = sorted(set(request) - policy.fields)
-    if extra:
-        return f"field {extra[0]!r} is not allowed"
-    if request.get("model") not in policy.models:
-        return f"model {request.get('model')!r} is not allowed"
-    for tool in request.get("tools") or ():
-        if not isinstance(tool, dict) or str(tool.get("type", "")) not in policy.tool_types:
-            return f"tool type {tool.get('type') if isinstance(tool, dict) else tool!r} is not allowed"
-    if _has_image(request.get("messages")) or _has_image(request.get("input")):
-        return "image input is not allowed"
-    if policy.output_limit:
-        field, cap = policy.output_limit
-        value = request.get(field)
-        if not isinstance(value, int) or isinstance(value, bool) or not 0 < value <= cap:
-            return f"{field} must be set at or below {cap}"
-    return None
-
-
-def _has_image(node) -> bool:
-    if isinstance(node, dict):
-        return node.get("type") in _IMAGE_PARTS or any(_has_image(v) for v in node.values())
-    if isinstance(node, list):
-        return any(_has_image(v) for v in node)
-    return False
+_CREDENTIAL_HEADERS = {"authorization", "x-api-key"}
 
 
 @dataclass
@@ -119,7 +50,8 @@ class _Owner:
 
 class Proxy:
     """`with Proxy(env) as proxy:` serves on an ephemeral loopback port; `session(job, attempt)` gives
-    a session's base URL per route. `settler_for` builds a settler from an upstream record."""
+    a session's base URL per route. `settler_for(upstream, key_fingerprint)` builds the settler of one
+    billing scope, or raises `settlers.NoSettler`."""
 
     def __init__(self, env: envelope_mod.Envelope, *, settler_for=settlers_mod.from_upstream,
                  settle_seconds=SETTLE_SECONDS, reconcile_seconds=RECONCILE_SECONDS,
@@ -127,7 +59,8 @@ class Proxy:
         self.env, self._settler_for = env, settler_for
         self._warn = warn or (lambda message: print(f"WARN proxy: {message}", file=sys.stderr, flush=True))
         self.routes = frozenset(env.route_names())
-        self._settlers: dict[str, settlers_mod.Settler] = {}
+        self._settlers: dict[tuple[route_config.Upstream, str], settlers_mod.Settler] = {}
+        self._policies: dict[str, route_config.Policy | str] = {}  # by route version: parsed once
         self._owners: dict[str, _Owner] = {}
         self._lock = threading.Lock()
         self._in_flight = 0
@@ -155,12 +88,17 @@ class Proxy:
         self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self._server.daemon_threads = True
         threading.Thread(target=self._server.serve_forever, daemon=True).start()
-        self.reconcile_now()
-        self._workers = [threading.Thread(target=self._loop, args=(self._settle_seconds, self.settle_now), daemon=True),
-                         threading.Thread(target=self._loop, args=(self._reconcile_seconds, self.reconcile_now),
-                                          daemon=True)]
-        for worker in self._workers:
-            worker.start()
+        try:
+            self.reconcile_now()
+            self._workers = [threading.Thread(target=self._loop, args=(self._settle_seconds, self.settle_now),
+                                              daemon=True),
+                             threading.Thread(target=self._loop, args=(self._reconcile_seconds, self.reconcile_now),
+                                              daemon=True)]
+            for worker in self._workers:
+                worker.start()
+        except BaseException:
+            self.__exit__(None, None, None)  # a failed start releases what it took: __exit__ isn't called for it
+            raise
         return self
 
     def __exit__(self, *exc) -> None:
@@ -207,7 +145,12 @@ class Proxy:
 
     def settle_now(self) -> None:
         for pending in self.env.pending_settlements():
-            outcome = self._settler(pending.upstream).settle(pending.billing_id)
+            try:
+                settler = self._settler(pending.upstream, pending.key_fingerprint)
+            except settlers_mod.NoSettler as exc:  # it stays counted at its admitted bound
+                self._warn(f"request {pending.request}: no settler: {exc}")
+                continue
+            outcome = settler.settle(pending.billing_id)
             # Committed only if the request still has exactly this id: the envelope checks it atomically.
             if isinstance(outcome, settlers_mod.Billed):
                 self.env.settle_looked_up(pending.request, pending.billing_id, outcome.usd)
@@ -220,18 +163,32 @@ class Proxy:
             if route is None:
                 continue
             try:
-                usage = self._settler(route.upstream).key_usage()
-            except settlers_mod.UsageUnavailable as exc:  # the snapshot expires and admission stops
-                self._warn(f"scope {scope}: no usage reading: {exc}")
+                usage = self._settler(route.upstream, route.key_fingerprint).key_usage()
+            except (settlers_mod.UsageUnavailable, settlers_mod.NoSettler) as exc:  # the snapshot expires and
+                self._warn(f"scope {scope}: no usage reading: {exc}")              # admission stops
                 continue
             self.env.reconcile(scope, usage)  # one reading per key, however many routes share it
 
-    def _settler(self, upstream: dict | None) -> settlers_mod.Settler:
-        key = json.dumps(upstream, sort_keys=True)
+    def _settler(self, upstream: dict | None, key_fingerprint: str) -> settlers_mod.Settler:
+        """The settler of one billing scope at one upstream, built once."""
+        try:
+            parsed = route_config.parse_upstream(upstream)
+        except ValueError as exc:
+            raise settlers_mod.NoSettler(str(exc)) from None
         with self._lock:
-            if key not in self._settlers:
-                self._settlers[key] = self._settler_for(upstream or {})
-            return self._settlers[key]
+            if (parsed, key_fingerprint) not in self._settlers:
+                self._settlers[parsed, key_fingerprint] = self._settler_for(parsed, key_fingerprint)
+            return self._settlers[parsed, key_fingerprint]
+
+    def _policy(self, route: envelope_mod.Route) -> route_config.Policy | str:
+        """The route's parsed policy, or why it doesn't parse; parsed once per route version."""
+        with self._lock:
+            if route.version not in self._policies:
+                try:
+                    self._policies[route.version] = route_config.parse_policy(route.policy)
+                except ValueError as exc:
+                    self._policies[route.version] = str(exc)
+            return self._policies[route.version]
 
     def _loop(self, seconds: float, work) -> None:
         while not self._stop.wait(seconds):
@@ -271,10 +228,9 @@ class Proxy:
         route = self.env.route(parts[3]) if parts[3] in self.routes else None
         if owner is None or route is None:
             return _reply(handler, 403, "unknown session or route")
-        try:
-            policy = parse_policy(route.policy)
-        except ValueError as exc:
-            return _reply(handler, 403, f"the route's policy is malformed: {exc}")
+        policy = self._policy(route)
+        if isinstance(policy, str):
+            return _reply(handler, 403, f"the route's policy is malformed: {policy}")
         try:
             length = int(handler.headers.get("Content-Length", ""))
         except ValueError:
@@ -283,26 +239,38 @@ class Proxy:
             return _reply(handler, 413, f"a body is at most {policy.max_body_bytes} bytes")
         body = handler.rfile.read(length)
         rest = "/" + parts[4]
-        problem = policy_problem(policy, rest, body)
+        problem = route_config.request_problem(policy, rest, body)
         if problem:
             return _reply(handler, 403, problem)
         credential = _credential(handler.headers)
         if credential is None or envelope_mod.fingerprint(credential) != route.key_fingerprint:
             return _reply(handler, 403, "the credential is not this route's key")
+        try:
+            settler = self._settler(route.upstream, route.key_fingerprint)
+        except settlers_mod.NoSettler as exc:  # nothing could settle it: not admitted
+            return _reply(handler, 503, f"this route can't be settled: {exc}")
         request_id = secrets.token_hex(16)
         try:
             self.env.admit(request_id, route.name, job=owner.job, attempt=owner.attempt, version=route.version)
         except envelope_mod.Refused as exc:
             return _reply(handler, 429, f"spend refused: {exc}")
-        self._forward(handler, route, rest, body, request_id)
+        self._forward(handler, route, settler, rest, body, request_id, credential)
 
-    def _forward(self, handler, route: envelope_mod.Route, rest: str, body: bytes, request_id: str) -> None:
-        target = urllib.parse.urlsplit(str(route.upstream["base_url"]).rstrip("/") + rest)
+    def _forward(self, handler, route: envelope_mod.Route, settler: settlers_mod.Settler, rest: str, body: bytes,
+                 request_id: str, credential: str) -> None:
+        target = urllib.parse.urlsplit(route_config.parse_upstream(route.upstream).base_url + rest)
         connection_type = http.client.HTTPSConnection if target.scheme == "https" else http.client.HTTPConnection
         connection = connection_type(target.netloc, timeout=600)
-        reader = _BillingReader(self._settler(route.upstream), lambda gen: self.env.record_billing_id(request_id, gen))
+        reader = _BillingReader(settler, lambda gen: self.env.record_billing_id(request_id, gen))
         try:
-            headers = {k: v for k, v in handler.headers.items() if k.lower() not in _HOP_BY_HOP}
+            sent = {k.lower() for k in handler.headers.keys()}
+            headers = {k: v for k, v in handler.headers.items()
+                       if k.lower() not in _HOP_BY_HOP and k.lower() not in _CREDENTIAL_HEADERS}
+            # Exactly the credential that was checked, under each header the client sent it in.
+            if "authorization" in sent:
+                headers["Authorization"] = f"Bearer {credential}"
+            if "x-api-key" in sent:
+                headers["x-api-key"] = credential
             headers["Accept-Encoding"] = "identity"  # the billing id must be readable
             connection.request("POST", target.path + (f"?{target.query}" if target.query else ""), body=body,
                                headers=headers)
@@ -367,10 +335,15 @@ class _BillingReader:
 
 
 def _credential(headers) -> str | None:
-    auth = headers.get("Authorization", "")
-    if auth.lower().startswith("bearer "):
-        return auth[7:].strip()
-    return headers.get("x-api-key")
+    """The one key a request carries. Clients may send it as both a Bearer token and `x-api-key`;
+    every such header must hold the same key, or there is no credential."""
+    keys = []
+    for auth in headers.get_all("Authorization") or ():
+        if not auth.lower().startswith("bearer "):
+            return None
+        keys.append(auth[7:].strip())
+    keys += [value.strip() for value in headers.get_all("x-api-key") or ()]
+    return keys[0] if keys and len(set(keys)) == 1 and keys[0] else None
 
 
 def _reply(handler, status: int, message: str) -> None:

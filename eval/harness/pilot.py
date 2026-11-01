@@ -48,9 +48,11 @@ def job_id(experiment: Experiment, purpose: str, run_id: str) -> str:
 
 
 def job_estimate(env: envelope.Envelope, experiment: Experiment, arm_name: str, calibration_runs: Path) -> float:
-    """What a job of this arm reserves: RESERVE_FACTOR × the dearest calibration build's upper cost, or
-    × its routes' bootstrap cost when there is none (or when a calibration build's spend is partly unknown)."""
+    """What a job of this arm reserves: RESERVE_FACTOR × the dearest calibration build's upper cost on
+    its routed seats (the envelope funds no native seat), or × its routes' bootstrap cost when there is
+    none (or when a calibration build's routed spend is partly unknown)."""
     arm = experiment.arm(arm_name)
+    routed = {spend.seat(a) for a in routed_seats(arm)}
     names = [routing.route_name(a.provider, a.model) for a in routed_seats(arm)]
     routes = {n: env.route(n) for n in names}
     missing = [n for n, r in routes.items() if r is None]
@@ -60,9 +62,10 @@ def job_estimate(env: envelope.Envelope, experiment: Experiment, arm_name: str, 
     highs, unknown = [], False
     for run_root in sorted(calibration_runs.glob(f"*--{arm_name}--r*")) if calibration_runs.is_dir() else []:
         for execution in spend.run_cost(run_root, None, arm).unscored:
-            totals = execution.totals()
-            highs.append(totals.cost.high)
-            unknown = unknown or totals.unknown > 0
+            on_routes = [a for a in execution.attempts if a.seat is None or a.seat in routed]
+            highs.append(sum(a.cost.high for a in on_routes if a.cost is not None))
+            # An unreadable record, or an attempt of unknown seat or cost, may hide routed spend.
+            unknown = unknown or bool(execution.unreadable) or any(a.cost is None for a in on_routes)
     base = max(highs) if highs else bootstrap
     return RESERVE_FACTOR * (max(base, bootstrap) if unknown else base)
 

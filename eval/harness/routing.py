@@ -75,6 +75,7 @@ def refusal(attempt: str) -> str | None:
 @contextlib.contextmanager
 def for_envelope(name: str, *, root=None):
     """Own the envelope, serve its proxy and make it the active context. Exit runs in reverse: the
-    context closes, the proxy drains every handler and worker, and only then is ownership released."""
+    context closes, the proxy drains its handlers and workers until its deadline, and then ownership is
+    released; a straggler past the deadline finds the envelope closed and can write nothing."""
     with envelope_mod.Envelope.owned(name, root=root) as env, proxy_mod.Proxy(env) as served, active(served):
         yield env

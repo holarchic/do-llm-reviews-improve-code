@@ -5,28 +5,31 @@ import shutil
 import tempfile
 import threading
 import unittest
+import unittest.mock
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-from eval.harness import envelope, prices, proxy, settlers
+from eval.harness import envelope, openrouter, prices, proxy, route_config, settlers
 from eval.harness.envelope import Envelope
 
 KEY = "sk-fake-key"
 FIELDS = ["model", "max_tokens", "messages", "stream", "tools", "system"]
 POLICY = {"paths": ["/v1/messages"], "models": ["m"], "fields": FIELDS, "tool_types": ["", "custom"],
           "output_limit": {"field": "max_tokens", "cap": 1000}, "max_body_bytes": 20_000}
-# The fake's own prices, $/M tokens: a body byte counts as an input token, billed as a 1-hour cache
-# write (the dearest input-side rate), and the fake refuses (unbilled) a body over its input ceiling.
+# The fake's own billing, $/M tokens: a request's input is its body bytes plus OVERHEAD tokens the
+# provider adds itself (a tool prompt, message framing), billed as a 1-hour cache write (the dearest
+# input-side rate); input past its CONTEXT window is refused, unbilled.
 RATE_IN, RATE_WRITE, RATE_OUT = 4.0, 8.0, 20.0
-CEILING = 20_000
+CONTEXT, OVERHEAD = 20_000, 300
 
 
 class FakeProvider:
-    """An upstream with its own billing: a request costs its body bytes and max_tokens at RATE_IN/RATE_OUT."""
+    """An upstream with its own billing: a request costs its input tokens at RATE_WRITE and its
+    max_tokens at RATE_OUT."""
 
     def __init__(self):
-        self.calls, self.billed, self.visible_lag = 0, {}, 0.0
+        self.calls, self.billed, self.visible_lag, self.credentials = 0, {}, 0.0, []
         self.encodings, self.cut, self.events = [], False, None
         self.lookup = "billed"  # or "pending" | "error"
         self._lock = threading.Lock()
@@ -36,7 +39,9 @@ class FakeProvider:
             def do_POST(self):
                 body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
                 request = json.loads(body)
-                if len(body) > CEILING:  # over the provider's own input ceiling: refused, not billed
+                provider.credentials.append((self.headers.get_all("Authorization"), self.headers.get_all("x-api-key")))
+                tokens = len(body) + OVERHEAD
+                if tokens > CONTEXT:  # past the context window: refused, not billed
                     self.send_response(400)
                     self.end_headers()
                     return
@@ -44,7 +49,7 @@ class FakeProvider:
                     provider.calls += 1
                     provider.encodings.append(self.headers.get("Accept-Encoding"))
                     gen = f"gen-{provider.calls}"
-                    provider.billed[gen] = (len(body) * RATE_WRITE + request.get("max_tokens", 0) * RATE_OUT) / 1e6
+                    provider.billed[gen] = (tokens * RATE_WRITE + request.get("max_tokens", 0) * RATE_OUT) / 1e6
                 events = provider.events(gen) if provider.events else [{"id": gen, "type": "start"},
                                                                         {"delta": "a"}, {"delta": "b"}]
                 self.send_response(200)
@@ -120,7 +125,7 @@ class Fixture(unittest.TestCase):
         self.env.validate_route("r")
 
     def start(self, **kw):
-        served = proxy.Proxy(self.env, settler_for=lambda upstream: self.settler, settle_seconds=3600,
+        served = proxy.Proxy(self.env, settler_for=lambda upstream, fingerprint: self.settler, settle_seconds=3600,
                              reconcile_seconds=3600, shutdown_seconds=kw.pop("shutdown_seconds", 0), **kw)
         served.__enter__()
         self.addCleanup(served.__exit__, None, None, None)
@@ -200,6 +205,17 @@ class ForwardingTest(Fixture):
             "a tool type not allowed": {**ok, "tools": [{"type": "image_generation"}]},
             "a server tool": {**ok, "tools": [{"type": "web_search_20250305"}]},
             "image": {**ok, "messages": [{"role": "user", "content": [{"type": "image", "source": {}}]}]},
+            "a remote document": {**ok, "messages": [{"role": "user", "content": [
+                {"type": "document", "source": {"type": "url", "url": "https://example.com/a.pdf"}}]}]},
+            "a file in a tool result": {**ok, "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t", "content": [{"type": "input_file", "file_url": "u"}]}]}]},
+            "a file in the system prompt": {**ok, "system": [{"type": "file", "file_id": "f"}]},
+            "audio": {**ok, "messages": [{"role": "user", "content": [{"type": "input_audio", "data": ""}]}]},
+            "a content type that is not a string": {**ok, "messages": [{"role": "user", "content": [{"type": []}]}]},
+            "a model that is not a string": {**ok, "model": []},
+            "tools that are not a list": {**ok, "tools": 42},
+            "a tool that is not a table": {**ok, "tools": [42]},
+            "a tool type that is not a string": {**ok, "tools": [{"type": ["custom"]}]},
             "no output limit": {k: v for k, v in ok.items() if k != "max_tokens"},
             "output limit too high": {**ok, "max_tokens": 1001},
         }
@@ -213,6 +229,114 @@ class ForwardingTest(Fixture):
         self.assertEqual(self.provider.calls, 0)
         self.assertEqual(self.requests(), [])
         self.assertEqual(self.post(base, {**ok, "tools": [{"name": "Bash", "input_schema": {}}]})[0], 200)
+        # A tool call's own arguments are the model's output, not provider input: never walked.
+        call = {"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "Write",
+                                                  "input": {"type": "document", "schema": {"type": "object"}}}]}
+        self.assertEqual(self.post(base, {**ok, "messages": [call]})[0], 200)
+
+    def test_every_content_type_both_clis_send_is_admitted(self):
+        """The shapes Claude Code and Codex sent through the proxy in the live check, plus the tool
+        traffic of a working session."""
+        claude = {"model": "m", "max_tokens": 100, "system": [{"type": "text", "text": "s",
+                                                               "cache_control": {"type": "ephemeral"}}],
+                  "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                               {"role": "assistant", "content": [{"type": "thinking", "thinking": "t", "signature": "x"},
+                                                                 {"type": "tool_use", "id": "u", "name": "Bash",
+                                                                  "input": {"command": "ls"}}]},
+                               {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "u",
+                                                             "content": [{"type": "text", "text": "a.py"}]}]}]}
+        self.assertIsNone(route_config.request_problem(route_config.parse_policy(POLICY), "/v1/messages",
+                                                       json.dumps(claude).encode()))
+        codex = {"model": "m", "input": [
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "d"}]},
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "r"}], "encrypted_content": "e"},
+            {"type": "function_call", "name": "shell", "arguments": "{}", "call_id": "c"},
+            {"type": "function_call_output", "call_id": "c", "output": "ok"},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}]}
+        responses = route_config.parse_policy({"paths": ["/v1/responses"], "models": ["m"], "fields": ["model", "input"],
+                                               "tool_types": [], "max_body_bytes": 20_000})
+        self.assertIsNone(route_config.request_problem(responses, "/v1/responses", json.dumps(codex).encode()))
+        codex["input"].append({"type": "message", "role": "user", "content": [{"type": "input_file", "file_id": "f"}]})
+        self.assertIn("input_file", route_config.request_problem(responses, "/v1/responses", json.dumps(codex).encode()))
+
+
+class CredentialTest(Fixture):
+    def raw_post(self, served, headers):
+        base = served.session("job", "a1")["r"]
+        body = json.dumps({"model": "m", "max_tokens": 100, "messages": []}).encode()
+        connection = http.client.HTTPConnection("127.0.0.1", served.port, timeout=10)
+        connection.putrequest("POST", base.split(str(served.port))[1] + "/v1/messages")
+        connection.putheader("Content-Length", str(len(body)))
+        for name, value in headers:
+            connection.putheader(name, value)
+        connection.endheaders(body)
+        status = connection.getresponse().status
+        connection.close()
+        return status
+
+    def test_every_credential_header_must_carry_the_same_key(self):
+        served = self.start()
+        for headers in ([("Authorization", f"Bearer {KEY}"), ("Authorization", "Bearer sk-other")],
+                        [("Authorization", "Bearer sk-other"), ("Authorization", f"Bearer {KEY}")],
+                        [("x-api-key", KEY), ("Authorization", "Bearer sk-other")],
+                        [("x-api-key", KEY), ("x-api-key", "sk-other")],
+                        [("Authorization", f"Basic {KEY}")], [("Authorization", f"Basic {KEY}"), ("x-api-key", KEY)],
+                        [("Authorization", "Bearer ")], []):
+            with self.subTest(headers=headers):
+                self.assertEqual(self.raw_post(served, headers), 403)
+        self.assertEqual((self.provider.calls, self.requests()), (0, []))
+
+    def test_the_checked_key_is_exactly_what_is_forwarded(self):
+        served = self.start()
+        self.assertEqual(self.raw_post(served, [("Authorization", f"Bearer {KEY}"), ("x-api-key", KEY)]), 200)
+        self.assertEqual(self.raw_post(served, [("authorization", f"Bearer  {KEY} ")]), 200)
+        self.assertEqual(self.provider.credentials, [([f"Bearer {KEY}"], [KEY]), ([f"Bearer {KEY}"], None)])
+
+
+class SettlerScopeTest(Fixture):
+    def test_each_scope_gets_its_own_settler_with_its_own_key(self):
+        built = []
+        served = self.start()
+        served._settler_for = lambda upstream, fingerprint: (built.append(fingerprint), FakeSettler(self.provider))[1]
+        upstream = {"base_url": self.provider.base_url, "settler": "fake"}
+        first = served._settler(upstream, "fp-a")
+        self.assertIs(served._settler(upstream, "fp-a"), first)
+        self.assertIsNot(served._settler(upstream, "fp-b"), first)
+        self.assertEqual(built, ["fp-a", "fp-b"])
+
+    def test_the_openrouter_settler_refuses_a_key_file_holding_another_key(self):
+        key_file = self.root / "key"
+        key_file.write_text("sk-or-current\n")
+        upstream = route_config.Upstream("https://openrouter.ai/api", "openrouter")
+        with unittest.mock.patch.object(openrouter, "KEY_PATH", key_file):
+            settler = settlers.from_upstream(upstream, envelope.fingerprint("sk-or-current"))
+            self.assertEqual(settler.api_base, "https://openrouter.ai/api/v1")
+            with self.assertRaises(settlers.NoSettler):
+                settlers.from_upstream(upstream, envelope.fingerprint("sk-or-registered"))
+        with self.assertRaises(settlers.NoSettler):
+            settlers.from_upstream(route_config.Upstream("https://x", "other"), "fp")
+
+    def test_a_route_that_cannot_be_settled_is_not_admitted(self):
+        def no_settler(upstream, fingerprint):
+            raise settlers.NoSettler("the key file holds a different key from the scope's")
+        served = proxy.Proxy(self.env, settler_for=no_settler, settle_seconds=3600, reconcile_seconds=3600,
+                             shutdown_seconds=0, warn=lambda message: None)
+        served.__enter__()
+        self.addCleanup(served.__exit__, None, None, None)
+        self.assertEqual(self.post(served.session("job", "a1")["r"])[0], 503)
+        self.assertEqual((self.provider.calls, self.requests()), (0, []))
+
+
+class StartupTest(Fixture):
+    def test_a_failed_start_releases_its_listener(self):
+        def broken(upstream, fingerprint):
+            raise RuntimeError("an adapter bug")
+        served = proxy.Proxy(self.env, settler_for=broken, settle_seconds=3600, reconcile_seconds=3600, shutdown_seconds=0)
+        with self.assertRaises(RuntimeError):
+            served.__enter__()
+        port = served.port
+        with self.assertRaises(OSError):
+            http.client.HTTPConnection("127.0.0.1", port, timeout=2).connect()
 
 
 class AdmissionTest(Fixture):
@@ -250,12 +374,13 @@ class AdmissionTest(Fixture):
 
 class BoundEndToEndTest(Fixture):
     def test_maximal_requests_at_a_tight_allocation_never_bill_past_funded_credit(self):
-        """The fake bills each request at its own prices (input as cache writes, the dearest rate); the
-        route's bound comes from the price arithmetic over its enforced input and output limits."""
+        """The fake bills each request at its own prices (input as cache writes, the dearest rate, with
+        input it adds itself); the route's bound comes from the price arithmetic over the enforced
+        limits, the context window and the output cap, never from the body's size."""
         cap = 100_000  # the output cap: about $2 a maximal request
         fake_price = prices.Price("fake", "m", prices.Rates(RATE_IN, RATE_IN, RATE_OUT, (("1h", RATE_WRITE),)), "test")
-        bound = prices.request_charge_bound(fake_price, max_input_tokens=CEILING, max_output_tokens=cap)
-        policy = {**POLICY, "output_limit": {"field": "max_tokens", "cap": cap}, "max_body_bytes": CEILING}
+        bound = prices.request_charge_bound(fake_price, max_input_tokens=CONTEXT, max_output_tokens=cap)
+        policy = {**POLICY, "output_limit": {"field": "max_tokens", "cap": cap}, "max_body_bytes": 2 * CONTEXT}
         self.set_route(policy=policy, max_charge=bound, slots=3)
         self.env.reconcile("or", 7.0)
         served = self.start()
@@ -265,10 +390,12 @@ class BoundEndToEndTest(Fixture):
             shell["messages"][0]["content"] = "x" * (size - len(json.dumps(shell)))
             return json.dumps(shell).encode()
 
-        self.assertEqual(self.post(served.session("job", "big")["r"], body_of(CEILING + 1))[0], 413)
+        self.assertEqual(self.post(served.session("job", "big")["r"], body_of(2 * CONTEXT + 1))[0], 413)
+        # Within the body limit but past the window once the provider adds its own input: refused, unbilled.
+        self.assertEqual(self.post(served.session("job", "wide")["r"], body_of(CONTEXT))[0], 400)
         statuses = []
         for i in range(40):
-            statuses.append(self.post(served.session("job", f"a{i}")["r"], body_of(CEILING))[0])
+            statuses.append(self.post(served.session("job", f"a{i}")["r"], body_of(CONTEXT - OVERHEAD))[0])
             served.settle_now()
             self.env.reconcile("or", self.settler.key_usage())
         self.assertGreater(statuses.count(200), 0)
@@ -327,7 +454,7 @@ class SettlementTest(Fixture):
 
     def test_settlement_uses_the_upstream_a_request_was_admitted_under(self):
         seen = []
-        served = proxy.Proxy(self.env, settler_for=lambda upstream: (seen.append(upstream["base_url"]), self.settler)[1],
+        served = proxy.Proxy(self.env, settler_for=lambda upstream, fingerprint: (seen.append(upstream.base_url), self.settler)[1],
                              settle_seconds=3600, reconcile_seconds=3600, shutdown_seconds=0)
         served.__enter__()
         self.addCleanup(served.__exit__, None, None, None)
@@ -422,7 +549,9 @@ class OpenRouterSettlerTest(unittest.TestCase):
     def test_key_usage_reads_or_raises(self):
         self.responses["/api/v1/key"] = (200, {"data": {"usage": 4.5}})
         self.assertEqual(self.settler.key_usage(), 4.5)
-        for bad in ((200, {"data": {"usage": "x"}}), (500, {"error": "down"}), (200, {"nothing": 1})):
+        for bad in ((200, {"data": {"usage": "x"}}), (500, {"error": "down"}), (200, {"nothing": 1}),
+                    (200, {"data": {"usage": True}}), (200, {"data": {"usage": -1.0}}),
+                    (200, {"data": {"usage": float("inf")}}), (200, {"data": {"usage": float("nan")}})):
             self.responses["/api/v1/key"] = bad
             with self.subTest(bad=bad), self.assertRaises(settlers.UsageUnavailable):
                 self.settler.key_usage()
@@ -450,6 +579,9 @@ class ChargeBoundTest(unittest.TestCase):
         self.assertAlmostEqual(prices.request_charge_bound(opus, max_input_tokens=1_000_000, max_output_tokens=128_000,
                                                            per_request_usd=0.01),
                                (1_000_000 * 8.0 + 128_000 * 20.0) / 1e6 + 0.01, places=9)
+        dear_reads = prices.Price("fake", "m", prices.Rates(1.0, 3.0, 2.0, (("5m", 2.0),)), "test")
+        self.assertAlmostEqual(prices.request_charge_bound(dear_reads, max_input_tokens=1_000_000, max_output_tokens=0),
+                               3.0)  # a cached read dearer than everything else still bounds it
 
 
 if __name__ == "__main__":
