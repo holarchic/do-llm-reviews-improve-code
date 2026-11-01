@@ -29,7 +29,7 @@ class _KeyFile(unittest.TestCase):
 
 
 class StubProxy:
-    """Stands in for routing.Proxy: every routed session needs an active routing context."""
+    """Stands in for proxy.Proxy: every routed session needs an active routing context."""
     BASE = "http://127.0.0.1:9/s/token"
 
     def __init__(self, *models):

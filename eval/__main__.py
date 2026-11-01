@@ -110,9 +110,7 @@ def _probe(args) -> int:
 
 
 def _run(args) -> int:
-    import json
-
-    from .harness import loop, pilot, tasks
+    from .harness import pilot, tasks
 
     experiment = args.experiment
     if not args.task:
@@ -127,30 +125,7 @@ def _run(args) -> int:
     if not task.is_dev:
         print("run: scored tasks run only from a frozen schedule", file=sys.stderr)
         return 2
-    arm = experiment.arm(args.arm)
-    runs_root = _data_root(experiment) / "runs"
-    calibration = _data_root(experiment) / "calibration" / "runs"
-
-    def build_and_followup() -> int:
-        record = loop.execute_run(task, arm, runs_root, manifest_hash=None, offline=experiment.offline)
-        print(json.dumps({k: record.get(k) for k in ("run_id", "exec", "status", "flags", "rounds", "scores")}))
-        if record["status"] != "complete":
-            return 1
-        if arm.name not in experiment.followup_arms:
-            return 0
-        exec_dir = runs_root / record["run_id"] / record["exec"]
-        followup = loop.execute_followup(task, exec_dir, arm, manifest_hash=None, offline=experiment.offline)
-        print(json.dumps({k: followup.get(k) for k in ("status", "flags", "scores")}))
-        return 0 if followup["status"] == "complete" else 1
-
-    # The follow-up runs inside the same reservation and routing context as its build.
-    with pilot.routing_context(experiment) as env:
-        code = pilot.reserved(env, f"dev:{loop.run_id(task.id, arm.name, None)}",
-                              lambda: pilot.job_estimate(env, experiment, arm.name, calibration), build_and_followup)
-    if code is None:
-        print("run: not admitted by the spend envelope", file=sys.stderr)
-        return 1
-    return code
+    return pilot.run_dev(_data_root(experiment), experiment, task, experiment.arm(args.arm))
 
 
 def _calibrate(args) -> int:

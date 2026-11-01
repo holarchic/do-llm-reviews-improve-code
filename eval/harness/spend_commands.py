@@ -11,7 +11,7 @@ from dataclasses import dataclass
 
 from . import envelope, openrouter, proxy
 
-ACTIONS = ("create", "fund", "scope", "route", "validate-route", "status", "resolve")
+ACTIONS = ("create", "fund", "scope", "allocate", "route", "validate-route", "status", "resolve")
 
 
 class Usage(Exception):
@@ -78,14 +78,18 @@ def _parse(args):
         _need(args, "scope", "provider", "allocation")
         if args.provider != "openrouter":
             raise Usage("only an openrouter scope can read its key's usage so far")
+    if action == "allocate":
+        _need(args, "scope", "allocation")
     if action == "route":
         _need(args, "route", "scope", "max_charge", "slots", "policy", "bootstrap", "upstream_base", "settler")
         try:
             policy = json.loads(args.policy)
         except ValueError as exc:
             raise Usage(f"--policy is not JSON: {exc}") from None
-        if not isinstance(policy, dict) or not all(k in policy for k in ("paths", "models", "fields", "tool_types")):
-            raise Usage("--policy needs paths, models, fields and tool_types")
+        try:
+            proxy.parse_policy(policy)  # the proxy's own parser: a policy it would refuse is never stored
+        except ValueError as exc:
+            raise Usage(f"--policy: {exc}") from None
         return RouteCommand(args.route, args.scope, args.max_charge, args.slots, policy, args.bootstrap,
                             {"base_url": args.upstream_base, "settler": args.settler})
     if action == "validate-route":
@@ -106,9 +110,11 @@ def _apply(env: envelope.Envelope, args, command) -> None:
             env.fund(credit=args.credit, fees=args.fees or 0.0, taxes=args.taxes or 0.0)
     elif action == "scope":
         key = openrouter.api_key()
-        env.register_scope(args.scope, provider=args.provider, fingerprint=proxy.fingerprint(key),
+        env.register_scope(args.scope, provider=args.provider, fingerprint=envelope.fingerprint(key),
                            opening_usage=openrouter.credit_used(), allocation=args.allocation,
                            provider_limit=args.provider_limit)
+    elif action == "allocate":
+        env.raise_allocation(args.scope, args.allocation)
     elif action == "route":
         env.set_route(command.route, scope=command.scope, max_charge=command.max_charge, slots=command.slots,
                       policy=command.policy, bootstrap_build_usd=command.bootstrap, upstream=command.upstream)

@@ -19,6 +19,7 @@ check out refuses everything.
 
 import copy
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -30,10 +31,18 @@ from pathlib import Path
 
 DEFAULT_ROOT = Path(__file__).resolve().parents[1] / "data" / "envelopes"
 SNAPSHOT_SECONDS = 600
-RESERVE_FACTOR = 1.5
 PROBE = "probe"  # the job id of a probe reservation
 STAGES = ("probe", "validated")
 _EPSILON = 1e-9
+
+
+def fingerprint(credential: str) -> str:
+    """How a scope names its key: never the key itself."""
+    return hashlib.sha256(credential.encode()).hexdigest()[:16]
+
+
+def _version(config: dict) -> str:
+    return hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:16]
 
 
 @dataclass(frozen=True)
@@ -47,6 +56,7 @@ class Route:
     stage: str
     upstream: dict | None
     key_fingerprint: str
+    version: str  # admission checks it: the ledger records exactly the route the proxy checked
 
 
 @dataclass(frozen=True)
@@ -172,6 +182,20 @@ class Envelope:
         finally:
             registry.close()
 
+    def raise_allocation(self, scope: str, allocation: float) -> None:
+        """Give a scope more of the funded credit; a scope's key and opening usage never change."""
+        if not _money(allocation):
+            raise Refused("an allocation is a non-negative amount")
+
+        def change(s):
+            if scope not in s["scopes"]:
+                raise Refused(f"no scope {scope}")
+            if allocation < s["scopes"][scope]["allocation"]:
+                raise Refused("an allocation only rises")
+            s["scopes"][scope]["allocation"] = allocation
+            _require_allocations(s)
+        self._transition(change)
+
     def set_route(self, route: str, *, scope: str, max_charge: float, slots: int, policy: dict,
                   bootstrap_build_usd: float, upstream: dict | None = None) -> None:
         """`upstream` is where the proxy forwards: {"base_url": ..., "settler": "openrouter"}."""
@@ -247,17 +271,20 @@ class Envelope:
 
     # ---- requests
 
-    def admit(self, request: str, route: str, *, job: str, attempt: str) -> float:
-        """Admit one request, or record a refusal against its attempt and raise Refused."""
+    def admit(self, request: str, route: str, *, job: str, attempt: str, version: str | None = None) -> float:
+        """Admit one request, or record a refusal against its attempt and raise Refused. With `version`,
+        the route must still be exactly the one the caller checked."""
         def change(s):
             if request in s["requests"]:
                 raise Refused(f"request {request} was already admitted")
             reason = _admission_problem(s, route, job, attempt, self._now())
+            if not reason and version is not None and _version(_config(s["routes"][route])) != version:
+                reason = f"route {route} changed while the request was checked"
             if not reason:
                 r = s["routes"][route]
                 s["requests"][request] = {"route": route, "scope": r["scope"], "bound": r["max_charge"], "job": job,
                                           "attempt": attempt, "state": "unresolved", "billed": None,
-                                          "billing_id": None, "ambiguous": False,
+                                          "billing_id": None, "ambiguous": False, "captured": False,
                                           "upstream": copy.deepcopy(r["upstream"]), "admitted_at": self._now()}
                 try:
                     _require_reservations_fit(s)  # the request must not eat into another job's hold
@@ -265,7 +292,7 @@ class Envelope:
                     del s["requests"][request]
                     reason = str(exc)
             if reason:
-                s["refusals"][attempt] = reason
+                s["refusals"].setdefault(attempt, reason)  # the first reason stands: a retrying CLI can't grow it
                 return reason
             return None
         reason = self._transition(change)
@@ -283,8 +310,28 @@ class Envelope:
                 entry["billing_id"], entry["ambiguous"] = None, True
         self._transition(change)
 
+    def capture_complete(self, request: str) -> None:
+        """The response has ended: its billing id, if any, is final, and settlement may look it up."""
+        def change(s):
+            s["requests"][request]["captured"] = True
+        self._transition(change)
+
+    def settle_looked_up(self, request: str, billing_id: str, billed: float | None) -> bool:
+        """An automatic settlement: committed only if the request is still unresolved, its capture has
+        ended, and `billing_id` is still its one unambiguous id. False (and nothing changed) otherwise."""
+        def change(s):
+            entry = s["requests"].get(request)
+            if (entry is None or entry["state"] != "unresolved" or not entry["captured"] or entry["ambiguous"]
+                    or entry["billing_id"] != billing_id):
+                return False
+            return _settle(s, entry, billed)
+        if billed is not None and not _money(billed):
+            raise Refused(f"billed {billed!r} is not a charge")
+        return self._transition(change)
+
     def settle(self, request: str, billed: float | None) -> bool:
-        """The provider's billed charge (None: not billed). Idempotent: a settled request stays as it was."""
+        """The operator's resolution, after checking the provider's billing (None: not billed).
+        Idempotent: a settled request stays as it was."""
         if billed is not None and not _money(billed):
             raise Refused(f"billed {billed!r} is not a charge")
 
@@ -294,11 +341,7 @@ class Envelope:
                 raise Refused(f"no request {request}")
             if entry["state"] != "unresolved":
                 return False
-            entry["state"], entry["billed"] = ("billed", billed) if billed is not None else ("not_billed", 0.0)
-            held = s["reservations"].get(entry["job"])
-            if held is not None and held["open"] and held["terminated"]:
-                _close_if_done(s, entry["job"])
-            return True
+            return _settle(s, entry, billed)
         return self._transition(change)
 
     # ---- typed views
@@ -310,7 +353,7 @@ class Envelope:
                 return None
             return Route(name, r["scope"], r["max_charge"], r["slots"], copy.deepcopy(r["policy"]),
                          r["bootstrap_build_usd"], r["stage"], copy.deepcopy(r["upstream"]),
-                         self._state["scopes"][r["scope"]]["fingerprint"])
+                         self._state["scopes"][r["scope"]]["fingerprint"], _version(_config(r)))
 
     def route_names(self) -> list[str]:
         with self._mutex:
@@ -325,7 +368,7 @@ class Envelope:
         with self._mutex:
             return [PendingSettlement(rid, r["billing_id"], copy.deepcopy(r["upstream"]), r["scope"])
                     for rid, r in self._state["requests"].items()
-                    if r["state"] == "unresolved" and r["billing_id"] and not r["ambiguous"]]
+                    if r["state"] == "unresolved" and r["captured"] and r["billing_id"] and not r["ambiguous"]]
 
     def refusal(self, attempt: str) -> str | None:
         with self._mutex:
@@ -358,15 +401,6 @@ def summary(state: dict, now: float) -> dict:
     }
 
 
-def job_estimate(build_highs: list[float], bootstrap_build_usd: float, unknown: bool = False) -> float:
-    """What a job reserves: RESERVE_FACTOR × the dearest calibration build's upper cost, or the route's
-    bootstrap cost when there is none (or when a calibration build's spend is partly unknown)."""
-    base = max(build_highs) if build_highs else bootstrap_build_usd
-    if unknown:
-        base = max(base, bootstrap_build_usd)
-    return RESERVE_FACTOR * base
-
-
 def _empty(name: str, envelope_usd: float) -> dict:
     return {"name": name, "envelope_usd": envelope_usd, "funding": [], "scopes": {}, "routes": {},
             "requests": {}, "reservations": {}, "refusals": {}}
@@ -384,6 +418,18 @@ def _write(path: Path, state: dict) -> None:
         os.fsync(directory)
     finally:
         os.close(directory)
+
+
+def _config(route: dict) -> dict:
+    return {k: route[k] for k in ("scope", "max_charge", "slots", "policy", "bootstrap_build_usd", "upstream")}
+
+
+def _settle(s: dict, entry: dict, billed: float | None) -> bool:
+    entry["state"], entry["billed"] = ("billed", billed) if billed is not None else ("not_billed", 0.0)
+    held = s["reservations"].get(entry["job"])
+    if held is not None and held["open"] and held["terminated"]:
+        _close_if_done(s, entry["job"])
+    return True
 
 
 def _close_if_done(s: dict, job: str) -> bool:
@@ -410,11 +456,13 @@ def _check(s: dict) -> None:
             ensure(snap is None or (_money(snap["usage"]) and _money(snap["at"])), f"scope {name} snapshot")
         for name, route in s["routes"].items():
             ensure(route["scope"] in s["scopes"] and route["stage"] in STAGES and _money(route["max_charge"])
+                   and route["max_charge"] > 0
                    and isinstance(route["slots"], int) and not isinstance(route["slots"], bool) and route["slots"] >= 1
                    and isinstance(route["policy"], dict) and _money(route["bootstrap_build_usd"])
                    and (route["upstream"] is None or isinstance(route["upstream"], dict)), f"route {name}")
         for name, r in s["requests"].items():
-            ensure(r["scope"] in s["scopes"] and _money(r["bound"])
+            ensure(r["route"] in s["routes"] and r["scope"] in s["scopes"] and _money(r["bound"]) and r["bound"] > 0
+                   and isinstance(r["captured"], bool) and _money(r["admitted_at"])
                    and r["state"] in ("unresolved", "billed", "not_billed")
                    and (r["billed"] is None) == (r["state"] == "unresolved")
                    and (r["billed"] is None or _money(r["billed"]))

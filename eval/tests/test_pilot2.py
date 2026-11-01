@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from eval.harness import agents, experiments, loop, manifest, openrouter, pilot, tasks
+from eval.harness import agents, experiments, loop, manifest, openrouter, pilot, prices, tasks
 
 DEV = tasks.Task(tasks.TASKS_ROOT / "dev-intervals")
 PILOT2 = experiments.PILOT2
@@ -41,38 +41,74 @@ class ShapeTest(unittest.TestCase):
         self.assertEqual({arm.writer for arm in PILOT2.arms}, {experiments.QWEN_WRITER})
 
 
-class SpendCapTest(unittest.TestCase):
-    def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="eval-test-"))
-        self.addCleanup(shutil.rmtree, self.tmp)
-        self.ledger = self.tmp / "spend.json"
+class HistoricalSpendTest(unittest.TestCase):
+    """Pilot 2's report reads the spend-cap ledger its runs wrote; no new run writes one."""
 
-    def admit(self, usage, cap=1.0, phase="scored"):
-        side_effect = openrouter.CreditUnavailable("down") if usage is None else None
-        with mock.patch.object(openrouter, "credit_used", return_value=usage, side_effect=side_effect):
-            return openrouter.SpendCap(self.ledger, phase, cap).admit()
+    def test_spent_reads_a_phase_and_a_missing_ledger_is_none(self):
+        tmp = Path(tempfile.mkdtemp(prefix="eval-test-"))
+        self.addCleanup(shutil.rmtree, tmp)
+        ledger = tmp / "spend.json"
+        ledger.write_text(json.dumps({"scored": {"baseline": 5.0, "readings": [5.0, 5.4]}}))
+        self.assertAlmostEqual(openrouter.spent(ledger, "scored"), 0.4)
+        self.assertIsNone(openrouter.spent(ledger, "calibration"))
+        self.assertIsNone(openrouter.spent(tmp / "missing.json", "scored"))
 
-    def test_baseline_survives_a_resume_and_counts_cumulative_spend(self):
-        self.assertTrue(self.admit(5.0))
-        self.assertTrue(self.admit(5.9))  # a new SpendCap: the resumed run keeps the first baseline
-        self.assertFalse(self.admit(6.0))
-        self.assertAlmostEqual(openrouter.spent(self.ledger, "scored"), 1.0)
 
-    def test_settle_records_the_last_jobs_spend(self):
-        self.assertTrue(self.admit(5.0))
-        with mock.patch.object(openrouter, "credit_used", return_value=5.4):
-            openrouter.SpendCap(self.ledger, "scored", 1.0).settle()
-        self.assertAlmostEqual(openrouter.spent(self.ledger, "scored"), 0.4)
+class JobEstimateTest(unittest.TestCase):
+    def test_an_estimate_is_the_bootstrap_until_calibration_then_the_dearest_build(self):
+        from eval.harness import envelope, routing
+        root = Path(tempfile.mkdtemp(prefix="eval-test-"))
+        self.addCleanup(shutil.rmtree, root)
+        experiment = dataclasses.replace(PILOT2, envelope="T")
+        with envelope.Envelope.owned("T", root=root / "envelopes", create_usd=50.0) as env:
+            env.fund(credit=10.0)
+            env.register_scope("or", provider="openrouter", fingerprint="fp", opening_usage=0.0, allocation=10.0,
+                               provider_limit=None)
+            arm = experiment.arm("A1")
+            env.set_route(routing.route_name(arm.writer.provider, arm.writer.model), scope="or", max_charge=0.5,
+                          slots=1, policy={}, bootstrap_build_usd=2.0)
+            calibration = root / "calibration" / "runs"
+            self.assertEqual(pilot.job_estimate(env, experiment, "A1", calibration), 3.0)  # 1.5 × $2 bootstrap
+            exec_dir = calibration / "dev-intervals--A1--r1" / "exec-1"
+            exec_dir.mkdir(parents=True)
+            by_model = {arm.writer.model: {"inputTokens": 1_000_000, "outputTokens": 0, "cacheReadInputTokens": 0,
+                                           "cacheCreationInputTokens": 0}}
+            (exec_dir / "record.json").write_text(json.dumps({"steps": [{"name": "build", "attempts": [
+                {"usage": {"by_model": by_model}, "seconds": 1}]}]}))
+            with mock.patch.dict(prices.PRICES, {("openrouter", arm.writer.model): prices.Price(
+                    "openrouter", arm.writer.model, prices.Rates(4.0, 0.4, 20.0), "test")}):
+                self.assertAlmostEqual(pilot.job_estimate(env, experiment, "A1", calibration), 6.0)  # 1.5 × $4
 
-    def test_unreadable_usage_refuses(self):
-        self.assertFalse(self.admit(None))
+    def test_experiments_sharing_an_envelope_never_share_a_jobs_hold(self):
+        from eval.harness import envelope, routing
+        root = Path(tempfile.mkdtemp(prefix="eval-test-"))
+        self.addCleanup(shutil.rmtree, root)
+        first, second = (dataclasses.replace(PILOT2, name=name, envelope="T") for name in ("first", "second"))
+        run = loop.run_id("dev-intervals", "A1", 1)  # the same task, arm and replicate in both
+        with envelope.Envelope.owned("T", root=root / "envelopes", create_usd=50.0) as env:
+            env.fund(credit=10.0)
+            env.register_scope("or", provider="openrouter", fingerprint="fp", opening_usage=0.0, allocation=10.0,
+                               provider_limit=None)
+            arm = PILOT2.arm("A1")
+            route = routing.route_name(arm.writer.provider, arm.writer.model)
+            env.set_route(route, scope="or", max_charge=4.0, slots=4, policy={}, bootstrap_build_usd=1.0)
+            env.validate_route(route)
+            env.reconcile("or", 0.0)
+            env.reserve(pilot.job_id(first, "build", run), 1.0)
+            env.admit("q1", route, job=pilot.job_id(first, "build", run), attempt="a")
+            env.settle("q1", 4.0)
+            env.finish(pilot.job_id(first, "build", run))
+            env.reconcile("or", 4.0)
+            env.reserve(pilot.job_id(second, "build", run), 5.0)
+            with self.assertRaises(envelope.Refused):  # $4 spent + two $5 holds > $10
+                env.reserve(pilot.job_id(second, "calibration", run), 5.0)
 
-    def test_phases_have_separate_baselines(self):
-        self.assertTrue(self.admit(5.0, phase="calibration"))
-        self.assertTrue(self.admit(8.0, phase="scored"))
-        self.assertFalse(self.admit(9.0, phase="calibration", cap=3.0))
-        self.assertTrue(self.admit(8.5, phase="scored"))
-        self.assertIsNone(openrouter.spent(self.tmp / "missing.json", "scored"))
+    def test_a_native_only_arm_runs_without_a_reservation(self):
+        ran = []
+        native = dataclasses.replace(PILOT2.arm("A1"), writer=agents.Agent("claude", "claude-opus-5-5"))
+        outcome = pilot.reserved(mock.Mock(reserve=mock.Mock(side_effect=AssertionError)), native, "x", lambda: 0.0,
+                                 lambda: ran.append(1) or "done")
+        self.assertEqual((outcome, ran), (pilot.Admitted("done"), [1]))
 
 
 class RunBuildsEnvelopeTest(unittest.TestCase):
@@ -173,8 +209,8 @@ class RunBuildsEnvelopeTest(unittest.TestCase):
             # A resumed run: the build is complete, only its follow-up is still owed.
             with mock.patch.object(pilot, "complete_build", lambda *a, **k: root / "runs" / "x" / "exec-1"):
                 pilot.run_builds(root, experiment)
-        run_id = loop.run_id("dev-intervals", "A1", None)  # one replicate: no --r suffix
-        self.assertEqual(seen, [(run_id, True), (run_id, True)])
+        job = pilot.job_id(experiment, "build", loop.run_id("dev-intervals", "A1", None))
+        self.assertEqual(seen, [(job, True), (job, True)])
 
     def test_a_routed_experiment_without_an_envelope_is_refused(self):
         from eval.harness import routing

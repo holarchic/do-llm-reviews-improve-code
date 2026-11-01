@@ -146,6 +146,10 @@ class GateTest(Fixture):
             with self.assertRaises(Refused):
                 env.admit("q3", "r", job="job", attempt="a2")
             self.assertIn("slots", env.refusal("a2"))
+            for i in range(5):  # a CLI that keeps retrying: the recorded reason stays the first one
+                with self.assertRaises(Refused):
+                    env.admit(f"r{i}", "r", job="job", attempt="a2")
+            self.assertEqual(env.refusal("a2").count("refused"), 0)
             env.admit("q4", "r", job="job", attempt="a3")
 
     def test_a_request_id_is_admitted_once(self):
@@ -330,15 +334,6 @@ class StageAndReservationTest(Fixture):
             with self.assertRaises(Refused):
                 env.reserve("j2", 3.0)  # 7.5 + 3 > 10
 
-    def test_estimates_use_the_dearest_build_or_the_bootstrap(self):
-        self.assertEqual(envelope.job_estimate([], 2.0), 3.0)
-        self.assertEqual(envelope.job_estimate([1.0, 4.0], 2.0), 6.0)
-        self.assertEqual(envelope.job_estimate([1.0], 2.0, unknown=True), 3.0)
-
-
-if __name__ == "__main__":
-    unittest.main()
-
 
 class SpendCommandTest(Fixture):
     def spend(self, *argv):
@@ -363,6 +358,11 @@ class SpendCommandTest(Fixture):
             self.assertEqual(self.spend("resolve", "--envelope", "B", "--request", "q1", "--billed", "0.3"), 3)
             self.assertEqual(self.spend("status", "--envelope", "B"), 0)
         self.assertEqual(self.spend("resolve", "--envelope", "B", "--request", "q1"), 2)  # neither flag
+        bad_policy = json.dumps({"paths": "not a list", "models": [], "fields": [], "tool_types": [], "max_body_bytes": 1})
+        self.assertEqual(self.spend("route", "--envelope", "B", "--route", "r9", "--scope", "or", "--max-charge", "1",
+                                    "--slots", "1", "--policy", bad_policy, "--bootstrap", "1",
+                                    "--upstream-base", "http://x", "--settler", "openrouter"), 2)
+        self.assertNotIn("r9", envelope.load(self.root / "B.json")["routes"])
         self.assertEqual(self.spend("resolve", "--envelope", "B", "--request", "q1", "--billed", "0.3"), 0)
         self.assertEqual(envelope.load(self.root / "B.json")["requests"]["q1"]["billed"], 0.3)
 
@@ -433,3 +433,30 @@ class ReworkTest(Fixture):
             self.ready(env)
         with self.assertRaises(EnvelopeError):
             env.fund(credit=1.0)
+
+
+class RoundTwoTest(Fixture):
+    def test_an_allocation_only_rises_and_never_past_funded_credit(self):
+        with self.owned() as env:
+            self.ready(env, credit=100.0, allocation=10.0)
+            env.raise_allocation("or", 20.0)
+            self.assertEqual(env.state["scopes"]["or"]["allocation"], 20.0)
+            for bad in (15.0, 101.0):
+                with self.subTest(bad=bad), self.assertRaises(Refused):
+                    env.raise_allocation("or", bad)
+
+    def test_a_zero_bound_route_or_a_request_without_its_route_is_not_loaded(self):
+        with self.owned() as env:
+            self.ready(env)
+            env.reserve("job", 1.0)
+            env.admit("q1", "r", job="job", attempt="a1")
+        path = self.root / "B.json"
+        state = json.loads(path.read_text())
+        zero = json.loads(json.dumps(state))
+        zero["routes"]["r"]["max_charge"] = 0.0
+        orphan = json.loads(json.dumps(state))
+        orphan["requests"]["q1"]["route"] = "gone"
+        for broken in (zero, orphan):
+            path.write_text(json.dumps(broken))
+            with self.assertRaises(EnvelopeError):
+                envelope.load(path)

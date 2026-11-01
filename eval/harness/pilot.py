@@ -17,6 +17,7 @@ import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from dataclasses import dataclass
 from typing import NamedTuple
 
 from . import envelope, judge, loop, manifest, openrouter, records, routing, spend, tasks
@@ -34,11 +35,23 @@ def routing_context(experiment: Experiment):
     return routing.for_envelope(experiment.envelope)
 
 
+RESERVE_FACTOR = 1.5  # a job reserves this times its estimated cost
+
+
+def routed_seats(arm) -> list:
+    return [a for a in (arm.writer, arm.reviewer) if a is not None and a.provider != "native"]
+
+
+def job_id(experiment: Experiment, purpose: str, run_id: str) -> str:
+    """A reservation's id: experiments sharing an envelope reuse task, arm and replicate names."""
+    return f"{experiment.name}/{purpose}/{run_id}"
+
+
 def job_estimate(env: envelope.Envelope, experiment: Experiment, arm_name: str, calibration_runs: Path) -> float:
-    """What a job of this arm reserves: from the arm's calibration builds, or its routes' bootstrap cost."""
+    """What a job of this arm reserves: RESERVE_FACTOR × the dearest calibration build's upper cost, or
+    × its routes' bootstrap cost when there is none (or when a calibration build's spend is partly unknown)."""
     arm = experiment.arm(arm_name)
-    names = [routing.route_name(a.provider, a.model) for a in (arm.writer, arm.reviewer)
-             if a is not None and a.provider != "native"]
+    names = [routing.route_name(a.provider, a.model) for a in routed_seats(arm)]
     routes = {n: env.route(n) for n in names}
     missing = [n for n, r in routes.items() if r is None]
     if missing:
@@ -50,25 +63,64 @@ def job_estimate(env: envelope.Envelope, experiment: Experiment, arm_name: str, 
             totals = execution.totals()
             highs.append(totals.cost.high)
             unknown = unknown or totals.unknown > 0
-    return envelope.job_estimate(highs, bootstrap, unknown)
+    base = max(highs) if highs else bootstrap
+    return RESERVE_FACTOR * (max(base, bootstrap) if unknown else base)
 
 
-def reserved(env: envelope.Envelope | None, job_id: str, estimate, run):
-    """Run `run()` as job `job_id` under a reservation; None when the envelope does not admit it. The
-    job's reservation closes once it has finished and every request it made has settled."""
-    if env is None:
-        return run()
+@dataclass(frozen=True)
+class Admitted:
+    value: object
+
+
+@dataclass(frozen=True)
+class NotAdmitted:
+    reason: str
+
+
+def reserved(env: envelope.Envelope | None, arm, job: str, estimate, run) -> Admitted | NotAdmitted:
+    """Run `run()` as `job` under a reservation when the arm has routed seats; a native-only arm needs
+    none. The reservation closes once the job has finished and every request it made has settled."""
+    if env is None or not routed_seats(arm):
+        return Admitted(run())
     try:
-        env.reserve(job_id, estimate())
+        env.reserve(job, estimate())
     except envelope.Refused as exc:
-        _log(f"{job_id}: not admitted: {exc}")
-        return None
+        _log(f"{job}: not admitted: {exc}")
+        return NotAdmitted(str(exc))
     try:
-        with routing.job(job_id):
-            return run()
+        with routing.job(job):
+            return Admitted(run())
     finally:
-        if not env.finish(job_id):
-            _log(f"{job_id}: its reservation stays held until its requests settle")
+        if not env.finish(job):
+            _log(f"{job}: its reservation stays held until its requests settle")
+
+
+def run_dev(data_root: Path, experiment: Experiment, task, arm) -> int:
+    """One development build (and its follow-up) outside the schedule, inside the same envelope rules."""
+    import json
+
+    runs_root = data_root / "runs"
+
+    def build_and_followup() -> int:
+        record = loop.execute_run(task, arm, runs_root, manifest_hash=None, offline=experiment.offline)
+        print(json.dumps({k: record.get(k) for k in ("run_id", "exec", "status", "flags", "rounds", "scores")}))
+        if record["status"] != "complete":
+            return 1
+        if arm.name not in experiment.followup_arms:
+            return 0
+        exec_dir = runs_root / record["run_id"] / record["exec"]
+        followup = loop.execute_followup(task, exec_dir, arm, manifest_hash=None, offline=experiment.offline)
+        print(json.dumps({k: followup.get(k) for k in ("status", "flags", "scores")}))
+        return 0 if followup["status"] == "complete" else 1
+
+    with routing_context(experiment) as env:
+        outcome = reserved(env, arm, job_id(experiment, "dev", loop.run_id(task.id, arm.name, None)),
+                           lambda: job_estimate(env, experiment, arm.name, data_root / "calibration" / "runs"),
+                           build_and_followup)
+    if isinstance(outcome, NotAdmitted):
+        _log(f"run: not admitted by the spend envelope: {outcome.reason}")
+        return 1
+    return outcome.value
 
 
 def scored_tasks(experiment: Experiment) -> list[tasks.Task]:
@@ -159,10 +211,10 @@ def run_builds(data_root: Path, experiment: Experiment, only_arm: str | None = N
         if exec_dir is not None and (arm not in experiment.followup_arms or complete_followup(exec_dir, digest)):
             return True
         # The build and its follow-up run as one job, inside one reservation, a resumed follow-up included.
-        done = reserved(env, loop.run_id(task.id, arm, rep),
-                        lambda: job_estimate(env, experiment, arm, data_root / "calibration" / "runs"),
-                        lambda: build_and_followup(task, arm, rep, exec_dir))
-        return bool(done)
+        outcome = reserved(env, experiment.arm(arm), job_id(experiment, "build", loop.run_id(task.id, arm, rep)),
+                           lambda: job_estimate(env, experiment, arm, data_root / "calibration" / "runs"),
+                           lambda: build_and_followup(task, arm, rep, exec_dir))
+        return isinstance(outcome, Admitted) and bool(outcome.value)
 
     def build_and_followup(task, arm: str, rep, exec_dir) -> bool:
         if exec_dir is None:
@@ -200,13 +252,14 @@ def run_calibration(data_root: Path, experiment: Experiment, task_ids: list[str]
         def job(task_id):
             built = []
             for rep in range(1, reps + 1):
-                record = reserved(env, f"calibration:{loop.run_id(task_id, arm, rep)}",
-                                  lambda: job_estimate(env, experiment, arm, runs_root),
-                                  lambda: loop.execute_run(by_id[task_id], experiment.arm(arm), runs_root, rep=rep,
-                                                           manifest_hash=None, offline=experiment.offline))
-                if record is None:
+                outcome = reserved(env, experiment.arm(arm),
+                                   job_id(experiment, "calibration", loop.run_id(task_id, arm, rep)),
+                                   lambda: job_estimate(env, experiment, arm, runs_root),
+                                   lambda: loop.execute_run(by_id[task_id], experiment.arm(arm), runs_root, rep=rep,
+                                                            manifest_hash=None, offline=experiment.offline))
+                if isinstance(outcome, NotAdmitted):
                     break
-                built.append(record)
+                built.append(outcome.value)
             return built
         return job
 

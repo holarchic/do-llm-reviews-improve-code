@@ -17,6 +17,10 @@ from dataclasses import dataclass
 from . import openrouter
 
 
+class UsageUnavailable(Exception):
+    """The key's usage could not be read: reconciliation has no snapshot."""
+
+
 @dataclass(frozen=True)
 class Billed:
     usd: float
@@ -75,7 +79,7 @@ class OpenRouterSettler(Settler):
         except urllib.error.HTTPError as exc:  # a 404 proves nothing
             exc.close()
             return Pending(f"lookup answered {exc.code}")
-        except Exception as exc:  # nor does an outage
+        except (OSError, ValueError, KeyError, TypeError) as exc:  # nor does an outage or a garbled answer
             return Pending(f"lookup failed: {type(exc).__name__}")
         cost = data.get("total_cost") if isinstance(data, dict) else None
         if isinstance(cost, (int, float)) and not isinstance(cost, bool) and 0 <= cost < float("inf"):
@@ -83,9 +87,15 @@ class OpenRouterSettler(Settler):
         return Pending("no total_cost yet")
 
     def key_usage(self) -> float:
-        usage = self._get("/key")["data"]["usage"]
+        try:
+            usage = self._get("/key")["data"]["usage"]
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            raise UsageUnavailable(f"key lookup answered {exc.code}") from None
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise UsageUnavailable(f"key lookup failed: {type(exc).__name__}") from None
         if isinstance(usage, bool) or not isinstance(usage, (int, float)):
-            raise ValueError(f"usage is {usage!r}")
+            raise UsageUnavailable(f"usage is {usage!r}")
         return float(usage)
 
     def _get(self, path: str) -> dict:

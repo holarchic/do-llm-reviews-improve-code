@@ -18,11 +18,11 @@ reconciliation workers, and only then lets the envelope's owner close; anything 
 to write after that is refused by the closed envelope. Headers and bodies are never logged.
 """
 
-import hashlib
 import http.client
 import http.server
 import json
 import secrets
+import sys
 import threading
 import time
 import urllib.parse
@@ -40,32 +40,66 @@ _HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authoriz
                "transfer-encoding", "upgrade", "host", "content-length", "accept-encoding"}
 
 
-def policy_problem(policy: dict, path: str, body: bytes) -> str | None:
+@dataclass(frozen=True)
+class Policy:
+    """A route's request allowlist. `max_body_bytes` bounds a request's input: a byte-level tokenizer
+    makes at least one byte per token, so it is also a bound on the request's input tokens."""
+    paths: frozenset[str]
+    models: frozenset[str]
+    fields: frozenset[str]
+    tool_types: frozenset[str]
+    max_body_bytes: int
+    output_limit: tuple[str, int] | None  # (field, cap) where the provider enforces a requested maximum
+
+
+def parse_policy(raw) -> Policy:
+    """A route's policy record, checked: raises ValueError for anything malformed."""
+    def strings(key):
+        value = raw.get(key)
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise ValueError(f"policy {key} must be a list of strings")
+        return frozenset(value)
+    if not isinstance(raw, dict):
+        raise ValueError("a policy is a table")
+    size = raw.get("max_body_bytes")
+    if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+        raise ValueError("policy max_body_bytes must be a positive integer")
+    limit = raw.get("output_limit")
+    if limit is not None:
+        if not (isinstance(limit, dict) and isinstance(limit.get("field"), str) and isinstance(limit.get("cap"), int)
+                and not isinstance(limit.get("cap"), bool) and limit["cap"] > 0):
+            raise ValueError("policy output_limit must be {field: str, cap: positive int}")
+        limit = (limit["field"], limit["cap"])
+    return Policy(strings("paths"), strings("models"), strings("fields"), strings("tool_types"), size, limit)
+
+
+def policy_problem(policy: Policy, path: str, body: bytes) -> str | None:
     """Why a request falls outside its route's policy, or None. `path` is the part after the route."""
-    if path.split("?", 1)[0] not in policy.get("paths", ()):
+    if path.split("?", 1)[0] not in policy.paths:
         return f"path {path.split('?', 1)[0]!r} is not allowed"
+    if len(body) > policy.max_body_bytes:
+        return f"the body is over {policy.max_body_bytes} bytes"
     try:
         request = json.loads(body)
     except ValueError:
         return "the body is not JSON"
     if not isinstance(request, dict):
         return "the body is not a JSON object"
-    extra = sorted(set(request) - set(policy.get("fields", ())))
+    extra = sorted(set(request) - policy.fields)
     if extra:
         return f"field {extra[0]!r} is not allowed"
-    if request.get("model") not in policy.get("models", ()):
+    if request.get("model") not in policy.models:
         return f"model {request.get('model')!r} is not allowed"
-    allowed_tools = set(policy.get("tool_types", ()))
     for tool in request.get("tools") or ():
-        if not isinstance(tool, dict) or str(tool.get("type", "")) not in allowed_tools:
+        if not isinstance(tool, dict) or str(tool.get("type", "")) not in policy.tool_types:
             return f"tool type {tool.get('type') if isinstance(tool, dict) else tool!r} is not allowed"
     if _has_image(request.get("messages")) or _has_image(request.get("input")):
         return "image input is not allowed"
-    limit = policy.get("output_limit")  # {"field": "max_tokens", "cap": 64000}: the provider enforces it
-    if limit:
-        value = request.get(limit["field"])
-        if not isinstance(value, int) or isinstance(value, bool) or not 0 < value <= limit["cap"]:
-            return f"{limit['field']} must be set at or below {limit['cap']}"
+    if policy.output_limit:
+        field, cap = policy.output_limit
+        value = request.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or not 0 < value <= cap:
+            return f"{field} must be set at or below {cap}"
     return None
 
 
@@ -75,10 +109,6 @@ def _has_image(node) -> bool:
     if isinstance(node, list):
         return any(_has_image(v) for v in node)
     return False
-
-
-def fingerprint(credential: str) -> str:
-    return hashlib.sha256(credential.encode()).hexdigest()[:16]
 
 
 @dataclass
@@ -93,8 +123,9 @@ class Proxy:
 
     def __init__(self, env: envelope_mod.Envelope, *, settler_for=settlers_mod.from_upstream,
                  settle_seconds=SETTLE_SECONDS, reconcile_seconds=RECONCILE_SECONDS,
-                 shutdown_seconds=SHUTDOWN_SECONDS):
+                 shutdown_seconds=SHUTDOWN_SECONDS, warn=None):
         self.env, self._settler_for = env, settler_for
+        self._warn = warn or (lambda message: print(f"WARN proxy: {message}", file=sys.stderr, flush=True))
         self.routes = frozenset(env.route_names())
         self._settlers: dict[str, settlers_mod.Settler] = {}
         self._owners: dict[str, _Owner] = {}
@@ -155,7 +186,10 @@ class Proxy:
         while time.monotonic() < deadline and self.env.pending_settlements():
             try:
                 self.settle_now()
-            except Exception:  # a settler fault, or ownership ended: what stays unresolved stays counted
+            except envelope_mod.EnvelopeError:
+                return  # ownership ended: what stays unresolved stays counted
+            except Exception as exc:  # unexpected: surfaced, and its requests stay counted
+                self._warn(f"settlement at shutdown failed: {exc!r}")
                 return
             time.sleep(min(self._settle_seconds, 1.0, max(0.0, deadline - time.monotonic())))
 
@@ -174,10 +208,11 @@ class Proxy:
     def settle_now(self) -> None:
         for pending in self.env.pending_settlements():
             outcome = self._settler(pending.upstream).settle(pending.billing_id)
+            # Committed only if the request still has exactly this id: the envelope checks it atomically.
             if isinstance(outcome, settlers_mod.Billed):
-                self.env.settle(pending.request, outcome.usd)
+                self.env.settle_looked_up(pending.request, pending.billing_id, outcome.usd)
             elif isinstance(outcome, settlers_mod.NotBilled):
-                self.env.settle(pending.request, None)
+                self.env.settle_looked_up(pending.request, pending.billing_id, None)
 
     def reconcile_now(self) -> None:
         for scope in self.env.scopes():
@@ -186,7 +221,8 @@ class Proxy:
                 continue
             try:
                 usage = self._settler(route.upstream).key_usage()
-            except Exception:  # no valid reading: the snapshot expires and admission stops
+            except settlers_mod.UsageUnavailable as exc:  # the snapshot expires and admission stops
+                self._warn(f"scope {scope}: no usage reading: {exc}")
                 continue
             self.env.reconcile(scope, usage)  # one reading per key, however many routes share it
 
@@ -201,8 +237,10 @@ class Proxy:
         while not self._stop.wait(seconds):
             try:
                 work()
-            except Exception:  # a fault leaves requests unresolved: their worst case stays counted
-                continue
+            except envelope_mod.EnvelopeError:
+                return  # ownership ended
+            except Exception as exc:  # unexpected: surfaced; unresolved requests keep their worst case
+                self._warn(f"{work.__name__} failed: {exc!r}")
 
     # ---- one request
 
@@ -234,20 +272,26 @@ class Proxy:
         if owner is None or route is None:
             return _reply(handler, 403, "unknown session or route")
         try:
+            policy = parse_policy(route.policy)
+        except ValueError as exc:
+            return _reply(handler, 403, f"the route's policy is malformed: {exc}")
+        try:
             length = int(handler.headers.get("Content-Length", ""))
         except ValueError:
             return _reply(handler, 411, "a Content-Length is required")
+        if not 0 <= length <= policy.max_body_bytes:
+            return _reply(handler, 413, f"a body is at most {policy.max_body_bytes} bytes")
         body = handler.rfile.read(length)
         rest = "/" + parts[4]
-        problem = policy_problem(route.policy, rest, body)
+        problem = policy_problem(policy, rest, body)
         if problem:
             return _reply(handler, 403, problem)
         credential = _credential(handler.headers)
-        if credential is None or fingerprint(credential) != route.key_fingerprint:
+        if credential is None or envelope_mod.fingerprint(credential) != route.key_fingerprint:
             return _reply(handler, 403, "the credential is not this route's key")
         request_id = secrets.token_hex(16)
         try:
-            self.env.admit(request_id, route.name, job=owner.job, attempt=owner.attempt)
+            self.env.admit(request_id, route.name, job=owner.job, attempt=owner.attempt, version=route.version)
         except envelope_mod.Refused as exc:
             return _reply(handler, 429, f"spend refused: {exc}")
         self._forward(handler, route, rest, body, request_id)
@@ -282,6 +326,7 @@ class Proxy:
             pass  # an error mid-stream keeps the request unresolved: it may still be billed
         finally:
             connection.close()
+            self.env.capture_complete(request_id)  # only now may settlement look its billing id up
 
 
 class _BillingReader:

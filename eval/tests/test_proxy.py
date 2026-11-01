@@ -15,8 +15,11 @@ from eval.harness.envelope import Envelope
 KEY = "sk-fake-key"
 FIELDS = ["model", "max_tokens", "messages", "stream", "tools", "system"]
 POLICY = {"paths": ["/v1/messages"], "models": ["m"], "fields": FIELDS, "tool_types": ["", "custom"],
-          "output_limit": {"field": "max_tokens", "cap": 1000}}
-RATE_IN, RATE_OUT = 4.0, 20.0  # the fake's own prices, $/M tokens; a body byte counts as an input token
+          "output_limit": {"field": "max_tokens", "cap": 1000}, "max_body_bytes": 20_000}
+# The fake's own prices, $/M tokens: a body byte counts as an input token, billed as a 1-hour cache
+# write (the dearest input-side rate), and the fake refuses (unbilled) a body over its input ceiling.
+RATE_IN, RATE_WRITE, RATE_OUT = 4.0, 8.0, 20.0
+CEILING = 20_000
 
 
 class FakeProvider:
@@ -33,11 +36,15 @@ class FakeProvider:
             def do_POST(self):
                 body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
                 request = json.loads(body)
+                if len(body) > CEILING:  # over the provider's own input ceiling: refused, not billed
+                    self.send_response(400)
+                    self.end_headers()
+                    return
                 with provider._lock:
                     provider.calls += 1
                     provider.encodings.append(self.headers.get("Accept-Encoding"))
                     gen = f"gen-{provider.calls}"
-                    provider.billed[gen] = (len(body) * RATE_IN + request.get("max_tokens", 0) * RATE_OUT) / 1e6
+                    provider.billed[gen] = (len(body) * RATE_WRITE + request.get("max_tokens", 0) * RATE_OUT) / 1e6
                 events = provider.events(gen) if provider.events else [{"id": gen, "type": "start"},
                                                                         {"delta": "a"}, {"delta": "b"}]
                 self.send_response(200)
@@ -96,7 +103,7 @@ class Fixture(unittest.TestCase):
         self.env = self.owned.__enter__()
         self.addCleanup(self.close_owner)
         self.env.fund(credit=10.0, fees=1.0, taxes=1.0)
-        self.env.register_scope("or", provider="openrouter", fingerprint=proxy.fingerprint(KEY), opening_usage=7.0,
+        self.env.register_scope("or", provider="openrouter", fingerprint=envelope.fingerprint(KEY), opening_usage=7.0,
                                 allocation=10.0, provider_limit=10.0)
         self.set_route(max_charge=1.0, slots=2)
         self.env.reconcile("or", 7.0)
@@ -164,6 +171,24 @@ class ForwardingTest(Fixture):
         self.assertEqual(second["state"], "unresolved")
         self.assertEqual([r["state"] for r in self.requests() if r["attempt"] == "a2"], ["unresolved"])
 
+    def test_a_malformed_length_or_policy_never_reaches_the_provider(self):
+        served = self.start()
+        base = served.session("job", "a1")["r"]
+        for length in ("-1", "abc", str(POLICY["max_body_bytes"] + 1)):
+            with self.subTest(length=length):
+                connection = http.client.HTTPConnection("127.0.0.1", served.port, timeout=5)
+                connection.putrequest("POST", base.split(str(served.port))[1] + "/v1/messages")
+                connection.putheader("Content-Length", length)
+                connection.putheader("x-api-key", KEY)
+                connection.endheaders()
+                self.assertIn(connection.getresponse().status, (411, 413))
+                connection.close()
+        self.env.set_route("r", scope="or", policy={"paths": "not a list"}, bootstrap_build_usd=1.0, max_charge=1.0,
+                           slots=2, upstream={"base_url": self.provider.base_url, "settler": "fake"})
+        self.env.validate_route("r")
+        self.assertEqual(self.post(served.session("job", "a2")["r"])[0], 403)
+        self.assertEqual(self.provider.calls, 0)
+
     def test_requests_outside_the_allowlist_or_with_another_key_never_reach_the_provider(self):
         served = self.start()
         base = served.session("job", "a1")["r"]
@@ -225,27 +250,59 @@ class AdmissionTest(Fixture):
 
 class BoundEndToEndTest(Fixture):
     def test_maximal_requests_at_a_tight_allocation_never_bill_past_funded_credit(self):
-        """The fake bills each request at its own prices; the route's bound comes from the price
-        table arithmetic; provider usage stays within funded credit, fees and taxes within the envelope."""
-        window, cap = 4000, 100_000  # the largest body the route admits, and the output cap: about $2 a request
-        fake_price = prices.Price("fake", "m", prices.Rates(RATE_IN, RATE_IN, RATE_OUT), "test")
-        bound = prices.request_charge_bound(fake_price, max_input_tokens=window, max_output_tokens=cap)
-        self.set_route(policy={**POLICY, "output_limit": {"field": "max_tokens", "cap": cap}}, max_charge=bound, slots=3)
+        """The fake bills each request at its own prices (input as cache writes, the dearest rate); the
+        route's bound comes from the price arithmetic over its enforced input and output limits."""
+        cap = 100_000  # the output cap: about $2 a maximal request
+        fake_price = prices.Price("fake", "m", prices.Rates(RATE_IN, RATE_IN, RATE_OUT, (("1h", RATE_WRITE),)), "test")
+        bound = prices.request_charge_bound(fake_price, max_input_tokens=CEILING, max_output_tokens=cap)
+        policy = {**POLICY, "output_limit": {"field": "max_tokens", "cap": cap}, "max_body_bytes": CEILING}
+        self.set_route(policy=policy, max_charge=bound, slots=3)
         self.env.reconcile("or", 7.0)
         served = self.start()
-        filler = "x" * (window - 200)
+
+        def body_of(size):
+            shell = {"model": "m", "max_tokens": cap, "messages": [{"role": "user", "content": ""}]}
+            shell["messages"][0]["content"] = "x" * (size - len(json.dumps(shell)))
+            return json.dumps(shell).encode()
+
+        self.assertEqual(self.post(served.session("job", "big")["r"], body_of(CEILING + 1))[0], 413)
         statuses = []
         for i in range(40):
-            statuses.append(self.post(served.session("job", f"a{i}")["r"],
-                                      {"model": "m", "max_tokens": cap, "messages": [{"role": "user", "content": filler}]})[0])
+            statuses.append(self.post(served.session("job", f"a{i}")["r"], body_of(CEILING))[0])
             served.settle_now()
             self.env.reconcile("or", self.settler.key_usage())
-        state = self.env.state
         self.assertGreater(statuses.count(200), 0)
-        self.assertLessEqual(self.provider.usage, 10.0 + 1e-9)  # within the scope allocation and funded credit
-        self.assertLessEqual(self.provider.usage + 1.0 + 1.0, state["envelope_usd"])  # with fees and taxes
-        self.assertTrue(all(b <= bound for b in self.provider.billed.values()))
         self.assertIn(429, statuses)
+        self.assertTrue(all(b <= bound + 1e-12 for b in self.provider.billed.values()))
+        self.assertAlmostEqual(max(self.provider.billed.values()), bound, places=9)  # the bound is tight
+        self.assertLessEqual(self.provider.usage, 10.0 + 1e-9)  # within the allocation and funded credit
+        self.assertLessEqual(self.provider.usage + 1.0 + 1.0, self.env.state["envelope_usd"])  # with fees and taxes
+
+
+class CaptureTest(Fixture):
+    def test_a_request_settles_only_after_its_capture_ends_and_with_the_id_it_kept(self):
+        self.env.admit("q1", "r", job="job", attempt="a1")
+        self.env.record_billing_id("q1", "gen-1")
+        self.assertEqual(self.env.pending_settlements(), [])  # the stream may still bring a second id
+        self.env.capture_complete("q1")
+        (pending,) = self.env.pending_settlements()
+        self.assertFalse(self.env.settle_looked_up("q1", "gen-other", 0.1))  # a lookup of another id
+        self.assertTrue(self.env.settle_looked_up("q1", "gen-1", 0.1))
+
+    def test_a_lookup_in_flight_when_the_id_turns_ambiguous_commits_nothing(self):
+        self.env.admit("q1", "r", job="job", attempt="a1")
+        self.env.record_billing_id("q1", "gen-1")
+        self.env.record_billing_id("q1", "gen-2")  # a second id: ambiguous
+        self.env.capture_complete("q1")
+        self.assertFalse(self.env.settle_looked_up("q1", "gen-1", 0.01))
+        self.assertEqual(self.requests()[0]["state"], "unresolved")
+
+    def test_admission_records_exactly_the_route_the_proxy_checked(self):
+        checked = self.env.route("r")
+        self.set_route(max_charge=0.01, slots=2)  # the route changes between check and admission
+        with self.assertRaises(envelope.Refused):
+            self.env.admit("q1", "r", job="job", attempt="a1", version=checked.version)
+        self.assertEqual(self.requests(), [])
 
 
 class SettlementTest(Fixture):
@@ -287,7 +344,7 @@ class SettlementTest(Fixture):
         self.env.reconcile("or", 7.0)
 
         def broken():
-            raise OSError("down")
+            raise settlers.UsageUnavailable("down")
         self.settler.key_usage = broken
         served = self.start()
         clock[0] += envelope.SNAPSHOT_SECONDS + 1
@@ -365,9 +422,10 @@ class OpenRouterSettlerTest(unittest.TestCase):
     def test_key_usage_reads_or_raises(self):
         self.responses["/api/v1/key"] = (200, {"data": {"usage": 4.5}})
         self.assertEqual(self.settler.key_usage(), 4.5)
-        self.responses["/api/v1/key"] = (200, {"data": {"usage": "x"}})
-        with self.assertRaises(ValueError):
-            self.settler.key_usage()
+        for bad in ((200, {"data": {"usage": "x"}}), (500, {"error": "down"}), (200, {"nothing": 1})):
+            self.responses["/api/v1/key"] = bad
+            with self.subTest(bad=bad), self.assertRaises(settlers.UsageUnavailable):
+                self.settler.key_usage()
 
     def test_billing_ids_come_from_fixed_paths_only(self):
         get = self.settler.billing_id
