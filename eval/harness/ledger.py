@@ -28,6 +28,9 @@ PER_REQUEST, SESSION, TURN_ONLY, UNKNOWN = "per_request", "session", "turn_only"
 UNDATED = "undated"  # cache writes whose duration the CLI does not report
 _STANDARD = {None, "standard"}
 _STANDARD_GEO = {None, "global", "not_available"}
+# Beyond these a value is corrupt, and a float could not carry it through pricing or totals.
+_MAX_TOKENS = 10 ** 15
+_MAX_SECONDS = 10 ** 12
 
 
 class Unusable(Exception):
@@ -195,7 +198,7 @@ def _check_service(usage: dict) -> None:
 def _number(value) -> bool:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
-    return value >= 0 and (isinstance(value, int) or math.isfinite(value))
+    return 0 <= value <= _MAX_SECONDS and (isinstance(value, int) or math.isfinite(value))
 
 
 def _count(container: dict, key: str, *, required: bool = True) -> int:
@@ -204,7 +207,7 @@ def _count(container: dict, key: str, *, required: bool = True) -> int:
             raise Unusable(f"{key} missing")
         return 0
     value = container[key]
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= _MAX_TOKENS:
         raise Unusable(f"{key} is {value!r}, not a token count")
     return value
 

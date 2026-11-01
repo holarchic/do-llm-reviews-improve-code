@@ -140,11 +140,16 @@ class UnusableTest(Fixture):
                 self.assertIsNone(cost.cost)
                 self.assertTrue(cost.reason)
 
-    def test_a_huge_or_malformed_duration_counts_as_zero_seconds(self):
+    def test_huge_or_malformed_numbers_never_reach_float_arithmetic(self):
         for seconds in (10 ** 400, -1, math.inf, "x", True):
             with self.subTest(seconds=seconds):
                 self.assertEqual(ledger.attempt_cost("review", {"usage": {}, "seconds": seconds}, SOL, self.tmp).seconds,
-                                 0.0 if seconds != 10 ** 400 else 10 ** 400)
+                                 0.0)
+        huge = ledger.attempt_cost("review", {"usage": codex_usage(10 ** 400), "seconds": 10 ** 400}, SOL, self.tmp)
+        self.assertEqual((huge.basis, huge.seconds), (ledger.UNKNOWN, 0.0))
+        totals = ledger.Totals()
+        totals.add(huge)
+        self.assertEqual((totals.unknown, totals.seconds), (1, 0.0))
 
     def test_an_attempt_cost_cannot_be_unknown_and_priced(self):
         with self.assertRaises(ValueError):

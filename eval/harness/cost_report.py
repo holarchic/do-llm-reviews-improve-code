@@ -70,8 +70,9 @@ def render(report: CostReport) -> str:
              "a build recorded before that date is priced retrospectively.",
              f"- Builds matched to manifest digest `{report.digest}`." if report.digest else
              "- No manifest: no build is scored, so all spend is listed as unscored.",
-             "- A range is low–high: a Codex session without per-request counts whose total prompt crosses its "
-             "model's per-request tier, or cache writes of unknown duration. Unknown attempts (no usage, or "
+             "- A range is low–high: a session priced from its totals (Codex without per-request counts, any "
+             "Claude session) whose total prompt crosses its model's per-request tier (Sol's 272K, Haiku's 100K), "
+             "or cache writes of unknown duration. Unknown attempts (no usage, or "
              "usage that cannot be priced) add nothing and are counted.", ""]
     lines += ["## Per arm", ""]
     rows = [[arm, str(cost.builds), _money(cost.total.cost) if cost.builds else "—",
