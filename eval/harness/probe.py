@@ -46,8 +46,8 @@ def probe_plan(experiment) -> list[Probe]:
     on its writer and first Codex reviewer, the reviewer control when a Claude session reviews, the
     Codex-writer control when a Codex session writes, judges when it judges, the key and
     pass-through probes for each routed CLI and provider, and the network probe for each writer and reviewer
-    configuration when offline."""
-    writer = experiment.arms[0].writer
+    configuration when offline. Writers are every arm's, as reviewers are."""
+    writers = list(dict.fromkeys(arm.writer for arm in experiment.arms))
     reviewers = list(dict.fromkeys(arm.reviewer for arm in experiment.arms if arm.reviewer is not None))
     plan, names = [], set()
 
@@ -56,24 +56,27 @@ def probe_plan(experiment) -> list[Probe]:
         names.add(name)
         plan.append(Probe(name, kind, agent, role, experiment.offline))
 
-    add(f"{writer.cli}_instructions", "instructions", writer, agents.WRITER)
+    for other in writers:
+        add(f"{other.cli}_instructions", "instructions", other, agents.WRITER)
     for reviewer in reviewers:
-        if reviewer != writer:
+        if reviewer not in writers:
             add(f"{reviewer.cli}_instructions", "instructions", reviewer, agents.REVIEWER)
     if experiment.pairs:
         add("claude_judge_instructions", "instructions", agents.Agent("claude", agents.CLAUDE_JUDGE_MODEL), agents.JUDGE)
         add("codex_judge_instructions", "instructions", agents.Agent("codex", agents.CODEX_JUDGE_MODEL), agents.JUDGE)
     codex_reviewers = [r for r in reviewers if r.cli == "codex"]
-    if writer.cli == "claude":
-        add("claude_canary", "claude_canary", writer, agents.WRITER)
+    claude_writers = [w for w in writers if w.cli == "claude"]
+    if claude_writers:
+        add("claude_canary", "claude_canary", claude_writers[0], agents.WRITER)
     if codex_reviewers:
         add("codex_canary", "codex_canary", codex_reviewers[0], agents.REVIEWER)
     claude_reviewers = [r for r in reviewers if r.cli == "claude"]
     if claude_reviewers:
         add("claude_reviewer_read_only", "claude_reviewer", claude_reviewers[0], agents.REVIEWER)
-    if writer.cli == "codex":
-        add("codex_writer", "codex_writer", writer, agents.WRITER)
-    routed = [(writer, agents.WRITER)] + [(r, agents.REVIEWER) for r in reviewers]
+    codex_writers = [w for w in writers if w.cli == "codex"]
+    if codex_writers:
+        add("codex_writer", "codex_writer", codex_writers[0], agents.WRITER)
+    routed = [(w, agents.WRITER) for w in writers] + [(r, agents.REVIEWER) for r in reviewers]
     # One key and one pass-through probe per CLI and routed provider: each has its own key and path.
     first: dict[tuple[str, str], tuple[agents.Agent, str]] = {}
     for agent, role in routed:
@@ -86,7 +89,7 @@ def probe_plan(experiment) -> list[Probe]:
                 add(f"{cli}_key{suffix}", "key", agent, role)
                 add(f"{cli}_passthrough{suffix}", "passthrough", agent, role)
     if experiment.offline:
-        for agent, role in [(writer, agents.WRITER)] + [(r, agents.REVIEWER) for r in reviewers]:
+        for agent, role in routed:
             add(f"{agent.cli}_network_{role}", "network", agent, role)
     return plan
 
@@ -94,14 +97,14 @@ def probe_plan(experiment) -> list[Probe]:
 def run_probes(probe_root: Path, experiment) -> list[str]:
     """Run the experiment's probes; return the failures (empty means isolation holds)."""
     if experiment.routed and probe_root.exists():
-        providers.scrub(probe_root)  # a probe run that died mid-way left files its own scrub never reached
+        providers.scrub(probe_root, required=experiment.routed_providers)  # a probe run that died mid-way left files its own scrub never reached
     stamp = probe_root / time.strftime("%Y%m%dT%H%M%S")
     stamp.mkdir(parents=True)
     try:
         return _run_probes(stamp, experiment)
     finally:
         if experiment.routed:
-            providers.scrub(stamp)
+            providers.scrub(stamp, required=experiment.routed_providers)
 
 
 def _run_probes(stamp: Path, experiment) -> list[str]:
@@ -131,8 +134,9 @@ def _run_probes(stamp: Path, experiment) -> list[str]:
     problems = [f"{name}: {problem}" for name, found in results.items() for problem in found["problems"]]
     if experiment.routed:
         # After summary.json: every saved file of the probe run is scanned, and the scan must leave none behind.
-        providers.scrub(stamp)
-        problems += [f"key still in {path} after scrubbing" for path in providers.files_holding_keys(stamp)]
+        providers.scrub(stamp, required=experiment.routed_providers)
+        problems += [f"key still in {path} after scrubbing"
+                     for path in providers.files_holding_keys(stamp, required=experiment.routed_providers)]
     return problems  # run_probes scrubs once more on the way out, whether or not this got here
 
 

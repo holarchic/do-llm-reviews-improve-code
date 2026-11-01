@@ -77,6 +77,11 @@ class Experiment:
         return (None,) if self.reps == 1 else tuple(range(1, self.reps + 1))
 
     @property
+    def routed_providers(self) -> frozenset[str]:
+        return frozenset(agent.provider for arm in self.arms for agent in (arm.writer, arm.reviewer)
+                         if agent is not None and agent.routed)
+
+    @property
     def routed(self) -> bool:
         return any(agent is not None and agent.routed for arm in self.arms for agent in (arm.writer, arm.reviewer))
 

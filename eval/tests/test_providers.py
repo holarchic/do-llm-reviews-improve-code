@@ -210,6 +210,17 @@ class MultiKeyScrubTest(unittest.TestCase):
         self.assertFalse((repo / ".git").exists())
         self.assertEqual(providers.files_holding_keys(exec_dir), [])
 
+    def test_a_key_that_exists_but_cant_be_read_or_a_required_missing_one_refuses(self):
+        unreadable = self.tmp / "keys" / "locked"
+        unreadable.mkdir()  # reading a directory raises, as a locked file would
+        with mock.patch.dict(providers.KEY_PATHS, {"openrouter": unreadable}):
+            with self.assertRaises(ValueError):
+                providers.scrub(self.tmp)
+        with self.assertRaises(ValueError):  # the run used OpenRouter, whose key is missing here
+            providers.scrub(self.tmp, required={"openrouter"})
+        (self.tmp / "clean").mkdir()
+        self.assertEqual(providers.scrub(self.tmp / "clean", required={"deepseek"}), [])  # present: fine
+
     def test_a_scrub_with_no_key_installed_refuses(self):
         with mock.patch.dict(providers.KEY_PATHS, {"deepseek": self.tmp / "keys" / "missing"}):
             with self.assertRaises(ValueError):

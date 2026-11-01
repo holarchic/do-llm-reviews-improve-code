@@ -219,9 +219,10 @@ def _write_record(exec_dir: Path, record: dict, arm: Arm) -> None:
     flag each hit (the scrub cannot run earlier: the record itself is a saved file)."""
     path = exec_dir / "record.json"
     path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
-    if not any(agent is not None and agent.routed for agent in (arm.writer, arm.reviewer)):
+    routed = {agent.provider for agent in (arm.writer, arm.reviewer) if agent is not None and agent.routed}
+    if not routed:
         return
-    hits = providers.scrub(exec_dir)
+    hits = providers.scrub(exec_dir, required=routed)
     if hits:
         # The record itself may have held the key: carry on from its scrubbed copy, never the original.
         scrubbed = json.loads(path.read_text(encoding="utf-8"))

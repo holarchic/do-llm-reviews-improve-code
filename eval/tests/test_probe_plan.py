@@ -41,6 +41,18 @@ class ProbePlanTest(unittest.TestCase):
         self.assertIn("codex_passthrough_deepseek", plan)
         self.assertNotIn("codex_key", plan)
 
+    def test_a_later_arms_writer_is_probed_too(self):
+        import dataclasses
+        from eval.harness import agents
+        glm = agents.Agent("claude", "z-ai/glm-5.3", agents.OPENROUTER)
+        ds = agents.Agent("codex", "deepseek-v4-pro", agents.DEEPSEEK)
+        experiment = dataclasses.replace(experiments.REPLAY, arms=(experiments.Arm("W", glm), experiments.Arm("D", ds)))
+        plan = {p.name: p for p in probe.probe_plan(experiment)}
+        self.assertEqual(plan["codex_key_deepseek"].agent, ds)
+        self.assertEqual(plan["codex_network_writer"].agent, ds)
+        self.assertEqual(plan["codex_writer"].agent, ds)
+        self.assertIn("codex_instructions", plan)
+
     def test_the_replay_probes_every_configuration_offline(self):
         plan = {p.name: p for p in probe.probe_plan(experiments.REPLAY)}
         self.assertTrue(all(p.offline for p in plan.values()))

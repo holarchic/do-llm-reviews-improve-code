@@ -212,13 +212,14 @@ class MeteredSettlementTest(Fixture):
 
     def test_malformed_or_conflicting_usage_never_settles_automatically(self):
         # Each case stays unresolved by design: give every one its own slot, and the credit to hold it.
-        self.env.fund(credit=5.0)
-        self.env.raise_allocation("ds", 15.0)
-        self.env.set_route("r", scope="ds", max_charge=BOUND, slots=4, policy=POLICY, bootstrap_build_usd=1.0,
+        self.env.fund(credit=8.0)
+        self.env.raise_allocation("ds", 18.0)
+        self.env.set_route("r", scope="ds", max_charge=BOUND, slots=5, policy=POLICY, bootstrap_build_usd=1.0,
                            upstream={"base_url": self.fake.base_url, "settler": "deepseek", "model": MODEL})
         self.env.validate_route("r")
         served = self.start()
-        good = {"type": "message_delta", "usage": {"input_tokens": 10, "output_tokens": 5}}
+        good = {"type": "message_delta", "usage": {"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 0,
+                                                   "cache_creation_input_tokens": 0}}
         for name, events in (
                 ("malformed", [{"type": "message_start", "message": {"id": "m1"}},
                                {"type": "message_delta", "usage": {"input_tokens": "ten", "output_tokens": 5}},
@@ -227,17 +228,21 @@ class MeteredSettlementTest(Fixture):
                                           {"type": "message_delta", "usage": {"output_tokens": 5}},
                                           {"type": "message_stop"}]),
                 ("two figures", [{"type": "message_start", "message": {"id": "m3"}}, good,
-                                 {"type": "message_delta", "usage": {"input_tokens": 99, "output_tokens": 5}},
+                                 {"type": "message_delta", "usage": {**good["usage"], "input_tokens": 99}},
                                  {"type": "message_stop"}]),
                 ("server tool", [{"type": "message_start", "message": {"id": "m4"}},
-                                 {"type": "message_delta", "usage": {"input_tokens": 1, "output_tokens": 1,
-                                                                     "server_tool_use": {"web_search_requests": 1}}},
-                                 {"type": "message_stop"}])):
+                                 {"type": "message_delta", "usage": {
+                                     "input_tokens": 1, "output_tokens": 1, "cache_read_input_tokens": 0,
+                                     "cache_creation_input_tokens": 0, "server_tool_use": {"web_search_requests": 1}}},
+                                 {"type": "message_stop"}]),
+                ("no cache counter", [{"type": "message_start", "message": {"id": "m5"}},
+                                      {"type": "message_delta", "usage": {"input_tokens": 0, "output_tokens": 1}},
+                                      {"type": "message_stop"}])):
             with self.subTest(name):
                 self.fake.events_override = lambda *a, events=events: events
                 self.post(served.session("job", name)["r"])
         served.settle_now()
-        self.assertEqual(len(self.requests()), 4)  # every case was admitted and ran
+        self.assertEqual(len(self.requests()), 5)  # every case was admitted and ran
         for request in self.requests():
             self.assertIsNotNone(request["metered_invalid"], request["attempt"])
             self.assertEqual(request["state"], "unresolved", request["attempt"])
@@ -341,9 +346,24 @@ class EventReadingTest(unittest.TestCase):
                           "input_tokens": 1, "output_tokens": 1, "server_tool_use": {"tool_search": 1}}}}):
             with self.subTest(event=event["type"]):
                 self.assertIsInstance(self.settler.read(event).metered, settlers.Invalid)
-        zero = {"type": "message_delta", "usage": {"input_tokens": 1, "output_tokens": 1,
-                                                   "server_tool_use": {"web_search_requests": 0}}}
+        full = {"input_tokens": 1, "output_tokens": 1, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+        zero = {"type": "message_delta", "usage": {**full, "server_tool_use": {"web_search_requests": 0}}}
         self.assertIsInstance(self.settler.read(zero).metered, settlers.Usage)
+        for malformed in ({"tool_search": True}, [1], {"web_search_requests": -1}, {"web_search_requests": "1"},
+                          {"web_search_requests": False}, {"tool_search": ""}, {"tool_fetch": 0.0}):  # falsy, still malformed
+            with self.subTest(malformed=malformed):
+                event = {"type": "message_delta", "usage": {**full, "server_tool_use": malformed}}
+                self.assertIsInstance(self.settler.read(event).metered, settlers.Invalid)
+
+    def test_every_anthropic_counter_is_required_since_input_excludes_cache_hits(self):
+        full = {"input_tokens": 10, "output_tokens": 1, "cache_read_input_tokens": 500, "cache_creation_input_tokens": 0}
+        self.assertIsInstance(self.settler.read({"type": "message_delta", "usage": full}).metered, settlers.Usage)
+        for name in full:
+            for bad in (None, "absent"):
+                usage = {k: v for k, v in full.items() if k != name} if bad == "absent" else {**full, name: None}
+                with self.subTest(name=name, bad=bad):
+                    reading = self.settler.read({"type": "message_delta", "usage": usage})
+                    self.assertIsInstance(reading.metered, settlers.Invalid)
 
     def test_the_billing_id_comes_only_from_the_events_that_carry_the_response(self):
         get = self.settler.billing_id
@@ -382,7 +402,12 @@ class BalanceReadingTest(unittest.TestCase):
                                                          {"currency": "CNY", "total_balance": "0.00"}]}), -1.0)
         for bad in ({"balance_infos": [{"currency": "CNY", "total_balance": "3.00"}]},
                     {"balance_infos": [{"currency": "USD", "total_balance": "nan"}]},
-                    {"balance_infos": [{"currency": "USD"}]}, {"nothing": 1}):
+                    {"balance_infos": [{"currency": "USD"}]}, {"nothing": 1},
+                    {"balance_infos": [{"currency": "USD", "total_balance": True}]},
+                    {"balance_infos": []},  # no USD row: unavailable, never a zero balance
+                    {"balance_infos": [{"currency": "USD", "total_balance": "10"}, {"currency": "CNY", "total_balance": "25"},
+                                       {"currency": "CNY", "total_balance": "0"}]},  # a later row can't hide one
+                    {"balance_infos": "USD 4"}):
             with self.subTest(bad=bad), self.assertRaises(settlers.UsageUnavailable):
                 self.reading(bad)
 

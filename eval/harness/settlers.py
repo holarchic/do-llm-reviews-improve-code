@@ -212,17 +212,18 @@ class DeepSeekSettler(Settler):
         return EventReading()
 
     def _anthropic(self, usage) -> Usage | Invalid:
-        """`input_tokens` excludes cache hits: total input is it plus the cache reads and writes."""
+        """`input_tokens` excludes cache hits: total input is it plus the cache reads and writes, so every
+        counter is required (an absent one could hide input)."""
         try:
             _no_server_tools(usage)
-            fresh = _count(usage, "input_tokens") + _count(usage, "cache_creation_input_tokens", required=False)
-            return self._priced(fresh, _count(usage, "cache_read_input_tokens", required=False),
-                                _count(usage, "output_tokens"))
+            fresh = _count(usage, "input_tokens") + _count(usage, "cache_creation_input_tokens")
+            return self._priced(fresh, _count(usage, "cache_read_input_tokens"), _count(usage, "output_tokens"))
         except ValueError as exc:
             return Invalid(str(exc))
 
     def _responses(self, usage) -> Usage | Invalid:
-        """`input_tokens` includes the cached ones; `output_tokens` includes reasoning."""
+        """`input_tokens` includes the cached ones (an absent cached count prices them all as fresh, an
+        overstatement); `output_tokens` includes reasoning."""
         try:
             _no_server_tools(usage)
             total = _count(usage, "input_tokens")
@@ -250,22 +251,17 @@ class DeepSeekSettler(Settler):
     def key_usage(self) -> float:
         try:
             infos = _get_json(f"{self.api_base}/user/balance", self._key)["balance_infos"]
-            if not isinstance(infos, list):
-                raise TypeError("balance_infos is not a list")
-            balances = {}
-            for info in infos:
-                balances[info["currency"]] = float(info["total_balance"])
         except urllib.error.HTTPError as exc:
             exc.close()
             raise UsageUnavailable(f"balance lookup answered {exc.code}") from None
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise UsageUnavailable(f"balance lookup failed: {type(exc).__name__}") from None
+        balances = _balances(infos)
         if any(currency != "USD" and amount != 0 for currency, amount in balances.items()):
             raise UsageUnavailable("a non-USD balance can't be reconciled in dollars")
-        usd = balances.get("USD", 0.0)
-        if not math.isfinite(usd):
-            raise UsageUnavailable(f"balance is {usd!r}")
-        return -usd
+        if "USD" not in balances:
+            raise UsageUnavailable("no USD balance")
+        return -balances["USD"]
 
 
 def _model(node) -> str | None:
@@ -273,10 +269,38 @@ def _model(node) -> str | None:
     return model if isinstance(model, str) and model else None
 
 
+def _balances(infos) -> dict[str, float]:
+    """Each row strictly: a currency named once, its total a finite number (DeepSeek sends a string)."""
+    if not isinstance(infos, list):
+        raise UsageUnavailable("balance_infos is not a list")
+    balances = {}
+    for info in infos:
+        currency = info.get("currency") if isinstance(info, dict) else None
+        total = info.get("total_balance") if isinstance(info, dict) else None
+        if not isinstance(currency, str) or currency in balances:
+            raise UsageUnavailable(f"balance row {info!r} names no currency, or one already read")
+        if isinstance(total, bool) or not isinstance(total, (str, int, float)):
+            raise UsageUnavailable(f"{currency} balance is {total!r}")
+        try:
+            amount = float(total)
+        except ValueError:
+            raise UsageUnavailable(f"{currency} balance is {total!r}") from None
+        if not math.isfinite(amount):
+            raise UsageUnavailable(f"{currency} balance is {total!r}")
+        balances[currency] = amount
+    return balances
+
+
 def _no_server_tools(usage) -> None:
-    """Server tools bill per call, outside token prices: a request that used one can't be metered."""
+    """Server tools bill per call, outside token prices: a request that used one can't be metered. An
+    absent block means none; a present one must be counters, all zero."""
     tools = usage.get("server_tool_use") if isinstance(usage, dict) else None
-    if isinstance(tools, dict) and any(v for v in tools.values() if not isinstance(v, bool)):
+    if tools is None:
+        return
+    if not isinstance(tools, dict) or any(isinstance(v, bool) or not isinstance(v, int) or v < 0
+                                          for v in tools.values()):
+        raise ValueError(f"server_tool_use is {tools!r}")
+    if any(tools.values()):
         raise ValueError("a server tool was used")
 
 

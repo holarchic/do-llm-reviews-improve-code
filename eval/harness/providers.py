@@ -29,14 +29,13 @@ class Provider:
     upstream: str  # the base the proxy forwards a route's path to
     claude_path: str  # added under the route for Claude Code, which then posts /v1/messages
     codex_path: str  # added under the route for Codex, which then posts /responses
-    codex_variable: str  # the variable Codex reads the key from
-    settler: str  # settlers.NAMES
+    codex_variable: str  # the variable Codex reads the key from; its settler (settlers.py) bears its name
 
 
 PROVIDERS = {p.name: p for p in (
-    Provider(OPENROUTER, "https://openrouter.ai/api", "", "/v1", "OPENROUTER_API_KEY", "openrouter"),
+    Provider(OPENROUTER, "https://openrouter.ai/api", "", "/v1", "OPENROUTER_API_KEY"),
     # Anthropic Messages at /anthropic/v1/messages; Responses at /responses (Codex's base is the root).
-    Provider(DEEPSEEK, "https://api.deepseek.com", "/anthropic", "", "DEEPSEEK_API_KEY", "deepseek"),
+    Provider(DEEPSEEK, "https://api.deepseek.com", "/anthropic", "", "DEEPSEEK_API_KEY"),
 )}
 
 KEY_ROOT = Path.home() / ".config"
@@ -120,22 +119,27 @@ def codex_env(name: str, codex_home: Path) -> dict[str, str]:
     return {**_inherited(), "CODEX_HOME": str(codex_home), get(name).codex_variable: api_key(name)}
 
 
-def installed_keys() -> dict[str, str]:
-    """Every provider key present on this machine, by provider."""
+def installed_keys(required=()) -> dict[str, str]:
+    """Every provider key on this machine, by provider. Only an absent key of a provider not in
+    `required` is skipped: a key that exists but can't be read could still be in the files."""
     keys = {}
     for name in PROVIDERS:
         try:
             keys[name] = api_key(name)
-        except (OSError, ValueError):
-            continue
+        except FileNotFoundError:
+            if name in required:
+                raise ValueError(f"{name}'s key file is missing, so its run can't be checked") from None
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"{name}'s key file can't be read ({type(exc).__name__}), so nothing can be checked") from None
     return keys
 
 
-def scrub(root: Path) -> list[str]:
+def scrub(root: Path, required=()) -> list[str]:
     """Redact every installed provider key in every regular file under root; delete the .git of any repo
     that holds one in an object or a metadata file (compressed objects can't be redacted in place).
-    Returns the paths hit, relative to root."""
-    secrets = {key.encode(): f"[{name}-key]".encode() for name, key in installed_keys().items()}
+    `required` names the providers the scrubbed run used: each must have its key here. Returns the
+    paths hit, relative to root."""
+    secrets = {key.encode(): f"[{name}-key]".encode() for name, key in installed_keys(required).items()}
     if not secrets:  # only routed runs are scrubbed, and a routed run had its key
         raise ValueError("no provider key is installed, so nothing can be checked")
     hits = []
@@ -163,9 +167,9 @@ def scrub(root: Path) -> list[str]:
     return hits
 
 
-def files_holding_keys(root: Path) -> list[str]:
+def files_holding_keys(root: Path, required=()) -> list[str]:
     """Saved files still holding an installed key (after a scrub, there must be none)."""
-    secrets = [key.encode() for key in installed_keys().values()]
+    secrets = [key.encode() for key in installed_keys(required).values()]
     return [str(p.relative_to(root)) for p in root.rglob("*")
             if p.is_file() and not p.is_symlink() and any(s in p.read_bytes() for s in secrets)]
 
