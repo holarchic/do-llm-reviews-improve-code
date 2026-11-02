@@ -88,6 +88,10 @@ class Refused(Exception):
     """The check would not start: nothing was spent."""
 
 
+class Stopped(Exception):
+    """The check stopped after spending began (a session's files held a key): its record stays running."""
+
+
 # ---- the peak window
 
 
@@ -180,7 +184,6 @@ class MeteringDeps(SessionDeps):
 class ExhaustionDeps:
     """Send n requests at once through the proxy; the account's remaining credit; an attempt's requests;
     one settlement round; the clock; whether the run may go on (the DeepSeek window, where it applies)."""
-    provider: str
     send: Callable[[int], list["Reply"]]
     remaining: Callable[[], float]
     requests: Callable[[str], list[Request]]
@@ -418,7 +421,7 @@ def exhaustion(route: RouteRef, attempt: str, *, funding: float, overdraw_bound:
     if opening <= 0:
         raise Refused(f"the account holds ${opening:.4f}: nothing to drain, so nothing would be shown")
     replies: list[Reply] = []
-    empty = lambda reply: reply.insufficient_balance(deps.provider)  # noqa: E731
+    empty = lambda reply: reply.insufficient_balance(route.provider)  # noqa: E731
 
     def result(verdict, reason, **evidence):
         return Result("exhaustion", route.name, "any", attempt, verdict, reason,
@@ -515,6 +518,7 @@ class Record:
 
 
 _LEGAL = {"running": {"running"}, "done": {PASS, FAIL, INCONCLUSIVE}}
+_EMPTY_BINDING = Binding("", "", "", "", "", "", "", None)
 
 
 def _records(root: Path) -> list[Record]:
@@ -527,7 +531,12 @@ def _records(root: Path) -> list[Record]:
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
             result, raw_binding, state = record["result"], record["binding"], record["status"]
-            binding = asdict(Binding(**raw_binding))  # every field, nothing else
+            if not isinstance(raw_binding, dict) or set(raw_binding) != set(asdict(_EMPTY_BINDING)):
+                raise ValueError("the binding doesn't carry exactly its fields")
+            binding = asdict(Binding(**raw_binding))
+            if any(not isinstance(v, str) for k, v in binding.items() if k != "account") or \
+                    not (binding["account"] is None or isinstance(binding["account"], str)):
+                raise ValueError("a binding field has the wrong type")
             if (result["check"], result["cli"], result["attempt"], result["route"]) != (check, cli, attempt,
                                                                                        path.parent.name):
                 raise ValueError("the record doesn't match its name")
@@ -571,10 +580,18 @@ def status(root: Path, bindings: list[Binding]) -> list[dict]:
     return rows
 
 
+def _origin(endpoint: str) -> str:
+    from urllib.parse import urlsplit
+    parts = urlsplit(endpoint)
+    return f"{parts.scheme}://{parts.netloc}"
+
+
 def _same_account(recorded: dict | None, now: dict) -> bool:
-    """Exhaustion is the account's: it holds across keys and routes of the same named provider account."""
-    return (recorded is not None and recorded.get("account") is not None and recorded["account"] == now["account"]
-            and recorded["route"].split("--", 1)[0] == now["route"].split("--", 1)[0])
+    """Exhaustion is the account's: it holds across keys, models and CLIs of the same named provider
+    account at the same upstream, never at another."""
+    return (recorded is not None and recorded["account"] is not None and recorded["account"] == now["account"]
+            and recorded["route"].split("--", 1)[0] == now["route"].split("--", 1)[0]
+            and _origin(recorded["endpoint"]) == _origin(now["endpoint"]))
 
 
 def purchases(funding, fees, taxes) -> dict:

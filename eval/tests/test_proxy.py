@@ -402,6 +402,17 @@ class RefusalTest(Fixture):
         served.settle_now()
         self.assertEqual((self.requests()[0]["state"], self.requests()[0]["billed"]), ("billed", 0.002))
 
+    def test_a_refusal_echoing_a_key_is_stored_redacted(self):
+        key_file = self.root / "or-key"
+        key_file.write_text(KEY + "\n")
+        with unittest.mock.patch.dict(providers.KEY_PATHS, {"openrouter": key_file}):
+            served = self.start()
+            self.refuse(402, {"error": {"message": f"key {KEY} has no credit"}})
+            self.post(served.session("job", "a1")["r"])
+        (request,) = self.requests()
+        self.assertNotIn(KEY, request["refused_by_provider"]["error"])
+        self.assertIn("[openrouter-key]", request["refused_by_provider"]["error"])
+
     def test_a_null_request_id_takes_the_refusal_path(self):
         served = self.start()
         self.refuse(429, {"type": "error", "error": {"type": "rate_limit_error"}, "request_id": None})

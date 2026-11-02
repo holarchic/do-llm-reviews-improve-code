@@ -283,7 +283,8 @@ def _model(node) -> str | None:
 
 
 def _native_counts(data: dict) -> dict | None:
-    """OpenRouter's own token counts for a generation, when all three are present and sane."""
+    """OpenRouter's own token counts for a generation: prompt and completion present (an absent cached
+    count means none), all non-negative integers, cached within prompt; otherwise none."""
     counts = {"prompt": data.get("native_tokens_prompt"), "completion": data.get("native_tokens_completion"),
               "cached": data.get("native_tokens_cached") if data.get("native_tokens_cached") is not None else 0}
     ok = all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in counts.values())

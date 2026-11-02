@@ -63,7 +63,7 @@ def add_arguments(parser) -> None:
 
 
 def run(args, out) -> int:
-    """0 done, 2 bad flags, 3 refused before any spend."""
+    """0 done, 2 bad flags, 3 refused before any spend, 4 stopped after spending began."""
     try:
         if args.action == "budget":
             out(f"{admission.budget(ROOT):.2f}")
@@ -84,6 +84,9 @@ def run(args, out) -> int:
             settlers.UsageUnavailable, settlers.NoSettler) as exc:
         out(f"admit {args.action}: refused: {exc}", error=True)
         return 3
+    except admission.Stopped as exc:
+        out(f"admit {args.action}: stopped after spending began: {exc}", error=True)
+        return 4
 
 
 def _route(name: str | None) -> admission.RouteRef:
@@ -123,7 +126,11 @@ def _binding(state: dict, route: admission.RouteRef, cli: str, endpoint_cli: str
     return admission.Binding(route.name, configured.version, configured.key_fingerprint,
                              _endpoint(route, configured, endpoint_cli), cli,
                              _cli_version(endpoint_cli if cli == "any" else cli), prices.TABLE_SHA256,
-                             state["scopes"][configured.scope]["account"])
+                             _account(state, configured.scope))
+
+
+def _account(state: dict, scope: str) -> str | None:
+    return state["scopes"][scope]["account"]
 
 
 def _requests(env: envelope.Envelope):
@@ -171,7 +178,7 @@ def _session(route: admission.RouteRef, cli: str, attempt_dir: Path) -> admissio
         shutil.rmtree(workdir, ignore_errors=True)
         hits = providers.scrub(attempt_dir, required={route.provider}) if attempt_dir.exists() else []
     if hits or providers.files_holding_keys(attempt_dir, required={route.provider}):
-        raise admission.Refused(f"the session's files held a provider key ({hits}): redacted; stopping")
+        raise admission.Stopped(f"the session's files held a provider key ({hits}): redacted; stopping")
     return admission.SessionEvidence(session.terminal, session.reason, _reasoning_tokens(cli, session))
 
 
@@ -260,13 +267,14 @@ def _exhaustion(args, route: admission.RouteRef, out) -> int:
 
         now = _now()
         deps = admission.ExhaustionDeps(
-            provider=route.provider, send=send, remaining=lambda: settlers.remaining_credit(route.provider, key, base_url),
+            send=send, remaining=lambda: settlers.remaining_credit(route.provider, key, base_url),
             requests=_requests(env), settle=served.settle_now, sleep=lambda s: _sleep(s), now=lambda: _now(),
             may_continue=admission.in_window if deepseek else (lambda t: True))
         admission.write(ROOT, admission.Result("exhaustion", route.name, "any", attempt, "running", "", dict(bought)),
                         binding, "running")
         result = admission.exhaustion(route, attempt, funding=args.funding, overdraw_bound=overdraw, deps=deps,
-                                      max_requests=max_requests, deadline=now + DRAIN_DEADLINE)
+                                      max_requests=max_requests, deadline=now + DRAIN_DEADLINE,
+                                      batch=max(1, min(4, configured.slots)))
         result = replace(result, evidence={**result.evidence, **bought, "words": words, "max_requests": max_requests})
     out(f"{admission.write(ROOT, result, binding, 'done')}: {result.verdict} — {result.reason}")
     return 0
@@ -285,7 +293,7 @@ def _post(url: str, body: bytes, key: str) -> admission.Reply:
             return admission.Reply(response.status, _json(response.read()))
     except urllib.error.HTTPError as exc:
         with exc:
-            return admission.Reply(exc.code, _json(exc.read()))
+            return admission.Reply(exc.code, _json(providers.redact(exc.read().decode("utf-8", "replace")).encode()))
     except (urllib.error.URLError, OSError):
         return admission.Reply(None, None)
 

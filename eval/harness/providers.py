@@ -134,6 +134,13 @@ def installed_keys(required=()) -> dict[str, str]:
     return keys
 
 
+def redact(text: str) -> str:
+    """Text with every installed provider key replaced by its marker (an unreadable key file raises)."""
+    for name, key in installed_keys().items():
+        text = text.replace(key, f"[{name}-key]")
+    return text
+
+
 def scrub(root: Path, required=()) -> list[str]:
     """Redact every installed provider key in every regular file under root; delete the .git of any repo
     that holds one in an object or a metadata file (compressed objects can't be redacted in place).

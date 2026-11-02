@@ -416,6 +416,11 @@ class Envelope:
             return _settle(s, entry, None)
         return self._transition(change)
 
+    def scope_label(self, scope: str) -> str | None:
+        """The provider account a scope's key belongs to, as the operator named it."""
+        with self._mutex:
+            return self._state["scopes"][scope]["account"]
+
     def scope_account(self, scope: str) -> ScopeAccount:
         with self._mutex:
             requests = [r for r in self._state["requests"].values() if r["scope"] == scope]
@@ -487,8 +492,33 @@ def load(path: Path) -> dict:
         state = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise EnvelopeError(f"{path.name} unreadable: {exc!r}") from None
+    _upgrade(state)
     _check(state)
     return state
+
+
+# Fields later phases added, and the value that says "not recorded" for a ledger written before them.
+_SCOPE_DEFAULTS = {"fault": None, "account": None}
+_REQUEST_DEFAULTS = {"metered": None, "metered_invalid": None, "protocol_complete": False, "served": [],
+                     "metered_tokens": None, "billed_tokens": None, "refused_by_provider": None}
+
+
+def _upgrade(state) -> None:
+    """A ledger written before a field existed reads it as not recorded; every charge and unresolved
+    liability stays as written."""
+    if not isinstance(state, dict):
+        return
+    for scope in (state.get("scopes") or {}).values():
+        if isinstance(scope, dict):
+            for key, value in _SCOPE_DEFAULTS.items():
+                scope.setdefault(key, value)
+    for request in (state.get("requests") or {}).values():
+        if isinstance(request, dict):
+            for key, value in _REQUEST_DEFAULTS.items():
+                request.setdefault(key, copy.deepcopy(value))
+    for held in (state.get("reservations") or {}).values():
+        if isinstance(held, dict):
+            held.setdefault("baseline", 0.0)
 
 
 def route_view(state: dict, name: str) -> "Route | None":
@@ -591,8 +621,10 @@ def _check(s: dict) -> None:
                    and (r["metered_invalid"] is None or isinstance(r["metered_invalid"], str))
                    and isinstance(r["protocol_complete"], bool)
                    and isinstance(r["served"], list) and all(isinstance(v, str) for v in r["served"])
-                   and all(r[k] is None or isinstance(r[k], dict)
-                           for k in ("metered_tokens", "billed_tokens", "refused_by_provider")),
+                   and _counts(r["metered_tokens"], ("fresh", "cached", "output"))
+                   and _counts(r["billed_tokens"], ("prompt", "completion", "cached"))
+                   and (r["billed_tokens"] is None or r["billed_tokens"]["cached"] <= r["billed_tokens"]["prompt"])
+                   and (r["refused_by_provider"] is None or isinstance(r["refused_by_provider"], dict)),
                    f"request {name}")
         ensure(all(_money(r["amount"]) and isinstance(r["open"], bool) and isinstance(r["terminated"], bool)
                    and _money(r["baseline"]) for r in s["reservations"].values()), "reservations")
@@ -604,6 +636,12 @@ def _check(s: dict) -> None:
                "scope allocations exceed funded credit")
     except (KeyError, TypeError, AttributeError) as exc:
         raise EnvelopeError(f"envelope state does not check out: {exc!r}") from None
+
+
+def _counts(value, names: tuple[str, ...]) -> bool:
+    """Persisted token evidence: absent, or exactly these non-negative integer counters."""
+    return value is None or (isinstance(value, dict) and set(value) == set(names) and all(
+        isinstance(value[n], int) and not isinstance(value[n], bool) and value[n] >= 0 for n in names))
 
 
 def _funded(s: dict) -> float:

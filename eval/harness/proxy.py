@@ -13,7 +13,8 @@ job and attempt it belongs to. For each request, in order:
 4. the request stays unresolved until its settler reports the billed charge or that nothing was
    billed. A failed lookup, a 404, no billing id, or two different ones all keep its worst case
    counted; a billed route's request whose stream broke after its id arrived settles from the
-   provider's own lookup. A metered route's charge is the usage its
+   provider's own lookup. A provider's refusal before generating (a 402 or 429 with a JSON error and
+   no billing id) settles as not billed, keeping its status and its error, credentials redacted. A metered route's charge is the usage its
    response reported, recorded event by event on the request; one whose response never completed
    with valid usage stays at its worst case.
 
@@ -34,7 +35,7 @@ import urllib.parse
 from dataclasses import dataclass
 
 from . import envelope as envelope_mod
-from . import route_config
+from . import providers, route_config
 from . import settlers as settlers_mod
 
 RECONCILE_SECONDS = 240
@@ -367,7 +368,7 @@ def _refusal_evidence(status: int, body: dict | None) -> dict | None:
     """A complete JSON error body: its status and error object, trimmed; anything else proves nothing."""
     if body is None or not isinstance(body.get("error"), (dict, str)):
         return None
-    error = json.dumps(body["error"], sort_keys=True)
+    error = providers.redact(json.dumps(body["error"], sort_keys=True))
     return {"status": status, "error": error if len(error) <= _ERROR_EVIDENCE_LIMIT else error[:_ERROR_EVIDENCE_LIMIT]}
 
 

@@ -17,6 +17,7 @@ from eval.harness.envelope import Envelope, ScopeAccount
 UTC = timezone.utc
 PRO = admission.RouteRef("deepseek--deepseek-v4-pro", "deepseek", "deepseek-v4-pro")
 GLM = admission.RouteRef("openrouter--z-ai__glm-5.3", "openrouter", "z-ai/glm-5.3")
+FLASH = admission.RouteRef("deepseek--deepseek-flash", "deepseek", "deepseek-flash")
 PRO_PRICE = prices.lookup("deepseek", "deepseek-v4-pro")
 GLM_PRICE = prices.lookup("openrouter", "z-ai/glm-5.3")
 MONDAY_PEAK = datetime(2026, 11, 2, 6, 0, tzinfo=UTC)
@@ -280,7 +281,7 @@ class FakeDrain:
         self.clock += timedelta(seconds=seconds)
 
     def deps(self, **change):
-        deps = admission.ExhaustionDeps(provider="deepseek", send=self.send, remaining=lambda: self.balance,
+        deps = admission.ExhaustionDeps(send=self.send, remaining=lambda: self.balance,
                                         requests=lambda a: self.requests,
                                         settle=lambda: None, sleep=self.sleep, now=lambda: self.clock,
                                         may_continue=lambda t: True)
@@ -288,8 +289,8 @@ class FakeDrain:
 
 
 class ExhaustionTest(unittest.TestCase):
-    def run_check(self, drain, bound=0.8, max_requests=300, deadline=timedelta(hours=2), **change):
-        return admission.exhaustion(GLM, "x1", funding=2.0, overdraw_bound=bound, deps=drain.deps(**change),
+    def run_check(self, drain, bound=0.8, max_requests=300, deadline=timedelta(hours=2), route=FLASH, **change):
+        return admission.exhaustion(route, "x1", funding=2.0, overdraw_bound=bound, deps=drain.deps(**change),
                                     max_requests=max_requests, deadline=MONDAY_PEAK + deadline)
 
     def test_the_provider_stopping_at_its_balance_within_the_reserve_passes(self):
@@ -317,15 +318,15 @@ class ExhaustionTest(unittest.TestCase):
         an empty account."""
         def refusal(source):
             return (402, {"error": {"message": "x", "metadata": {"limit_source": source}}})
-        self.assertEqual(self.run_check(FakeDrain(refusal=refusal("openrouter_credits")), provider="openrouter").verdict,
+        self.assertEqual(self.run_check(FakeDrain(refusal=refusal("openrouter_credits")), route=GLM).verdict,
                          PASS)
         size = (402, {"error": {"message": "weight_exceeds_budget",
                                 "metadata": {"limit_source": "openrouter_credits"}}})  # one request too dear
-        self.assertEqual(self.run_check(FakeDrain(refusal=size), max_requests=120, provider="openrouter").verdict,
+        self.assertEqual(self.run_check(FakeDrain(refusal=size), max_requests=120, route=GLM).verdict,
                          INCONCLUSIVE)
         for source in ("key", "in_flight_budget", None):
             with self.subTest(source=source):
-                result = self.run_check(FakeDrain(refusal=refusal(source)), max_requests=120, provider="openrouter")
+                result = self.run_check(FakeDrain(refusal=refusal(source)), max_requests=120, route=GLM)
                 self.assertEqual(result.verdict, INCONCLUSIVE)
 
     def test_an_account_that_isnt_funded_is_refused_before_any_spend(self):
@@ -418,6 +419,26 @@ class RecordsTest(unittest.TestCase):
                 newer.write_text(json.dumps(record))
                 (row,) = self.rows([self.binding])
                 self.assertEqual((row["verdict"], row["stale"]), ("invalid", True))
+
+    def test_a_binding_missing_even_a_nullable_field_is_invalid(self):
+        exhaust = replace(self.binding, route="deepseek--deepseek-flash", cli="any")
+        self.write(check="exhaustion", route=exhaust.route, cli="any", binding=exhaust,
+                   evidence={"funding": 2.0, "fees": 0.0, "taxes": 0.0})
+        newer = self.write(check="exhaustion", route=exhaust.route, cli="any", binding=exhaust, verdict=FAIL,
+                           attempt="20261102T070000-bbbbbb", evidence={"funding": 2.0, "fees": 0.0, "taxes": 0.0})
+        record = json.loads(newer.read_text())
+        del record["binding"]["account"]
+        newer.write_text(json.dumps(record))
+        (row,) = self.rows([self.binding], "exhaustion")
+        self.assertEqual(row["verdict"], "invalid")  # the older pass never resurfaces
+
+    def test_exhaustion_at_another_upstream_never_applies(self):
+        local = replace(self.binding, route="deepseek--deepseek-flash", cli="any",
+                        endpoint="http://127.0.0.1:9/anthropic/v1/messages")
+        self.write(check="exhaustion", route=local.route, cli="any", binding=local,
+                   evidence={"funding": 2.0, "fees": 0.0, "taxes": 0.0})
+        (row,) = self.rows([self.binding], "exhaustion")
+        self.assertIsNone(row["verdict"])
 
     def test_a_damaged_latest_record_never_falls_back_to_an_earlier_pass(self):
         self.write(attempt="20261102T060000-aaaaaa")
@@ -557,6 +578,17 @@ class AdmitCommandTest(unittest.TestCase):
         _, record, _ = self.drain(rate=0.5)  # the envelope counts twice what is billed
         self.assertEqual(record["result"]["verdict"], PASS, record["result"]["reason"])
 
+    def test_a_one_slot_route_drains_one_request_at_a_time(self):
+        fake = self.metered.FakeDeepSeek(funded=2.0)
+        fake.output, fake.refuse_at_zero = 16, True
+        self.addCleanup(fake.server.server_close)
+        self.addCleanup(fake.server.shutdown)
+        self.exhaustion_envelope(fake, slots=1)
+        self.admit("exhaustion", "--route", "deepseek--deepseek-flash", "--funding", "2", "--envelope", "X")
+        (record,) = (self.root / "adm" / "deepseek--deepseek-flash").glob("exhaustion-any-*.json")
+        result = json.loads(record.read_text())["result"]
+        self.assertEqual(result["verdict"], PASS, result["reason"])
+
     def test_the_drain_refuses_outside_a_deepseek_peak_window_before_any_spend(self):
         fake = self.fake()
         self.clock[0] = at(7, 7)  # a Saturday
@@ -580,6 +612,46 @@ class AdmitCommandTest(unittest.TestCase):
     def test_status_reads_a_snapshot_while_another_process_owns_the_envelope(self):
         with Envelope.owned("B", root=self.root, create_usd=150.0):
             self.assertEqual(self.admit("status"), 0)
+
+
+class LedgerEvidenceTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="eval-ledger-evidence-"))
+        self.addCleanup(shutil.rmtree, self.root)
+        with Envelope.owned("B", root=self.root, create_usd=150.0) as env:
+            env.fund(credit=10.0)
+            env.register_scope("ds", provider="deepseek", fingerprint="fp", opening_usage=-10.0, allocation=10.0,
+                               provider_limit=None)
+            env.set_route("r", scope="ds", max_charge=1.0, slots=2, policy={}, bootstrap_build_usd=1.0)
+            env.validate_route("r")
+            env.reconcile("ds", -10.0)
+            env.reserve("job", 1.0)
+            env.admit("q1", "r", job="job", attempt="a1")
+        self.path = self.root / "B.json"
+
+    def test_a_ledger_written_before_the_evidence_fields_loads_with_them_unrecorded(self):
+        state = json.loads(self.path.read_text())
+        for key in ("fault", "account"):
+            del state["scopes"]["ds"][key]
+        for key in ("metered", "metered_invalid", "protocol_complete", "served", "metered_tokens", "billed_tokens",
+                    "refused_by_provider"):
+            del state["requests"]["q1"][key]
+        self.path.write_text(json.dumps(state))
+        loaded = envelope.load(self.path)
+        self.assertEqual((loaded["requests"]["q1"]["state"], loaded["requests"]["q1"]["bound"]), ("unresolved", 1.0))
+        self.assertIsNone(loaded["scopes"]["ds"]["account"])
+
+    def test_malformed_token_evidence_is_refused_on_load(self):
+        state = json.loads(self.path.read_text())
+        for bad in ({}, {"prompt": 1, "completion": 1}, {"prompt": 1, "completion": 1, "cached": 5},
+                    {"prompt": "1", "completion": 1, "cached": 0},
+                    {"prompt": -1, "completion": 1, "cached": -2},  # consistent, still not counts
+                    {"prompt": 5, "completion": 1, "cached": 0, "extra": 1}):
+            with self.subTest(bad=bad):
+                state["requests"]["q1"]["billed_tokens"] = bad
+                self.path.write_text(json.dumps(state))
+                with self.assertRaises(envelope.EnvelopeError):
+                    envelope.load(self.path)
 
 
 class AdmissionExperimentTest(unittest.TestCase):
