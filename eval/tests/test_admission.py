@@ -339,6 +339,29 @@ class RecordsTest(unittest.TestCase):
         self.assertAlmostEqual(admission.budget(self.root), 150.0 - 7.8)
 
 
+class AdmitCommandTest(unittest.TestCase):
+    def admit(self, *argv, root):
+        from unittest import mock
+        from eval.__main__ import main
+        from eval.harness import admit_commands
+        with mock.patch.object(envelope, "DEFAULT_ROOT", root), mock.patch.object(admit_commands, "ROOT", root / "adm"), \
+                mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+            return main(["admit", *argv])
+
+    def test_it_refuses_a_bad_route_and_a_missing_envelope_before_any_spend(self):
+        root = Path(tempfile.mkdtemp(prefix="eval-admit-"))
+        self.addCleanup(shutil.rmtree, root)
+        self.assertEqual(self.admit("cache", "--route", "nowhere", "--cli", "codex", root=root), 2)
+        self.assertEqual(self.admit("cache", "--route", "fireworks--glm", "--cli", "codex", root=root), 2)
+        self.assertEqual(self.admit("cache", "--route", "deepseek--deepseek-flash", root=root), 2)  # no --cli
+        self.assertEqual(self.admit("metering", "--route", "openrouter--z-ai__glm-5.3", "--cli", "codex",
+                                    root=root), 2)  # not metered
+        self.assertEqual(self.admit("cache", "--route", "deepseek--deepseek-flash", "--cli", "codex", root=root), 3)
+        self.assertEqual(self.admit("exhaustion", "--route", "deepseek--deepseek-flash", root=root), 2)  # no --funding
+        self.assertFalse((root / "adm").exists())  # nothing recorded, nothing spent
+        self.assertEqual(self.admit("budget", root=root), 0)
+
+
 class ExhaustionThroughTheProxyTest(unittest.TestCase):
     """The real proxy and envelope against a fake DeepSeek that refuses at a zero balance."""
 
