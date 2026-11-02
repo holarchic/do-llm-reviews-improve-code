@@ -22,6 +22,7 @@ import json
 import math
 import os
 import secrets
+import stat
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -547,9 +548,9 @@ def _record_paths(root: Path) -> list[Path]:
         raise Refused(f"{root} can't be listed ({type(exc).__name__}): records could be missed") from None
     paths = []
     for route in routes:
-        if not route.is_dir():
-            continue
         try:
+            if not stat.S_ISDIR(route.stat().st_mode):  # `is_dir` would read a stat error as "not a dir"
+                continue
             paths += sorted(p for p in route.iterdir() if p.suffix == ".json")
         except OSError as exc:
             raise Refused(f"{route} can't be listed ({type(exc).__name__}): records could be missed") from None

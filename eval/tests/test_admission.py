@@ -610,18 +610,27 @@ class AdmitCommandTest(unittest.TestCase):
         result = admission.Result("exhaustion", "deepseek--deepseek-flash", "any", "20261102T060000-aaaaaa", "running", "")
         binding = admission.Binding("deepseek--deepseek-flash", "v", "f", "https://x/anthropic/v1/messages", "any", "?",
                                     prices.TABLE_SHA256, "a")
-        synced = []
-        real_open = admission.os.open
+        opened, synced = {}, []
+        real_open, real_fsync, real_replace = admission.os.open, admission.os.fsync, Path.replace
 
         def tracking_open(path, flags, *args):
             descriptor = real_open(path, flags, *args)
-            if flags == admission.os.O_RDONLY:
-                synced.append(Path(path))
+            opened[descriptor] = Path(path)
             return descriptor
+
+        def tracking_fsync(descriptor):
+            synced.append(opened.get(descriptor, "the record file"))
+            return real_fsync(descriptor)
+
+        def tracking_replace(path, target):
+            synced.append("replace")
+            return real_replace(path, target)
         self.assertFalse(root.exists())  # the first record creates the admission root too
-        with mock.patch.object(admission.os, "open", tracking_open):
+        with mock.patch.object(admission.os, "open", tracking_open), \
+                mock.patch.object(admission.os, "fsync", tracking_fsync), \
+                mock.patch.object(Path, "replace", tracking_replace):
             admission.write(root, result, binding, "running")
-        self.assertEqual(synced, [root / "deepseek--deepseek-flash", root, root.parent])
+        self.assertEqual(synced, ["the record file", "replace", root / "deepseek--deepseek-flash", root, root.parent])
 
     def test_a_directory_sync_that_fails_raises_before_any_spend(self):
         root = self.root / "adm"
@@ -641,6 +650,17 @@ class AdmitCommandTest(unittest.TestCase):
         root = self.root / "adm"
         (root / "deepseek--deepseek-flash").mkdir(parents=True)
         self.assertEqual(admission.budget(self.root / "absent"), 150.0)  # no root: nothing spent
+        real_stat = Path.stat
+
+        def stat(path, *args, **kwargs):
+            if path == root / "deepseek--deepseek-flash":
+                raise PermissionError("denied")
+            return real_stat(path, *args, **kwargs)
+        with mock.patch.object(Path, "stat", stat):  # the route can be listed in the root, not looked at
+            with self.assertRaises(admission.Refused):
+                admission.budget(root)
+            with self.assertRaises(admission.Refused):
+                admission.status(root, [])
         real = Path.iterdir
         for failing in (root, root / "deepseek--deepseek-flash"):
             def iterdir(path, failing=failing):
