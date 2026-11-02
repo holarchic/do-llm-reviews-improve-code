@@ -344,12 +344,13 @@ def from_upstream(upstream: Upstream, fingerprint: str) -> Settler:
     return DeepSeekSettler(upstream.base_url, key, price)
 
 
-def remaining_credit(provider: str, key: str) -> float:
-    """The account's credit left (negative once overdrawn): OpenRouter's `/credits`, DeepSeek's balance."""
+def remaining_credit(provider: str, key: str, base_url: str) -> float:
+    """The account's credit left (negative once overdrawn), at the route's upstream: OpenRouter's
+    `/credits`, DeepSeek's balance."""
     if provider == "deepseek":
-        return -DeepSeekSettler(providers.get(provider).upstream, key).key_usage()
+        return -DeepSeekSettler(base_url, key).key_usage()
     try:
-        data = _get_json(providers.get(provider).upstream + "/v1/credits", key)["data"]
+        data = _get_json(base_url.rstrip("/") + "/v1/credits", key)["data"]
         total, used = data["total_credits"], data["total_usage"]
     except urllib.error.HTTPError as exc:
         exc.close()

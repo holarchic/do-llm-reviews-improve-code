@@ -431,12 +431,7 @@ class Envelope:
 
     def route(self, name: str) -> "Route | None":
         with self._mutex:
-            r = self._state["routes"].get(name)
-            if r is None:
-                return None
-            return Route(name, r["scope"], r["max_charge"], r["slots"], copy.deepcopy(r["policy"]),
-                         r["bootstrap_build_usd"], r["stage"], copy.deepcopy(r["upstream"]),
-                         self._state["scopes"][r["scope"]]["fingerprint"], _version(_config(r)))
+            return route_view(self._state, name)
 
     def route_names(self) -> list[str]:
         with self._mutex:
@@ -476,6 +471,16 @@ def load(path: Path) -> dict:
         raise EnvelopeError(f"{path.name} unreadable: {exc!r}") from None
     _check(state)
     return state
+
+
+def route_view(state: dict, name: str) -> "Route | None":
+    """A route as typed view of a state (an owner's, or a read-only `load`)."""
+    r = state["routes"].get(name)
+    if r is None:
+        return None
+    return Route(name, r["scope"], r["max_charge"], r["slots"], copy.deepcopy(r["policy"]), r["bootstrap_build_usd"],
+                 r["stage"], copy.deepcopy(r["upstream"]), state["scopes"][r["scope"]]["fingerprint"],
+                 _version(_config(r)))
 
 
 def summary(state: dict, now: float) -> dict:

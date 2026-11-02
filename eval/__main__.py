@@ -54,6 +54,10 @@ def main(argv: list[str]) -> int:
                   file=sys.stderr)
             return 2
         args.experiment = experiments.EXPERIMENTS[args.experiment]
+        if not args.experiment.tasks and args.command != "probe":
+            # A route-admission experiment: its probes run, nothing of it is scheduled, frozen or scored.
+            print(f"{args.command}: {args.experiment.name} has no tasks; only `probe` runs on it", file=sys.stderr)
+            return 2
     handler = HANDLERS[args.command]
     return handler(args)
 
@@ -115,9 +119,6 @@ def _run(args) -> int:
     from .harness import pilot, tasks
 
     experiment = args.experiment
-    if not experiment.tasks:
-        print(f"run: {experiment.name} has no tasks: it is never scheduled", file=sys.stderr)
-        return 2
     if not args.task:
         if args.arm is not None and args.arm not in experiment.arm_names:
             print(f"run: --arm must be one of {', '.join(experiment.arm_names)}", file=sys.stderr)

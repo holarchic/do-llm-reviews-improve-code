@@ -24,8 +24,8 @@ POLICY = {"paths": ["/anthropic/v1/messages", "/responses"], "models": [MODEL],
 BOUND = prices.request_charge_bound(PRICE, max_input_tokens=CONTEXT, max_output_tokens=MAX_OUT)
 
 
-def peak(fresh, cached, output):
-    r = PRICE.rates
+def peak(fresh, cached, output, model=MODEL):
+    r = prices.lookup(prices.DEEPSEEK, model).rates
     return (fresh * r.input + cached * r.cache_read + output * r.output) / 1e6
 
 
@@ -57,6 +57,7 @@ class FakeDeepSeek:
 
             def do_POST(self):
                 body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                model = json.loads(body).get("model", MODEL)
                 prompt = len(body) + OVERHEAD
                 if prompt > CONTEXT:
                     self.send_response(400)
@@ -74,7 +75,7 @@ class FakeDeepSeek:
                 output = min(fake.output, MAX_OUT)
                 with fake._lock:
                     n = len(fake.charges) + 1
-                    fake.charges.append(fake.rate * peak(prompt - cached, cached, output))
+                    fake.charges.append(fake.rate * peak(prompt - cached, cached, output, model))
                 reported = max(0, output - fake.hidden)
                 anthropic = self.path.split("?", 1)[0] == "/anthropic/v1/messages"  # Claude adds ?beta=true
                 events = (fake.events_override or (fake.anthropic if anthropic else fake.responses))(

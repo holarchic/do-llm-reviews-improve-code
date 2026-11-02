@@ -2,8 +2,8 @@
 
 A route (provider, model) is admitted by the operator (`spend validate-route`) only after its checks
 pass, per CLI where a check is per CLI. Each check returns a `Result`: pass, fail or inconclusive,
-with its evidence and what it is bound to (route version, key, endpoint, CLI version, price table),
-and inconclusive never admits. Every paid request goes through the active envelope's proxy.
+with its evidence, and inconclusive never admits. Records bind each result to what it admits (route
+version, key, endpoint, CLI version, price table). Every paid request goes through an envelope's proxy.
 
 - `cache_and_served`: one session; cache hits are billed at the cache rate (the saving the provider
   gave, against the saving its rates promise), and every request was served by whom the route says.
@@ -14,7 +14,8 @@ and inconclusive never admits. Every paid request goes through the active envelo
   stops spending at the account's balance, and in-flight requests overdraw it by at most the
   reserved overdraw (Σ slots × max charge).
 
-The clock, sleeping, sessions, balance readings and raw requests are injected, so tests drive them.
+Each check takes its own typed dependencies (the clock, sessions, balances, raw requests), so tests
+drive them.
 """
 
 import json
@@ -23,8 +24,10 @@ import secrets
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import Callable
 
 PASS, FAIL, INCONCLUSIVE = "pass", "fail", "inconclusive"
+CHECKS = ("cache", "served", "metering", "exhaustion")
 
 # DeepSeek's peak hours, UTC, Monday to Friday, except Chinese public holidays (off-peak by its terms).
 PEAK_HOURS = ((1, 4), (6, 10))
@@ -43,6 +46,7 @@ MAX_SESSIONS = 20
 CACHE_SAVING = (0.80, 1.05)  # the billed saving's share of the saving the route's rates promise
 REASONING_CHARS_PER_TOKEN = 6  # conservative: Claude Code's transcript keeps thinking text, not its count
 SERVED = {"openrouter": "Z.AI"}  # a metered route's served value must be its own model
+RATE_LIMIT_BACKOFF = 30
 
 
 @dataclass(frozen=True)
@@ -101,95 +105,138 @@ def window_left(utc: datetime) -> timedelta:
     return utc.replace(hour=end, minute=0, second=0, microsecond=0) - utc
 
 
-def _require_window(utc: datetime) -> None:
-    open_ = peak_window(utc)
-    if open_ is None:
+def in_window(utc: datetime) -> bool:
+    """Inside a peak window with at least MIN_WINDOW_LEFT of it to go."""
+    return bool(peak_window(utc)) and window_left(utc) >= MIN_WINDOW_LEFT
+
+
+def require_window(utc: datetime) -> None:
+    if peak_window(utc) is None:
         raise Refused(f"{utc.date()} is past the holiday list's coverage ({COVERED_UNTIL})")
-    if not open_ or window_left(utc) < MIN_WINDOW_LEFT:
-        raise Refused(f"{utc:%Y-%m-%d %H:%M} UTC is not inside a DeepSeek peak window with "
-                      f"{MIN_WINDOW_LEFT} left")
+    if not in_window(utc):
+        raise Refused(f"{utc:%Y-%m-%d %H:%M} UTC is not inside a DeepSeek peak window with {MIN_WINDOW_LEFT} left")
 
 
-# ---- deps
+# ---- the request views a check reads
 
 
-@dataclass
-class Deps:
-    """What a check talks to. `session(attempt_dir)` runs one CLI session and returns it; `requests(attempt)`
-    the envelope's requests for an attempt; `settle()` one settlement round; `balance()` the scope's
-    reading and its raw string; `now()` and `sleep(seconds)` the clock."""
-    session: object = None
-    requests: object = None
-    settle: object = None
-    balance: object = None
-    scope_unresolved: object = None
-    now: object = None
-    sleep: object = None
-    send: object = None
-    remaining: object = None
+@dataclass(frozen=True)
+class Request:
+    """One of an attempt's requests, as the envelope recorded it."""
+    id: str
+    state: str  # unresolved | billed | not_billed
+    billed: float | None
+    metered: float | None
+    metered_tokens: dict | None
+    billed_tokens: dict | None
+    served: tuple[str, ...]
+    admitted_at: float
+    refused: dict | None
+
+    @classmethod
+    def of(cls, record: dict) -> "Request":
+        return cls(record["request"], record["state"], record["billed"], record["metered"], record["metered_tokens"],
+                   record["billed_tokens"], tuple(record["served"]), record["admitted_at"],
+                   record["refused_by_provider"])
+
+
+@dataclass(frozen=True)
+class SessionDeps:
+    """Run one CLI session into a dir; an attempt's requests by its key; one settlement round; sleep."""
+    session: Callable
+    requests: Callable[[str], list[Request]]
+    settle: Callable[[], None]
+    sleep: Callable[[float], None]
+
+
+@dataclass(frozen=True)
+class MeteringDeps(SessionDeps):
+    """Also: the scope's reading and its raw balance string; whether the scope has unresolved requests;
+    the scope's usage since registration as the ledger accounts it (settled spend); the clock."""
+    balance: Callable[[], tuple[float, str]]
+    scope_unresolved: Callable[[], bool]
+    scope_accounted: Callable[[], tuple[float, float]]  # (opening usage, settled spend) of the scope
+    now: Callable[[], datetime]
+
+
+@dataclass(frozen=True)
+class ExhaustionDeps:
+    """Send n requests at once through the proxy; the account's remaining credit; an attempt's requests;
+    one settlement round; the clock; whether the run may go on (the DeepSeek window, where it applies)."""
+    send: Callable[[int], list["Reply"]]
+    remaining: Callable[[], float]
+    requests: Callable[[str], list[Request]]
+    settle: Callable[[], None]
+    sleep: Callable[[float], None]
+    now: Callable[[], datetime]
+    may_continue: Callable[[datetime], bool]
 
 
 def new_attempt() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + secrets.token_hex(3)
 
 
-def _settled(deps: Deps, attempt: str, limit: float = 600) -> list[dict]:
-    """The attempt's requests once settlement has had its chance (bounded)."""
+def attempt_key(attempt_dir: Path) -> str:
+    """How the routing context names a session's attempt: its resolved out dir."""
+    return str(attempt_dir.resolve())
+
+
+def _settle_all(settle, requests, sleep, attempt: str, limit: float) -> tuple[list[Request], bool]:
+    """Settlement rounds until the attempt has nothing unresolved, or the limit; and whether it got there."""
     waited = 0.0
     while True:
-        deps.settle()
-        requests = deps.requests(attempt)
-        if all(r["state"] != "unresolved" for r in requests) or waited >= limit:
-            return requests
-        deps.sleep(30)
+        settle()
+        found = requests(attempt)
+        if all(r.state != "unresolved" for r in found):
+            return found, True
+        if waited >= limit:
+            return found, False
+        sleep(30)
         waited += 30
 
 
 # ---- cache and served
 
 
-def cache_and_served(route, cli: str, price, attempt: str, attempt_dir: Path, deps: Deps) -> list[Result]:
+def cache_and_served(route: RouteRef, cli: str, price, attempt: str, attempt_dir: Path,
+                     deps: SessionDeps) -> list[Result]:
     """One session; then the two checks over its own requests."""
     session = deps.session(attempt_dir)
-    requests = _settled(deps, _attempt_key(attempt_dir))
-    base = {"requests": [r["request"] for r in requests], "session": session.terminal}
+    requests, _ = _settle_all(deps.settle, deps.requests, deps.sleep, attempt_key(attempt_dir), 600)
+    base = {"requests": [r.id for r in requests], "session": session.terminal}
     problem = _incomplete(session, requests)
     if problem:
         return [Result(name, route.name, cli, attempt, INCONCLUSIVE, problem, base) for name in ("cache", "served")]
     return [_cache(route, cli, price, attempt, requests, base), _served(route, cli, attempt, requests, base)]
 
 
-def _attempt_key(attempt_dir: Path) -> str:
-    return str(attempt_dir.resolve())  # the routing context names an attempt by its resolved out dir
-
-
-def _incomplete(session, requests: list[dict]) -> str | None:
+def _incomplete(session, requests: list[Request]) -> str | None:
     if session.terminal != "completed":
         return f"the session did not complete: {session.reason}"
     if not requests:
         return "no request of this attempt reached the proxy"
-    unresolved = [r["request"] for r in requests if r["state"] == "unresolved"]
+    unresolved = [r.id for r in requests if r.state == "unresolved"]
     return f"unresolved requests: {unresolved}" if unresolved else None
 
 
-def _tokens(request: dict) -> dict | None:
+def _tokens(request: Request) -> dict | None:
     """The provider's own counts: prompt (cached included), completion, cached."""
-    if request["billed_tokens"] is not None:
-        return request["billed_tokens"]
-    metered = request["metered_tokens"]
-    if metered is not None:
-        return {"prompt": metered["fresh"] + metered["cached"], "completion": metered["output"],
-                "cached": metered["cached"]}
+    if request.billed_tokens is not None:
+        return request.billed_tokens
+    if request.metered_tokens is not None:
+        m = request.metered_tokens
+        return {"prompt": m["fresh"] + m["cached"], "completion": m["output"], "cached": m["cached"]}
     return None
 
 
-def _cache(route, cli, price, attempt, requests, base) -> Result:
-    counts = [_tokens(r) for r in requests if r["state"] == "billed"]
+def _cache(route, cli, price, attempt, requests: list[Request], base) -> Result:
+    billed_requests = [r for r in requests if r.state == "billed"]
+    counts = [_tokens(r) for r in billed_requests]
     if not counts or any(c is None for c in counts):
         return Result("cache", route.name, cli, attempt, INCONCLUSIVE, "a request has no provider token counts", base)
     rates = price.rates
     prompt, completion, cached = (sum(c[k] for c in counts) for k in ("prompt", "completion", "cached"))
-    billed = sum(r["billed"] for r in requests)
+    billed = sum(r.billed for r in billed_requests)
     uncached = (prompt * rates.input + completion * rates.output) / 1e6
     expected = cached * (rates.input - rates.cache_read) / 1e6
     evidence = {**base, "prompt": prompt, "completion": completion, "cached": cached, "billed": billed,
@@ -203,13 +250,13 @@ def _cache(route, cli, price, attempt, requests, base) -> Result:
                   {**evidence, "share": share})
 
 
-def _served(route, cli, attempt, requests, base) -> Result:
+def _served(route, cli, attempt, requests: list[Request], base) -> Result:
     expected = SERVED.get(route.provider, route.model)
-    seen = [r["served"] for r in requests]
-    wrong = [r["request"] for r in requests if r["served"] != [expected]]
+    wrong = [r.id for r in requests if r.served != (expected,)]
     verdict = FAIL if wrong else PASS
     reason = f"served by {expected}" if not wrong else f"requests not served by exactly {expected}: {wrong}"
-    return Result("served", route.name, cli, attempt, verdict, reason, {**base, "served": seen, "expected": expected})
+    return Result("served", route.name, cli, attempt, verdict, reason,
+                  {**base, "served": [list(r.served) for r in requests], "expected": expected})
 
 
 # ---- metering
@@ -221,20 +268,19 @@ def tolerance(raw_balance: str) -> float:
     return max(2 * 10 ** -decimals, TOLERANCE_FLOOR)
 
 
-def _quiet_balance(deps: Deps, readings: list) -> tuple[float, str] | None:
-    """Poll until the balance has been unchanged for QUIET_SECONDS; None past SETTLE_LIMIT_SECONDS."""
-    waited = 0.0
-    last = deps.balance()
-    readings.append((deps.now().isoformat(), last[1]))
-    unchanged = 0.0
+def _quiet(reader, now, sleep, readings: list, key=lambda r: r):
+    """Poll `reader` until its value has held for QUIET_SECONDS; None past SETTLE_LIMIT_SECONDS."""
+    waited = unchanged = 0.0
+    last = reader()
+    readings.append((now().isoformat(), key(last)))
     while unchanged < QUIET_SECONDS:
         if waited >= SETTLE_LIMIT_SECONDS:
             return None
-        deps.sleep(POLL_SECONDS)
+        sleep(POLL_SECONDS)
         waited += POLL_SECONDS
-        current = deps.balance()
-        readings.append((deps.now().isoformat(), current[1]))
-        unchanged = unchanged + POLL_SECONDS if current[1] == last[1] else 0.0
+        current = reader()
+        readings.append((now().isoformat(), key(current)))
+        unchanged = unchanged + POLL_SECONDS if key(current) == key(last) else 0.0
         last = current
     return last
 
@@ -261,9 +307,9 @@ def reasoning_tokens(cli: str, session) -> int:
     return chars // REASONING_CHARS_PER_TOKEN
 
 
-def metering(route, cli: str, price, attempt: str, attempt_root: Path, deps: Deps) -> Result:
+def metering(route: RouteRef, cli: str, price, attempt: str, attempt_root: Path, deps: MeteringDeps) -> Result:
     """Refuses (nothing spent) outside a peak window or with earlier requests unresolved."""
-    _require_window(deps.now())
+    require_window(deps.now())
     if deps.scope_unresolved():
         raise Refused("the scope has unresolved requests: their debits could land in this attempt's measure")
     readings: list = []
@@ -271,13 +317,19 @@ def metering(route, cli: str, price, attempt: str, attempt_root: Path, deps: Dep
     def result(verdict, reason, **evidence):
         return Result("metering", route.name, cli, attempt, verdict, reason, {"balances": readings, **evidence})
 
-    opening = _quiet_balance(deps, readings)
+    opening = _quiet(deps.balance, deps.now, deps.sleep, readings, key=lambda r: r[1])
     if opening is None:
         return result(INCONCLUSIVE, "the balance never held still before the run: the account isn't isolated")
     tol = tolerance(opening[1])
+    # Earlier billing is accounted for: the account's fall since the scope opened is what the ledger settled.
+    scope_opening, settled = deps.scope_accounted()
+    earlier_gap = (opening[0] - scope_opening) - settled
+    if abs(earlier_gap) > tol:
+        return result(INCONCLUSIVE, f"earlier billing isn't accounted for (gap ${earlier_gap:.4f}): the baseline "
+                      "can't be trusted", earlier_gap=earlier_gap, tolerance=tol)
     rates = price.rates
     metered = cached_usd = reasoning_usd = 0.0
-    keys = []
+    keys: list[str] = []
 
     def workload_done() -> bool:
         return (metered >= WORKLOAD_FACTOR * tol and cached_usd >= COMPONENT_FACTOR * tol
@@ -287,28 +339,26 @@ def metering(route, cli: str, price, attempt: str, attempt_root: Path, deps: Dep
         if len(keys) >= MAX_SESSIONS:
             return result(INCONCLUSIVE, f"{MAX_SESSIONS} sessions without the workload's components",
                           metered=metered, cached_usd=cached_usd, reasoning_usd=reasoning_usd)
-        now = deps.now()
-        if not peak_window(now) or window_left(now) < MIN_WINDOW_LEFT:
+        if not in_window(deps.now()):
             return result(INCONCLUSIVE, "the peak window closed before the workload was complete", sessions=len(keys))
         attempt_dir = attempt_root / f"session-{len(keys)}"
         session = deps.session(attempt_dir)
-        keys.append(_attempt_key(attempt_dir))
-        for request in _settled(deps, keys[-1]):
-            if request["metered"] is not None:
-                metered += request["metered"]
-                cached_usd += (request["metered_tokens"] or {}).get("cached", 0) * rates.cache_read / 1e6
+        keys.append(attempt_key(attempt_dir))
+        for request in _settle_all(deps.settle, deps.requests, deps.sleep, keys[-1], 600)[0]:
+            if request.metered is not None:
+                metered += request.metered
+                cached_usd += (request.metered_tokens or {}).get("cached", 0) * rates.cache_read / 1e6
         reasoning_usd += reasoning_tokens(cli, session) * rates.output / 1e6
     requests = [r for key in keys for r in deps.requests(key)]
-    outside = [r["request"] for r in requests
-               if not peak_window(datetime.fromtimestamp(r["admitted_at"], timezone.utc))]
-    unresolved = [r["request"] for r in requests if r["state"] == "unresolved"]
-    evidence = {"requests": [r["request"] for r in requests], "metered": metered, "tolerance": tol,
-                "cached_usd": cached_usd, "reasoning_usd": reasoning_usd}
+    outside = [r.id for r in requests if not peak_window(datetime.fromtimestamp(r.admitted_at, timezone.utc))]
+    unresolved = [r.id for r in requests if r.state == "unresolved"]
+    evidence = {"requests": [r.id for r in requests], "metered": metered, "tolerance": tol,
+                "cached_usd": cached_usd, "reasoning_usd": reasoning_usd, "earlier_gap": earlier_gap}
     if outside:
         return result(INCONCLUSIVE, f"requests admitted outside the peak window: {outside}", **evidence)
     if unresolved:
         return result(INCONCLUSIVE, f"unresolved requests: {unresolved}", **evidence)
-    closing = _quiet_balance(deps, readings)
+    closing = _quiet(deps.balance, deps.now, deps.sleep, readings, key=lambda r: r[1])
     if closing is None:
         return result(INCONCLUSIVE, "the balance was still moving 90 minutes after the run", **evidence)
     fall = closing[0] - opening[0]  # a reading is −balance: it rises as the account is billed
@@ -335,50 +385,73 @@ class Reply:
         return isinstance(error, dict) and error.get("type") == "proxy"
 
     @property
-    def provider_refusal(self) -> bool:
-        return self.status in (402, 429) and not self.from_proxy
+    def rate_limited(self) -> bool:
+        return self.status == 429 and not self.from_proxy
 
     @property
     def request_size(self) -> bool:
         """OpenRouter refusing one request as too dear for what is left, while credit remains."""
         return "weight_exceeds_budget" in json.dumps(self.body or {})
 
+    @property
+    def insufficient_balance(self) -> bool:
+        """The one refusal that evidences an empty account: a 402 with a JSON error, not a request-size
+        refusal (DeepSeek: insufficient balance; OpenRouter: insufficient credits)."""
+        error = self.body.get("error") if isinstance(self.body, dict) else None
+        return (self.status == 402 and not self.from_proxy and isinstance(error, (dict, str))
+                and not self.request_size)
 
-def exhaustion(route, attempt: str, *, funding: float, request_cost: float, overdraw_bound: float,
-               deps: Deps, fees: float = 0.0, taxes: float = 0.0, max_requests: int = 300, batch: int = 4) -> Result:
-    """Drain the account through the proxy until the provider refuses, then attribute the refusal."""
+
+def exhaustion(route: RouteRef, attempt: str, *, funding: float, overdraw_bound: float, deps: ExhaustionDeps,
+               max_requests: int, deadline: datetime, batch: int = 4) -> Result:
+    """Drain the account through the proxy until the provider refuses for insufficient balance, then
+    confirm it with every request settled and the account's final balance read once it holds still."""
     replies: list[Reply] = []
 
     def result(verdict, reason, **evidence):
-        return Result("exhaustion", route.name, "-", attempt, verdict, reason,
-                      {"funding": funding, "fees": fees, "taxes": taxes, "request_cost": request_cost,
-                       "overdraw_bound": overdraw_bound,
+        return Result("exhaustion", route.name, "any", attempt, verdict, reason,
+                      {"funding": funding, "overdraw_bound": overdraw_bound,
                        "statuses": [r.status for r in replies], **evidence})
 
-    while not any(r.provider_refusal for r in replies):
-        if len(replies) >= max_requests:
-            return result(INCONCLUSIVE, f"{max_requests} requests without the provider refusing")
-        replies.extend(deps.send(batch))
-        deps.settle()  # settled requests free their slots for the next batch
-        if any(r.from_proxy for r in replies):
+    while not any(r.insufficient_balance for r in replies):
+        now = deps.now()
+        if len(replies) >= max_requests or now >= deadline:
+            return result(INCONCLUSIVE, f"{len(replies)} requests without the provider refusing for balance")
+        if not deps.may_continue(now):
+            return result(INCONCLUSIVE, "the run's window closed before the provider refused")
+        sent = deps.send(batch)
+        replies.extend(sent)
+        if any(r.from_proxy for r in sent):
             return result(INCONCLUSIVE, "the envelope refused before the provider did")
-    _settled(deps, attempt, limit=SETTLE_LIMIT_SECONDS)
-    remaining = deps.remaining()
+        if any(r.rate_limited for r in sent):
+            deps.sleep(RATE_LIMIT_BACKOFF)  # a rate limit says nothing of the balance: back off and go on
+        _settle_all(deps.settle, deps.requests, deps.sleep, attempt, 600)  # free the slots for the next batch
     confirm = deps.send(1)[0]
     replies.append(confirm)
-    refusals = [r.body for r in replies if r.provider_refusal]
-    evidence = {"remaining": remaining, "confirmation": confirm.status, "refusals": refusals[:5]}
-    if not confirm.provider_refusal:
-        return result(INCONCLUSIVE, "the refusal cleared: a later request was served", **evidence)
-    if remaining >= request_cost:
-        reason = "refused per request with credit left" if confirm.request_size else "refused with credit left"
-        return result(INCONCLUSIVE, reason, **evidence)
-    overdraw = max(0.0, -remaining)
-    if overdraw <= overdraw_bound:
-        return result(PASS, f"the provider stopped at its balance; overdraw ${overdraw:.4f}", overdraw=overdraw,
+    requests, settled = _settle_all(deps.settle, deps.requests, deps.sleep, attempt, SETTLE_LIMIT_SECONDS)
+    evidence = {"confirmation": confirm.status,
+                "refusals": [r.body for r in replies if r.status in (402, 429) and not r.from_proxy][:5]}
+    if not settled:
+        return result(INCONCLUSIVE, "requests still unresolved: the final spend isn't known", **evidence)
+    if not confirm.insufficient_balance:
+        return result(INCONCLUSIVE, "the refusal didn't hold: the confirmation was not refused for balance",
                       **evidence)
-    return result(FAIL, f"overdraw ${overdraw:.4f} exceeds the reserved ${overdraw_bound:.4f}", overdraw=overdraw,
-                  **evidence)
+    readings: list = []
+    final = _quiet(deps.remaining, deps.now, deps.sleep, readings)
+    evidence["remaining_readings"] = readings
+    if final is None:
+        return result(INCONCLUSIVE, "the account's balance never held still after the run", **evidence)
+    charges = [r.billed for r in requests if r.state == "billed" and r.billed]
+    smallest = min(charges) if charges else 0.0
+    evidence.update(remaining=final, smallest_charge=smallest)
+    if final >= smallest:
+        reason = "refused with credit left for a request" + (" (a request-size refusal)" if confirm.request_size else "")
+        return result(INCONCLUSIVE, reason, **evidence)
+    overdraw = max(0.0, -final)
+    evidence["overdraw"] = overdraw
+    if overdraw <= overdraw_bound:
+        return result(PASS, f"the provider stopped at its balance; overdraw ${overdraw:.4f}", **evidence)
+    return result(FAIL, f"overdraw ${overdraw:.4f} exceeds the reserved ${overdraw_bound:.4f}", **evidence)
 
 
 # ---- records
@@ -400,46 +473,94 @@ def write(root: Path, result: Result, binding: Binding, status: str) -> Path:
     return path
 
 
+@dataclass(frozen=True)
+class Record:
+    path: Path
+    check: str
+    route: str
+    cli: str
+    attempt: str
+    status: str | None = None
+    verdict: str | None = None
+    binding: dict | None = None
+    evidence: dict | None = None
+    invalid: str | None = None  # why the file couldn't be read: it blocks reliance on any earlier attempt
+
+
+def _records(root: Path) -> list[Record]:
+    """Every record, named by its path; a file that can't be read or parsed is kept, as invalid."""
+    found = []
+    for path in sorted(root.glob("*/*.json")):
+        check, _, rest = path.stem.partition("-")
+        cli, _, attempt = rest.partition("-")
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            result, binding = record["result"], record["binding"]
+            if (result["check"], result["cli"], result["attempt"]) != (check, cli, attempt) or \
+                    not isinstance(binding, dict) or result["verdict"] not in (PASS, FAIL, INCONCLUSIVE, "running"):
+                raise ValueError("the record doesn't match its name")
+            found.append(Record(path, check, path.parent.name, cli, attempt, record["status"], result["verdict"],
+                                binding, result.get("evidence") or {}))
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            found.append(Record(path, check, path.parent.name, cli, attempt, invalid=f"{type(exc).__name__}: {exc}"))
+    return found
+
+
 def status(root: Path, bindings: list[Binding]) -> list[dict]:
     """For each B route and CLI as configured now (`bindings`), the latest attempt of each check and
     whether it still applies. A route's own checks apply only to exactly its current binding; an
-    exhaustion result applies to every route of the same provider account."""
-    records = []
-    for path in sorted(root.glob("*/*.json")):
-        try:
-            record = json.loads(path.read_text(encoding="utf-8"))
-            records.append((record["result"], record["binding"], record["status"]))
-        except (OSError, ValueError, KeyError, TypeError):
-            continue
+    exhaustion result applies to every route of the same provider account. A damaged latest record
+    reads as invalid, never falling back to an earlier attempt."""
+    records = _records(root)
     rows = []
     for binding in bindings:
         now = asdict(binding)
-        for check in ("cache", "served", "metering", "exhaustion"):
-            mine = [(r, b, st) for r, b, st in records if r["check"] == check
-                    and (_same_account(b, now) if check == "exhaustion" else (r["route"], r["cli"]) == (binding.route, binding.cli))]
+        for check in CHECKS:
+            if check == "exhaustion":
+                mine = [r for r in records if r.check == check and (r.invalid or _same_account(r.binding, now))]
+            else:
+                mine = [r for r in records if r.check == check and (r.route, r.cli) == (binding.route, binding.cli)]
             if not mine:
                 rows.append({"route": binding.route, "cli": binding.cli, "check": check, "verdict": None})
                 continue
-            result, recorded, state = max(mine, key=lambda m: m[0]["attempt"])
-            current = check == "exhaustion" or recorded == now
-            rows.append({"route": binding.route, "cli": binding.cli, "check": check, "attempt": result["attempt"],
-                         "status": state, "verdict": result["verdict"], "stale": not current})
+            latest = max(mine, key=lambda r: r.attempt)
+            row = {"route": binding.route, "cli": binding.cli, "check": check, "attempt": latest.attempt}
+            if latest.invalid:
+                rows.append({**row, "verdict": "invalid", "reason": latest.invalid, "stale": True})
+                continue
+            current = check == "exhaustion" or latest.binding == now
+            rows.append({**row, "status": latest.status, "verdict": latest.verdict, "stale": not current})
     return rows
 
 
-def _same_account(recorded: dict, now: dict) -> bool:
+def _same_account(recorded: dict | None, now: dict) -> bool:
     """Exhaustion is the account's: it holds across keys and routes of the same named provider account."""
-    return (recorded.get("account") is not None and recorded["account"] == now["account"]
+    return (recorded is not None and recorded.get("account") is not None and recorded["account"] == now["account"]
             and recorded["route"].split("--", 1)[0] == now["route"].split("--", 1)[0])
 
 
+def purchases(funding, fees, taxes) -> dict:
+    """An exhaustion run's purchases, checked: written before any spend, so an interrupted run still counts."""
+    amounts = {"funding": funding, "fees": fees, "taxes": taxes}
+    for name, value in amounts.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise Refused(f"{name} must be a non-negative amount, not {value!r}")
+    if funding <= 0:
+        raise Refused("an exhaustion run needs the account's funding")
+    return amounts
+
+
 def budget(root: Path, total: float = 150.0) -> float:
-    """What is left of the total for B's envelope after the exhaustion runs' purchases, fees and taxes."""
+    """What is left of the total for B's envelope after the exhaustion runs' purchases, fees and taxes.
+    Every exhaustion record counts, running or done; one without its purchases refuses the sum."""
     spent = 0.0
-    for path in root.glob("*/exhaustion-*.json"):
-        record = json.loads(path.read_text(encoding="utf-8"))
-        evidence = record["result"]["evidence"]
-        spent += sum(float(evidence.get(k, 0.0)) for k in ("funding", "fees", "taxes"))
-    if not math.isfinite(spent) or spent < 0:
-        raise ValueError(f"exhaustion spend {spent!r} is not a sum of charges")
+    for record in _records(root):
+        if record.check != "exhaustion":
+            continue
+        if record.invalid:
+            raise Refused(f"{record.path} can't be read ({record.invalid}): the budget can't be summed")
+        try:
+            spent += sum(purchases(*(record.evidence[k] for k in ("funding", "fees", "taxes"))).values())
+        except (KeyError, Refused) as exc:
+            raise Refused(f"{record.path} has no valid purchases ({exc}): the budget can't be summed") from None
     return total - spent
