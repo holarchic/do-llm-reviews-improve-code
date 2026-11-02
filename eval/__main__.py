@@ -18,6 +18,7 @@ COMMANDS = {
     "rounds": "score each code-review round of a replay experiment's reviewed builds; apply the round rule",
     "cost": "price every recorded step of the experiment at the dated list prices (descriptive)",
     "spend": "a spend envelope: create, fund, scope, route, validate-route, status, resolve",
+    "admit": "route admission checks: cache, metering, exhaustion (paid); status, budget",
 }
 EXPERIMENT_COMMANDS = ("probe", "calibrate", "freeze", "run", "judge", "report", "rounds", "cost")
 
@@ -39,8 +40,9 @@ def main(argv: list[str]) -> int:
     parsers["judge"].add_argument("--pair", nargs=2, metavar="ARM", help="with --task: judge two arms' builds")
     parsers["rounds"].add_argument("--arm", required=True, help="a reviewed arm of the experiment")
     parsers["cost"].add_argument("--arm", action="append", help="one of the experiment's arms, repeatable (default: all)")
-    from .harness import spend_commands
+    from .harness import admit_commands, spend_commands
     spend_commands.add_arguments(parsers["spend"])
+    admit_commands.add_arguments(parsers["admit"])
     parsers["validate"].add_argument("--task", action="append", help="validate only this task, repeatable "
                                      "(default: every task no manifest freezes; a frozen task is refused)")
     args = parser.parse_args(argv)
@@ -113,6 +115,9 @@ def _run(args) -> int:
     from .harness import pilot, tasks
 
     experiment = args.experiment
+    if not experiment.tasks:
+        print(f"run: {experiment.name} has no tasks: it is never scheduled", file=sys.stderr)
+        return 2
     if not args.task:
         if args.arm is not None and args.arm not in experiment.arm_names:
             print(f"run: --arm must be one of {', '.join(experiment.arm_names)}", file=sys.stderr)
@@ -275,6 +280,11 @@ def _cost(args) -> int:
     return 0
 
 
+def _admit(args) -> int:
+    from .harness import admit_commands
+    return admit_commands.run(args, lambda text, error=False: print(text, file=sys.stderr if error else sys.stdout))
+
+
 def _spend(args) -> int:
     from .harness import spend_commands
 
@@ -283,7 +293,7 @@ def _spend(args) -> int:
 
 HANDLERS = {"validate": _validate, "probe": _probe, "calibrate": _calibrate, "freeze": _freeze, "run": _run,
             "judge": _judge, "report": _report, "rounds": _rounds, "cost": _cost,
-            "spend": _spend}
+            "spend": _spend, "admit": _admit}
 
 
 if __name__ == "__main__":

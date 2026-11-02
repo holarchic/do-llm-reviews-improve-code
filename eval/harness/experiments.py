@@ -18,7 +18,7 @@ Sonnet↔Terra, Haiku↔Luna.
 
 from dataclasses import dataclass
 
-from .agents import OPENROUTER, Agent
+from .agents import DEEPSEEK, OPENROUTER, Agent
 from .loop import Arm
 
 HAIKU = Agent("claude", "claude-haiku-5-5")
@@ -179,6 +179,29 @@ REPLAY = Experiment(
     offline=True,
 )
 
+# B's candidate routes, as A3b admits them: every route under Claude Code (a writer) and Codex (a
+# reviewer). Never scheduled, frozen or scored (no tasks): its probes and the admission checks run on it.
+_ADMISSION_MODELS = ((OPENROUTER, "z-ai/glm-5.3"), (OPENROUTER, "z-ai/glm-5.3-flash"),
+                     (DEEPSEEK, "deepseek-v4-pro"), (DEEPSEEK, "deepseek-flash"))
+ADMISSION = Experiment(
+    name="admission",
+    title="Route admission (A3b)",
+    arms=(Arm("R0", Agent("claude", *reversed(_ADMISSION_MODELS[0]))),)  # the registry's reviewer-less baseline
+    + tuple(Arm(f"R{i}", Agent("claude", model, provider), Agent("codex", model, provider))
+            for i, (provider, model) in enumerate(_ADMISSION_MODELS, 1)),
+    baseline="R0",
+    replicate=None,
+    followup_arms=(),
+    pairs=(),
+    seed=20261106,
+    data_dir="admission",
+    prereg="prereg/admission.md",  # none exists: nothing here is scored
+    decision_rule=None,
+    tasks=(),
+    envelope="B",
+    offline=True,
+)
+
 EXPERIMENTS = {experiment.name: experiment for experiment in (
     PILOT,
     PILOT2,
@@ -188,4 +211,5 @@ EXPERIMENTS = {experiment.name: experiment for experiment in (
     reverse("reverse-sonnet", TERRA, SONNET, seed=20261103),
     reverse("reverse-opus", SOL, OPUS, seed=20261104),
     ablation("ablation-sonnet", SONNET, TERRA, seed=20261105),
+    ADMISSION,
 )}

@@ -344,6 +344,23 @@ def from_upstream(upstream: Upstream, fingerprint: str) -> Settler:
     return DeepSeekSettler(upstream.base_url, key, price)
 
 
+def remaining_credit(provider: str, key: str) -> float:
+    """The account's credit left (negative once overdrawn): OpenRouter's `/credits`, DeepSeek's balance."""
+    if provider == "deepseek":
+        return -DeepSeekSettler(providers.get(provider).upstream, key).key_usage()
+    try:
+        data = _get_json(providers.get(provider).upstream + "/v1/credits", key)["data"]
+        total, used = data["total_credits"], data["total_usage"]
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        raise UsageUnavailable(f"credits lookup answered {exc.code}") from None
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise UsageUnavailable(f"credits lookup failed: {type(exc).__name__}") from None
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in (total, used)):
+        raise UsageUnavailable(f"credits are {total!r} and {used!r}")
+    return float(total) - float(used)
+
+
 def opening_usage(provider: str, key: str) -> float:
     """A scope's opening usage reading, through the provider's own settler."""
     if provider == "openrouter":

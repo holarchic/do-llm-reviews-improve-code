@@ -36,6 +36,7 @@ class FakeDeepSeek:
     def __init__(self, funded=10.0):
         self.funded, self.charges, self.rate, self.hidden, self.lag = funded, [], 1.0, 0, 0
         self.cached_share, self.output, self.cut, self.events_override = 0.5, 1000, None, None
+        self.refuse_at_zero = False  # refuse (402, JSON, before generating) once the balance is spent
         self._lock = threading.Lock()
         fake = self
 
@@ -60,6 +61,14 @@ class FakeDeepSeek:
                 if prompt > CONTEXT:
                     self.send_response(400)
                     self.end_headers()
+                    return
+                if fake.refuse_at_zero and fake.funded - fake.billed <= 0:
+                    data = json.dumps({"error": {"message": "Insufficient Balance", "type": "invalid_request_error"}}).encode()
+                    self.send_response(402)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
                     return
                 cached = int(prompt * fake.cached_share)
                 output = min(fake.output, MAX_OUT)

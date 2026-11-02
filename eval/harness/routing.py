@@ -65,6 +65,15 @@ def session_base(provider: str, model: str, attempt: str) -> str:
     return current.session(job_id, attempt)[route]
 
 
+def active_proxy():
+    """The proxy routed sessions go through now; raises outside a routing context."""
+    with _active_lock:
+        current = _active
+    if current is None:
+        raise RoutingRequired("no routing context is active")
+    return current
+
+
 def answered(attempt: str) -> int | None:
     """How many of an attempt's requests the active envelope's proxy admitted and the model answered;
     None with no routing context."""
