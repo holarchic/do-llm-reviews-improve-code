@@ -36,7 +36,7 @@ def add_arguments(parser) -> None:
                  "--max-charge", "--bootstrap", "--billed"):
         parser.add_argument(flag, type=float)
     for flag in ("--scope", "--provider", "--route", "--policy", "--upstream-base", "--settler", "--upstream-model",
-                 "--request"):
+                 "--request", "--account"):
         parser.add_argument(flag)
     parser.add_argument("--slots", type=int)
     parser.add_argument("--not-billed", action="store_true")
@@ -127,7 +127,8 @@ def _apply(env: envelope.Envelope, args, command) -> None:
         key = providers.api_key(args.provider)
         opening = settlers.opening_usage(args.provider, key)
         env.register_scope(args.scope, provider=args.provider, fingerprint=envelope.fingerprint(key),
-                           opening_usage=opening, allocation=args.allocation, provider_limit=args.provider_limit)
+                           opening_usage=opening, allocation=args.allocation, provider_limit=args.provider_limit,
+                           account=args.account)
     elif action == "allocate":
         env.raise_allocation(args.scope, args.allocation)
     elif action == "route":

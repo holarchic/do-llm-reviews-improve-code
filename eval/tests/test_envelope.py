@@ -399,6 +399,10 @@ class MeteredCommandTest(SpendCommandTest):
         self.assertEqual(self.spend("scope", "--envelope", "B", "--scope", "x", "--provider", "fireworks",
                                     "--allocation", "1"), 2)
         with self.owned() as env:
+            env.register_scope("ds2", provider="deepseek", fingerprint="fp-2", opening_usage=-1.0, allocation=0.0,
+                               provider_limit=None, account="deepseek-main")
+        self.assertEqual(envelope.load(self.root / "B.json")["scopes"]["ds2"]["account"], "deepseek-main")
+        with self.owned() as env:
             env.reconcile("ds", -11.0)  # a top-up
         self.assertEqual(self.spend("clear-fault", "--envelope", "B"), 2)
         self.assertEqual(self.spend("clear-fault", "--envelope", "B", "--scope", "ds"), 0)

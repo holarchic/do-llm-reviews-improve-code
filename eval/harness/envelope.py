@@ -175,7 +175,9 @@ class Envelope:
         self._transition(change)
 
     def register_scope(self, scope: str, *, provider: str, fingerprint: str, opening_usage: float,
-                       allocation: float, provider_limit: float | None) -> None:
+                       allocation: float, provider_limit: float | None, account: str | None = None) -> None:
+        """`account` names the provider account the key belongs to (the operator's label): account-level
+        evidence, like an exhaustion run, carries over between keys of the same account."""
         if not (_reading(opening_usage) and _money(allocation)) or not fingerprint:
             raise Refused("a scope needs a fingerprint, an opening usage and an allocation")
         registry = open(self.path.parent / "registry.lock", "a")
@@ -194,7 +196,7 @@ class Envelope:
                     raise Refused("that key already has a scope in this envelope")
                 s["scopes"][scope] = {"provider": provider, "fingerprint": fingerprint, "opening_usage": opening_usage,
                                       "allocation": allocation, "provider_limit": provider_limit,
-                                      "snapshot": None, "excess": 0.0, "fault": None}
+                                      "snapshot": None, "excess": 0.0, "fault": None, "account": account}
                 _require_allocations(s)
             self._transition(change)
         finally:
@@ -320,7 +322,8 @@ class Envelope:
                                           "attempt": attempt, "state": "unresolved", "billed": None,
                                           "billing_id": None, "ambiguous": False, "captured": False,
                                           "metered": None, "metered_invalid": None, "protocol_complete": False,
-                                          "served": [],
+                                          "served": [], "metered_tokens": None, "billed_tokens": None,
+                                          "refused_by_provider": None,
                                           "upstream": copy.deepcopy(r["upstream"]), "admitted_at": self._now()}
                 try:
                     _require_reservations_fit(s)  # the request must not eat into another job's hold
@@ -347,7 +350,7 @@ class Envelope:
         self._transition(change)
 
     def record_reading(self, request: str, *, metered: float | None = None, invalid: str | None = None,
-                       served: str | None = None, complete: bool = False) -> None:
+                       served: str | None = None, complete: bool = False, tokens: dict | None = None) -> None:
         """What one response event said: a priced usage figure (a second, different one makes the usage
         unusable), an unusable usage block (sticky), the model that served it, the protocol's end."""
         if metered is not None and not _money(metered):
@@ -359,7 +362,7 @@ class Envelope:
                 entry["metered_invalid"] = invalid
             if metered is not None:
                 if entry["metered"] is None:
-                    entry["metered"] = metered
+                    entry["metered"], entry["metered_tokens"] = metered, copy.deepcopy(tokens)
                 elif abs(entry["metered"] - metered) > _EPSILON and entry["metered_invalid"] is None:
                     entry["metered_invalid"] = "two different usage figures"
             if served is not None and served not in entry["served"]:
@@ -375,7 +378,7 @@ class Envelope:
         self._transition(change)
 
     def settle_looked_up(self, request: str, billing_id: str, billed: float | None,
-                         served: str | None = None) -> bool:
+                         served: str | None = None, tokens: dict | None = None) -> bool:
         """An automatic settlement: committed only if the request is still unresolved, its capture has
         ended, and `billing_id` is still its one unambiguous id. False (and nothing changed) otherwise."""
         def change(s):
@@ -385,10 +388,29 @@ class Envelope:
                 return False
             if served is not None and served not in entry["served"]:
                 entry["served"].append(served)
+            entry["billed_tokens"] = copy.deepcopy(tokens)
             return _settle(s, entry, billed)
         if billed is not None and not _money(billed):
             raise Refused(f"billed {billed!r} is not a charge")
         return self._transition(change)
+
+    def settle_refused(self, request: str, evidence: dict) -> bool:
+        """The provider refused it before generating (a payment or rate refusal with no billing id): not
+        billed, keeping the refusal as evidence. Never applies to a request with a billing id."""
+        def change(s):
+            entry = s["requests"].get(request)
+            if (entry is None or entry["state"] != "unresolved" or not entry["captured"] or entry["ambiguous"]
+                    or entry["billing_id"] is not None or entry["metered"] is not None):
+                return False
+            entry["refused_by_provider"] = copy.deepcopy(evidence)
+            return _settle(s, entry, None)
+        return self._transition(change)
+
+    def requests_of(self, attempt: str) -> list[dict]:
+        """An attempt's requests, as recorded (copies): the admission checks' evidence."""
+        with self._mutex:
+            return [{"request": rid, **copy.deepcopy(r)} for rid, r in self._state["requests"].items()
+                    if r["attempt"] == attempt]
 
     def settle(self, request: str, billed: float | None) -> bool:
         """The operator's resolution, after checking the provider's billing (None: not billed).
@@ -523,7 +545,8 @@ def _check(s: dict) -> None:
         for name, scope in s["scopes"].items():
             ensure(_money(scope["allocation"]) and _reading(scope["opening_usage"]) and _money(scope["excess"])
                    and isinstance(scope["fingerprint"], str) and scope["fingerprint"]
-                   and (scope["fault"] is None or isinstance(scope["fault"], str)), f"scope {name}")
+                   and (scope["fault"] is None or isinstance(scope["fault"], str))
+                   and (scope["account"] is None or isinstance(scope["account"], str)), f"scope {name}")
             snap = scope["snapshot"]
             ensure(snap is None or (_reading(snap["usage"]) and _money(snap["at"])), f"scope {name} snapshot")
         for name, route in s["routes"].items():
@@ -544,7 +567,9 @@ def _check(s: dict) -> None:
                    and (r["metered"] is None or _money(r["metered"]))
                    and (r["metered_invalid"] is None or isinstance(r["metered_invalid"], str))
                    and isinstance(r["protocol_complete"], bool)
-                   and isinstance(r["served"], list) and all(isinstance(v, str) for v in r["served"]),
+                   and isinstance(r["served"], list) and all(isinstance(v, str) for v in r["served"])
+                   and all(r[k] is None or isinstance(r[k], dict)
+                           for k in ("metered_tokens", "billed_tokens", "refused_by_provider")),
                    f"request {name}")
         ensure(all(_money(r["amount"]) and isinstance(r["open"], bool) and isinstance(r["terminated"], bool)
                    and _money(r["baseline"]) for r in s["reservations"].values()), "reservations")

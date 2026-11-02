@@ -32,6 +32,7 @@ class FakeProvider:
         self.calls, self.billed, self.visible_lag, self.credentials = 0, {}, 0.0, []
         self.encodings, self.cut, self.events = [], False, None
         self.lookup = "billed"  # or "pending" | "error"
+        self.refuse = None  # (status, body bytes, content type): answer every request with it
         self._lock = threading.Lock()
         provider = self
 
@@ -39,6 +40,14 @@ class FakeProvider:
             def do_POST(self):
                 body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
                 request = json.loads(body)
+                if provider.refuse is not None:
+                    status, payload, kind = provider.refuse
+                    self.send_response(status)
+                    self.send_header("Content-Type", kind)
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 provider.credentials.append((self.headers.get_all("Authorization"), self.headers.get_all("x-api-key")))
                 tokens = len(body) + OVERHEAD
                 if tokens > CONTEXT:  # past the context window: refused, not billed
@@ -91,7 +100,8 @@ class FakeSettler(settlers.Settler):
             raise OSError("HTTP 404 from the billing lookup")
         if self.provider.lookup == "pending":
             return settlers.Pending("not yet")
-        return settlers.Billed(self.provider.billed[billing_id], getattr(self, "served", None))
+        return settlers.Billed(self.provider.billed[billing_id], getattr(self, "served", None),
+                               getattr(self, "tokens", None))
 
     def key_usage(self):
         return self.opening + max(0.0, self.provider.usage - self.provider.visible_lag)
@@ -163,12 +173,19 @@ class ForwardingTest(Fixture):
         served.settle_now()
         self.assertAlmostEqual(envelope.summary(self.env.state, 0)["settled"], self.provider.billed["gen-1"])
 
+    def test_the_billing_id_includes_a_messages_errors_top_level_request_id(self):
+        get = settlers.OpenRouterSettler("x", "k").billing_id
+        self.assertEqual(get({"type": "error", "error": {"type": "overloaded_error"}, "request_id": "gen-77"}), "gen-77")
+        self.assertIsNone(get({"type": "error", "error": {}, "request_id": None}))
+        self.assertIsNone(get({"type": "message_delta", "request_id": "gen-1"}))  # only on an error envelope
+
     def test_the_provider_that_served_a_billed_request_is_recorded(self):
         served = self.start()
         self.post(served.session("job", "a1")["r"])
-        self.settler.served = "Z.AI"
+        self.settler.served, self.settler.tokens = "Z.AI", {"prompt": 10, "completion": 2, "cached": 4}
         served.settle_now()
         self.assertEqual(self.requests()[0]["served"], ["Z.AI"])
+        self.assertEqual(self.requests()[0]["billed_tokens"], {"prompt": 10, "completion": 2, "cached": 4})
         self.assertEqual(envelope.summary(self.env.state, 0)["served"], {"r": ["Z.AI"]})
 
     def test_the_billing_id_is_read_at_fixed_paths_and_two_ids_make_it_ambiguous(self):
@@ -347,6 +364,61 @@ class StartupTest(Fixture):
         port = served.port
         with self.assertRaises(OSError):
             http.client.HTTPConnection("127.0.0.1", port, timeout=2).connect()
+
+
+class RefusalTest(Fixture):
+    """A provider's refusal before generating frees its slot; anything that may have been billed doesn't."""
+
+    def refuse(self, status, body, kind="application/json"):
+        self.provider.refuse = (status, body if isinstance(body, bytes) else json.dumps(body).encode(), kind)
+
+    def test_a_json_payment_or_rate_refusal_settles_as_not_billed_with_its_evidence(self):
+        served = self.start()
+        for status in (402, 429):
+            self.refuse(status, {"error": {"code": status, "message": "Insufficient credits", "metadata": {"x": 1}}})
+            self.assertEqual(self.post(served.session("job", f"a{status}")["r"])[0], status)
+        for request in self.requests():
+            self.assertEqual((request["state"], request["billed"]), ("not_billed", 0.0))
+            self.assertIn("Insufficient credits", request["refused_by_provider"]["error"])
+        self.assertEqual(sorted(r["refused_by_provider"]["status"] for r in self.requests()), [402, 429])
+
+    def test_a_refusal_carrying_openrouters_generation_id_is_looked_up_not_freed(self):
+        self.provider.lookup = "pending"
+        served = self.start()
+        self.refuse(429, {"type": "error", "error": {"type": "rate_limit_error", "message": "slow"}, "request_id": "gen-9"})
+        self.post(served.session("job", "a1")["r"])
+        served.settle_now()
+        (request,) = self.requests()
+        self.assertEqual((request["billing_id"], request["state"], request["refused_by_provider"]),
+                         ("gen-9", "unresolved", None))
+        served.__exit__(None, None, None)
+        self.close_owner()
+        self.owned = Envelope.owned("B", root=self.root)
+        self.env = self.owned.__enter__()
+        self.env.reconcile("or", 7.0)
+        self.provider.lookup = "billed"
+        self.provider.billed["gen-9"] = 0.002
+        served = self.start()
+        served.settle_now()
+        self.assertEqual((self.requests()[0]["state"], self.requests()[0]["billed"]), ("billed", 0.002))
+
+    def test_a_null_request_id_takes_the_refusal_path(self):
+        served = self.start()
+        self.refuse(429, {"type": "error", "error": {"type": "rate_limit_error"}, "request_id": None})
+        self.post(served.session("job", "a1")["r"])
+        self.assertEqual(self.requests()[0]["state"], "not_billed")
+
+    def test_other_failures_stay_unresolved(self):
+        self.set_route(max_charge=1.0, slots=4)  # each case stays unresolved: give each its own slot
+        self.env.reconcile("or", 7.0)
+        served = self.start()
+        for name, (status, body, kind) in {"server error": (500, {"error": {"message": "down"}}, "application/json"),
+                                           "a 402 without JSON": (402, b"payment required", "text/plain"),
+                                           "a 402 without an error": (402, {"detail": "x"}, "application/json")}.items():
+            with self.subTest(name):
+                self.refuse(status, body, kind)
+                self.post(served.session("job", name)["r"])
+        self.assertEqual([r["state"] for r in self.requests()], ["unresolved"] * 3)  # all three reached it
 
 
 class AdmissionTest(Fixture):
@@ -559,6 +631,10 @@ class OpenRouterSettlerTest(unittest.TestCase):
         self.responses["/api/v1/generation?id=gen-5"] = (200, {"data": {"total_cost": 0.5, "provider_name": "Z.AI"}})
         self.assertEqual(self.settler.settle(pending("gen-1")), settlers.Billed(0.0123))  # served unknown, not guessed
         self.assertEqual(self.settler.settle(pending("gen-5")), settlers.Billed(0.5, "Z.AI"))
+        self.responses["/api/v1/generation?id=gen-6"] = (200, {"data": {
+            "total_cost": 0.1, "provider_name": "Z.AI", "native_tokens_prompt": 900, "native_tokens_completion": 50,
+            "native_tokens_cached": 600}})
+        self.assertEqual(self.settler.settle(pending("gen-6")).tokens, {"prompt": 900, "completion": 50, "cached": 600})
         for missing in ("gen-2", "gen-3", "gen-4"):
             self.assertIsInstance(self.settler.settle(pending(missing)), settlers.Pending)
 

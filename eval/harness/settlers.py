@@ -43,6 +43,7 @@ class NoSettler(Exception):
 class Billed:
     usd: float
     served: str | None = None  # who served it, when the provider says
+    tokens: dict | None = None  # the provider's own counts: {"prompt", "completion", "cached"}
 
     def __post_init__(self):
         if isinstance(self.usd, bool) or not isinstance(self.usd, (int, float)) or not 0 <= self.usd < float("inf"):
@@ -64,8 +65,9 @@ Outcome = Billed | NotBilled | Pending
 
 @dataclass(frozen=True)
 class Usage:
-    """A valid usage figure, priced."""
+    """A valid usage figure, priced, with the token counts it priced: {"fresh", "cached", "output"}."""
     usd: float
+    tokens: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -128,7 +130,12 @@ class OpenRouterSettler(Settler):
         self.api_base, self._key = api_base.rstrip("/"), key
 
     def billing_id(self, event: dict) -> str | None:
-        return _id_at_fixed_paths(event, self._GEN)
+        """Also a Messages error envelope's top-level `request_id`: a refusal OpenRouter may have billed."""
+        found = _id_at_fixed_paths(event, self._GEN)
+        if found is None and event.get("type") == "error":
+            candidate = event.get("request_id")
+            found = candidate if isinstance(candidate, str) and self._GEN.match(candidate) else None
+        return found
 
     def settle(self, pending: envelope.PendingSettlement) -> Outcome:
         try:
@@ -141,7 +148,7 @@ class OpenRouterSettler(Settler):
         cost = data.get("total_cost") if isinstance(data, dict) else None
         if isinstance(cost, (int, float)) and not isinstance(cost, bool) and 0 <= cost < float("inf"):
             served = data.get("provider_name")
-            return Billed(float(cost), served if isinstance(served, str) and served else None)
+            return Billed(float(cost), served if isinstance(served, str) and served else None, _native_counts(data))
         return Pending("no total_cost yet")
 
     def key_usage(self) -> float:
@@ -238,7 +245,8 @@ class DeepSeekSettler(Settler):
         if self.price is None:
             raise ValueError("no price for this route's model")
         r = self.price.rates
-        return Usage((fresh * r.input + cached * r.cache_read + output * r.output) / 1e6)
+        return Usage((fresh * r.input + cached * r.cache_read + output * r.output) / 1e6,
+                     {"fresh": fresh, "cached": cached, "output": output})
 
     def settle(self, pending: envelope.PendingSettlement) -> Outcome:
         """The metered figure, once the response is complete and its usage valid and unambiguous."""
@@ -249,6 +257,10 @@ class DeepSeekSettler(Settler):
         return Billed(pending.metered)
 
     def key_usage(self) -> float:
+        return self.balance_reading()[0]
+
+    def balance_reading(self) -> tuple[float, str]:
+        """The usage reading, −(USD balance), with the balance exactly as DeepSeek wrote it."""
         try:
             infos = _get_json(f"{self.api_base}/user/balance", self._key)["balance_infos"]
         except urllib.error.HTTPError as exc:
@@ -261,12 +273,21 @@ class DeepSeekSettler(Settler):
             raise UsageUnavailable("a non-USD balance can't be reconciled in dollars")
         if "USD" not in balances:
             raise UsageUnavailable("no USD balance")
-        return -balances["USD"]
+        raw = next(str(info["total_balance"]) for info in infos if info.get("currency") == "USD")
+        return -balances["USD"], raw
 
 
 def _model(node) -> str | None:
     model = node.get("model") if isinstance(node, dict) else None
     return model if isinstance(model, str) and model else None
+
+
+def _native_counts(data: dict) -> dict | None:
+    """OpenRouter's own token counts for a generation, when all three are present and sane."""
+    counts = {"prompt": data.get("native_tokens_prompt"), "completion": data.get("native_tokens_completion"),
+              "cached": data.get("native_tokens_cached") if data.get("native_tokens_cached") is not None else 0}
+    ok = all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in counts.values())
+    return counts if ok and counts["cached"] <= counts["prompt"] else None
 
 
 def _balances(infos) -> dict[str, float]:

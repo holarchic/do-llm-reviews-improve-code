@@ -265,6 +265,8 @@ class MeteredSettlementTest(Fixture):
         served = self.start()
         served.settle_now()
         states = {r["attempt"]: (r["state"], r["protocol_complete"], r["metered"] is not None) for r in self.requests()}
+        whole = next(r for r in self.requests() if r["attempt"] == "whole")
+        self.assertEqual(set(whole["metered_tokens"]), {"fresh", "cached", "output"})  # the breakdown survives
         self.assertEqual(states, {"cut": ("unresolved", False, True), "whole": ("billed", True, True)})
 
 
@@ -395,7 +397,7 @@ class EventReadingTest(unittest.TestCase):
 
 
 class BalanceReadingTest(unittest.TestCase):
-    def reading(self, payload):
+    def reading(self, payload, raw=False):
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 data = json.dumps(payload).encode()
@@ -411,10 +413,13 @@ class BalanceReadingTest(unittest.TestCase):
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
-        return settlers.DeepSeekSettler(f"http://127.0.0.1:{server.server_address[1]}", KEY).key_usage()
+        settler = settlers.DeepSeekSettler(f"http://127.0.0.1:{server.server_address[1]}", KEY)
+        return settler.balance_reading() if raw else settler.key_usage()
 
     def test_the_usd_balance_is_read_negated_and_anything_else_is_unavailable(self):
         self.assertEqual(self.reading({"balance_infos": [{"currency": "USD", "total_balance": "4.25"}]}), -4.25)
+        self.assertEqual(self.reading({"balance_infos": [{"currency": "USD", "total_balance": "4.250"}]}, raw=True),
+                         (-4.25, "4.250"))  # the raw string keeps its precision
         self.assertEqual(self.reading({"balance_infos": [{"currency": "USD", "total_balance": "1.00"},
                                                          {"currency": "CNY", "total_balance": "0.00"}]}), -1.0)
         for bad in ({"balance_infos": [{"currency": "CNY", "total_balance": "3.00"}]},

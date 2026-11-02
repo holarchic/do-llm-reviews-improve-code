@@ -19,7 +19,8 @@ job and attempt it belongs to. For each request, in order:
 
 Shutdown refuses new requests, drains the handlers in flight and the settlement and
 reconciliation workers, and only then lets the envelope's owner close; anything a straggler tries
-to write after that is refused by the closed envelope. Headers and bodies are never logged.
+to write after that is refused by the closed envelope. Headers and bodies are never logged; a
+provider's refusal keeps only its status and error object as evidence.
 """
 
 import http.client
@@ -43,6 +44,9 @@ _JSON_LIMIT = 16 * 1024 * 1024
 _HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer",
                "transfer-encoding", "upgrade", "host", "content-length", "accept-encoding"}
 _CREDENTIAL_HEADERS = {"authorization", "x-api-key"}
+# A provider refusing before any generation: payment or rate refusals.
+_REFUSALS = {402, 429}
+_ERROR_EVIDENCE_LIMIT = 4096
 
 
 @dataclass
@@ -156,7 +160,8 @@ class Proxy:
             outcome = settler.settle(pending)
             # Committed only if the request still has exactly this id: the envelope checks it atomically.
             if isinstance(outcome, settlers_mod.Billed):
-                self.env.settle_looked_up(pending.request, pending.billing_id, outcome.usd, served=outcome.served)
+                self.env.settle_looked_up(pending.request, pending.billing_id, outcome.usd, served=outcome.served,
+                                          tokens=outcome.tokens)
             elif isinstance(outcome, settlers_mod.NotBilled):
                 self.env.settle_looked_up(pending.request, pending.billing_id, None)
 
@@ -266,6 +271,7 @@ class Proxy:
         connection = connection_type(target.netloc, timeout=600)
         reader = _BillingReader(settler, lambda gen: self.env.record_billing_id(request_id, gen),
                                 lambda reading: self.env.record_reading(request_id, **_fields(reading)))
+        refusal = None
         try:
             sent = {k.lower() for k in handler.headers.keys()}
             headers = {k: v for k, v in handler.headers.items()
@@ -294,11 +300,16 @@ class Proxy:
                 handler.wfile.flush()
                 reader.feed(chunk)
             reader.finish()
+            if response.status in _REFUSALS:
+                refusal = _refusal_evidence(response.status, reader.json_body())
         except (OSError, http.client.HTTPException):
             pass  # an error mid-stream keeps the request unresolved: it may still be billed
         finally:
             connection.close()
             self.env.capture_complete(request_id)  # only now may settlement look its billing id up
+        if refusal is not None:
+            # Refused before any generation; with a billing id it is looked up like any other instead.
+            self.env.settle_refused(request_id, refusal)
 
 
 class _BillingReader:
@@ -321,6 +332,16 @@ class _BillingReader:
             if line.startswith(b"data:"):
                 self._event(line[5:].strip())
 
+    def json_body(self) -> dict | None:
+        """The whole JSON body, when the response was one (not a stream) and fit the limit."""
+        if not self._body or len(self._body) >= _JSON_LIMIT:
+            return None
+        try:
+            body = json.loads(self._body)
+        except ValueError:
+            return None
+        return body if isinstance(body, dict) else None
+
     def finish(self) -> None:
         if self._body:
             self._event(self._body)
@@ -342,9 +363,18 @@ class _BillingReader:
                 self.report_reading(reading)
 
 
+def _refusal_evidence(status: int, body: dict | None) -> dict | None:
+    """A complete JSON error body: its status and error object, trimmed; anything else proves nothing."""
+    if body is None or not isinstance(body.get("error"), (dict, str)):
+        return None
+    error = json.dumps(body["error"], sort_keys=True)
+    return {"status": status, "error": error if len(error) <= _ERROR_EVIDENCE_LIMIT else error[:_ERROR_EVIDENCE_LIMIT]}
+
+
 def _fields(reading: settlers_mod.EventReading) -> dict:
     metered = reading.metered
-    return {"metered": metered.usd if isinstance(metered, settlers_mod.Usage) else None,
+    usage = metered if isinstance(metered, settlers_mod.Usage) else None
+    return {"metered": usage.usd if usage else None, "tokens": usage.tokens if usage else None,
             "invalid": metered.reason if isinstance(metered, settlers_mod.Invalid) else None,
             "served": reading.served, "complete": reading.complete}
 
