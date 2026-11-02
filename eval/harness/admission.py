@@ -20,6 +20,7 @@ drive them.
 
 import json
 import math
+import os
 import secrets
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -89,7 +90,8 @@ class Refused(Exception):
 
 
 class Stopped(Exception):
-    """The check stopped after spending began (a session's files held a key): its record stays running."""
+    """The check stopped after spending may have begun (a provider or ledger failure, or a session's
+    files holding a key): its record stays `running`, its purchases counted."""
 
 
 # ---- the peak window
@@ -495,11 +497,22 @@ def write(root: Path, result: Result, binding: Binding, status: str) -> Path:
     """An attempt's record: `running` before any spend, its verdict at the end; never overwritten
     by another attempt."""
     path = record_path(root, result)
+    created = not path.parent.exists()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.partial")
-    tmp.write_text(json.dumps({"status": status, "result": asdict(result), "binding": asdict(binding)}, indent=1,
-                              sort_keys=True, default=str), encoding="utf-8")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps({"status": status, "result": asdict(result), "binding": asdict(binding)}, indent=1,
+                                sort_keys=True, default=str))
+        handle.flush()
+        os.fsync(handle.fileno())
     tmp.replace(path)
+    # Durable before any spend: the rename, and a new route dir's own entry, survive a machine crash.
+    for directory in (path.parent, path.parent.parent) if created else (path.parent,):
+        descriptor = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
     return path
 
 

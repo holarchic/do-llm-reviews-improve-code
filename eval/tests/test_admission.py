@@ -593,6 +593,27 @@ class AdmitCommandTest(unittest.TestCase):
         result = json.loads(record.read_text())["result"]
         self.assertEqual(result["verdict"], PASS, result["reason"])
 
+    def test_a_record_that_cant_be_made_durable_stops_the_drain_before_any_spend(self):
+        fake = self.fake()
+        real = admission.write
+
+        def failing(root, result, binding, status):
+            if status == "running":
+                raise OSError("disk full")
+            return real(root, result, binding, status)
+        with mock.patch.object(admission, "write", failing), self.assertRaises(OSError):
+            self.admit("exhaustion", "--route", "deepseek--deepseek-flash", "--funding", "2", "--envelope", "X")
+        self.assertEqual(fake.charges, [])
+
+    def test_a_record_is_fsynced_with_its_directory(self):
+        root = self.root / "adm"
+        result = admission.Result("exhaustion", "deepseek--deepseek-flash", "any", "20261102T060000-aaaaaa", "running", "")
+        binding = admission.Binding("deepseek--deepseek-flash", "v", "f", "https://x/anthropic/v1/messages", "any", "?",
+                                    prices.TABLE_SHA256, "a")
+        with mock.patch.object(admission.os, "fsync", wraps=admission.os.fsync) as fsync:
+            admission.write(root, result, binding, "running")
+        self.assertGreaterEqual(fsync.call_count, 3)  # the file, its new directory and the root's entry for it
+
     def test_the_drain_refuses_outside_a_deepseek_peak_window_before_any_spend(self):
         fake = self.fake()
         self.clock[0] = at(7, 7)  # a Saturday

@@ -416,11 +416,6 @@ class Envelope:
             return _settle(s, entry, None)
         return self._transition(change)
 
-    def scope_label(self, scope: str) -> str | None:
-        """The provider account a scope's key belongs to, as the operator named it."""
-        with self._mutex:
-            return self._state["scopes"][scope]["account"]
-
     def scope_account(self, scope: str) -> ScopeAccount:
         with self._mutex:
             requests = [r for r in self._state["requests"].values() if r["scope"] == scope]
