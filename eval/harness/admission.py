@@ -26,6 +26,8 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
+from .envelope import ScopeAccount
+
 PASS, FAIL, INCONCLUSIVE = "pass", "fail", "inconclusive"
 CHECKS = ("cache", "served", "metering", "exhaustion")
 
@@ -47,6 +49,7 @@ CACHE_SAVING = (0.80, 1.05)  # the billed saving's share of the saving the route
 REASONING_CHARS_PER_TOKEN = 6  # conservative: Claude Code's transcript keeps thinking text, not its count
 SERVED = {"openrouter": "Z.AI"}  # a metered route's served value must be its own model
 RATE_LIMIT_BACKOFF = 30
+CONFIRM_PAUSE = 120  # before confirming: a transient refusal (spend still settling) has cleared by then
 
 
 @dataclass(frozen=True)
@@ -141,9 +144,25 @@ class Request:
 
 
 @dataclass(frozen=True)
+class SessionEvidence:
+    """What a check needs of one CLI session: how it ended, and the reasoning it evidenced (Codex's
+    reported reasoning tokens; Claude Code's thinking text, counted conservatively)."""
+    terminal: str
+    reason: str
+    reasoning_tokens: int
+
+
+@dataclass(frozen=True)
+class BalanceReading:
+    """A metered scope's usage reading (−balance) and the balance exactly as the provider wrote it."""
+    usage: float
+    raw: str
+
+
+@dataclass(frozen=True)
 class SessionDeps:
     """Run one CLI session into a dir; an attempt's requests by its key; one settlement round; sleep."""
-    session: Callable
+    session: Callable[[Path], SessionEvidence]
     requests: Callable[[str], list[Request]]
     settle: Callable[[], None]
     sleep: Callable[[float], None]
@@ -151,11 +170,9 @@ class SessionDeps:
 
 @dataclass(frozen=True)
 class MeteringDeps(SessionDeps):
-    """Also: the scope's reading and its raw balance string; whether the scope has unresolved requests;
-    the scope's usage since registration as the ledger accounts it (settled spend); the clock."""
-    balance: Callable[[], tuple[float, str]]
-    scope_unresolved: Callable[[], bool]
-    scope_accounted: Callable[[], tuple[float, float]]  # (opening usage, settled spend) of the scope
+    """Also: the scope's balance reading; the ledger's account of the scope; the clock."""
+    balance: Callable[[], BalanceReading]
+    scope: Callable[[], ScopeAccount]
     now: Callable[[], datetime]
 
 
@@ -163,6 +180,7 @@ class MeteringDeps(SessionDeps):
 class ExhaustionDeps:
     """Send n requests at once through the proxy; the account's remaining credit; an attempt's requests;
     one settlement round; the clock; whether the run may go on (the DeepSeek window, where it applies)."""
+    provider: str
     send: Callable[[int], list["Reply"]]
     remaining: Callable[[], float]
     requests: Callable[[str], list[Request]]
@@ -210,7 +228,7 @@ def cache_and_served(route: RouteRef, cli: str, price, attempt: str, attempt_dir
     return [_cache(route, cli, price, attempt, requests, base), _served(route, cli, attempt, requests, base)]
 
 
-def _incomplete(session, requests: list[Request]) -> str | None:
+def _incomplete(session: SessionEvidence, requests: list[Request]) -> str | None:
     if session.terminal != "completed":
         return f"the session did not complete: {session.reason}"
     if not requests:
@@ -285,45 +303,28 @@ def _quiet(reader, now, sleep, readings: list, key=lambda r: r):
     return last
 
 
-def reasoning_tokens(cli: str, session) -> int:
-    """Codex reports its reasoning tokens; Claude Code's transcript keeps the thinking text."""
-    if cli == "codex":
-        value = session.usage.get("reasoning_output_tokens") if isinstance(session.usage, dict) else None
-        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
-    chars = 0
-    try:
-        lines = session.transcript.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return 0
-    for line in lines:
-        try:
-            event = json.loads(line)
-        except ValueError:
-            continue
-        message = event.get("message") if isinstance(event, dict) else None
-        for block in (message.get("content") or []) if isinstance(message, dict) else []:
-            if isinstance(block, dict) and block.get("type") == "thinking" and isinstance(block.get("thinking"), str):
-                chars += len(block["thinking"])
-    return chars // REASONING_CHARS_PER_TOKEN
-
-
 def metering(route: RouteRef, cli: str, price, attempt: str, attempt_root: Path, deps: MeteringDeps) -> Result:
     """Refuses (nothing spent) outside a peak window or with earlier requests unresolved."""
     require_window(deps.now())
-    if deps.scope_unresolved():
+    account = deps.scope()
+    if account.unresolved:
         raise Refused("the scope has unresolved requests: their debits could land in this attempt's measure")
+    if any(not peak_window(datetime.fromtimestamp(t, timezone.utc)) for t in account.admitted_at):
+        raise Refused("the scope has requests admitted off-peak: they settled at peak prices above what DeepSeek "
+                      "billed, so no baseline can match; run metering first on a fresh scope, and keep every "
+                      "request before it in a peak window")
     readings: list = []
 
     def result(verdict, reason, **evidence):
         return Result("metering", route.name, cli, attempt, verdict, reason, {"balances": readings, **evidence})
 
-    opening = _quiet(deps.balance, deps.now, deps.sleep, readings, key=lambda r: r[1])
+    opening = _quiet(deps.balance, deps.now, deps.sleep, readings, key=lambda r: r.raw)
     if opening is None:
         return result(INCONCLUSIVE, "the balance never held still before the run: the account isn't isolated")
-    tol = tolerance(opening[1])
+    tol = tolerance(opening.raw)
     # Earlier billing is accounted for: the account's fall since the scope opened is what the ledger settled.
-    scope_opening, settled = deps.scope_accounted()
-    earlier_gap = (opening[0] - scope_opening) - settled
+    account = deps.scope()
+    earlier_gap = (opening.usage - account.opening_usage) - account.settled
     if abs(earlier_gap) > tol:
         return result(INCONCLUSIVE, f"earlier billing isn't accounted for (gap ${earlier_gap:.4f}): the baseline "
                       "can't be trusted", earlier_gap=earlier_gap, tolerance=tol)
@@ -348,7 +349,7 @@ def metering(route: RouteRef, cli: str, price, attempt: str, attempt_root: Path,
             if request.metered is not None:
                 metered += request.metered
                 cached_usd += (request.metered_tokens or {}).get("cached", 0) * rates.cache_read / 1e6
-        reasoning_usd += reasoning_tokens(cli, session) * rates.output / 1e6
+        reasoning_usd += session.reasoning_tokens * rates.output / 1e6
     requests = [r for key in keys for r in deps.requests(key)]
     outside = [r.id for r in requests if not peak_window(datetime.fromtimestamp(r.admitted_at, timezone.utc))]
     unresolved = [r.id for r in requests if r.state == "unresolved"]
@@ -358,10 +359,10 @@ def metering(route: RouteRef, cli: str, price, attempt: str, attempt_root: Path,
         return result(INCONCLUSIVE, f"requests admitted outside the peak window: {outside}", **evidence)
     if unresolved:
         return result(INCONCLUSIVE, f"unresolved requests: {unresolved}", **evidence)
-    closing = _quiet(deps.balance, deps.now, deps.sleep, readings, key=lambda r: r[1])
+    closing = _quiet(deps.balance, deps.now, deps.sleep, readings, key=lambda r: r.raw)
     if closing is None:
         return result(INCONCLUSIVE, "the balance was still moving 90 minutes after the run", **evidence)
-    fall = closing[0] - opening[0]  # a reading is −balance: it rises as the account is billed
+    fall = closing.usage - opening.usage  # a reading is −balance: it rises as the account is billed
     difference = fall - metered
     evidence.update(fall=fall, difference=difference)
     if abs(difference) <= tol:
@@ -393,39 +394,64 @@ class Reply:
         """OpenRouter refusing one request as too dear for what is left, while credit remains."""
         return "weight_exceeds_budget" in json.dumps(self.body or {})
 
-    @property
-    def insufficient_balance(self) -> bool:
-        """The one refusal that evidences an empty account: a 402 with a JSON error, not a request-size
-        refusal (DeepSeek: insufficient balance; OpenRouter: insufficient credits)."""
+    def insufficient_balance(self, provider: str) -> bool:
+        """The one refusal that evidences an empty account, by provider; anything else, or an unknown
+        attribution, counts for nothing. DeepSeek: a 402 with a JSON error (its only 402 is insufficient
+        balance). OpenRouter: a 402 whose `error.metadata.limit_source` is the account's credits, and not
+        a request-size refusal; key limits and in-flight budgets name other sources."""
         error = self.body.get("error") if isinstance(self.body, dict) else None
-        return (self.status == 402 and not self.from_proxy and isinstance(error, (dict, str))
-                and not self.request_size)
+        if self.status != 402 or self.from_proxy or not isinstance(error, (dict, str)):
+            return False
+        if provider == "deepseek":
+            return True
+        metadata = error.get("metadata") if isinstance(error, dict) else None
+        source = metadata.get("limit_source") if isinstance(metadata, dict) else None
+        return provider == "openrouter" and source == "openrouter_credits" and not self.request_size
 
 
 def exhaustion(route: RouteRef, attempt: str, *, funding: float, overdraw_bound: float, deps: ExhaustionDeps,
                max_requests: int, deadline: datetime, batch: int = 4) -> Result:
     """Drain the account through the proxy until the provider refuses for insufficient balance, then
-    confirm it with every request settled and the account's final balance read once it holds still."""
+    confirm it with every request settled and the account's final balance read once it holds still.
+    Refuses (nothing spent) when the account isn't funded to start with."""
+    opening = deps.remaining()
+    if opening <= 0:
+        raise Refused(f"the account holds ${opening:.4f}: nothing to drain, so nothing would be shown")
     replies: list[Reply] = []
+    empty = lambda reply: reply.insufficient_balance(deps.provider)  # noqa: E731
 
     def result(verdict, reason, **evidence):
         return Result("exhaustion", route.name, "any", attempt, verdict, reason,
-                      {"funding": funding, "overdraw_bound": overdraw_bound,
+                      {"funding": funding, "opening_remaining": opening, "overdraw_bound": overdraw_bound,
                        "statuses": [r.status for r in replies], **evidence})
 
-    while not any(r.insufficient_balance for r in replies):
+    def blocked(reserve: int) -> str | None:
+        """Why no further request may start: one guard before every send, the confirmation included."""
         now = deps.now()
-        if len(replies) >= max_requests or now >= deadline:
-            return result(INCONCLUSIVE, f"{len(replies)} requests without the provider refusing for balance")
+        if len(replies) + reserve > max_requests:
+            return f"the {max_requests}-request cap"
+        if now >= deadline:
+            return "the deadline"
         if not deps.may_continue(now):
-            return result(INCONCLUSIVE, "the run's window closed before the provider refused")
-        sent = deps.send(batch)
+            return "the run's window closing"
+        return None
+
+    while not any(empty(r) for r in replies):
+        reason = blocked(1 + 1)  # one request, and the confirmation's
+        if reason:
+            return result(INCONCLUSIVE, f"stopped by {reason} before the provider refused for balance")
+        sent = deps.send(min(batch, max_requests - len(replies) - 1))
         replies.extend(sent)
         if any(r.from_proxy for r in sent):
             return result(INCONCLUSIVE, "the envelope refused before the provider did")
         if any(r.rate_limited for r in sent):
             deps.sleep(RATE_LIMIT_BACKOFF)  # a rate limit says nothing of the balance: back off and go on
         _settle_all(deps.settle, deps.requests, deps.sleep, attempt, 600)  # free the slots for the next batch
+    _settle_all(deps.settle, deps.requests, deps.sleep, attempt, 600)
+    deps.sleep(CONFIRM_PAUSE)  # let a refusal that only reflects spend still settling clear
+    reason = blocked(1)
+    if reason:
+        return result(INCONCLUSIVE, f"no confirmation: stopped by {reason}")
     confirm = deps.send(1)[0]
     replies.append(confirm)
     requests, settled = _settle_all(deps.settle, deps.requests, deps.sleep, attempt, SETTLE_LIMIT_SECONDS)
@@ -433,20 +459,21 @@ def exhaustion(route: RouteRef, attempt: str, *, funding: float, overdraw_bound:
                 "refusals": [r.body for r in replies if r.status in (402, 429) and not r.from_proxy][:5]}
     if not settled:
         return result(INCONCLUSIVE, "requests still unresolved: the final spend isn't known", **evidence)
-    if not confirm.insufficient_balance:
+    if not empty(confirm):
         return result(INCONCLUSIVE, "the refusal didn't hold: the confirmation was not refused for balance",
                       **evidence)
+    charges = [r.billed for r in requests if r.state == "billed" and r.billed]
+    if not charges:
+        return result(INCONCLUSIVE, "no request of this attempt was billed: it drained nothing", **evidence)
     readings: list = []
     final = _quiet(deps.remaining, deps.now, deps.sleep, readings)
     evidence["remaining_readings"] = readings
     if final is None:
         return result(INCONCLUSIVE, "the account's balance never held still after the run", **evidence)
-    charges = [r.billed for r in requests if r.state == "billed" and r.billed]
-    smallest = min(charges) if charges else 0.0
-    evidence.update(remaining=final, smallest_charge=smallest)
+    smallest = min(charges)
+    evidence.update(remaining=final, smallest_charge=smallest, billed=sum(charges))
     if final >= smallest:
-        reason = "refused with credit left for a request" + (" (a request-size refusal)" if confirm.request_size else "")
-        return result(INCONCLUSIVE, reason, **evidence)
+        return result(INCONCLUSIVE, "refused with credit left for a request", **evidence)
     overdraw = max(0.0, -final)
     evidence["overdraw"] = overdraw
     if overdraw <= overdraw_bound:
@@ -487,20 +514,31 @@ class Record:
     invalid: str | None = None  # why the file couldn't be read: it blocks reliance on any earlier attempt
 
 
+_LEGAL = {"running": {"running"}, "done": {PASS, FAIL, INCONCLUSIVE}}
+
+
 def _records(root: Path) -> list[Record]:
-    """Every record, named by its path; a file that can't be read or parsed is kept, as invalid."""
+    """Every record, named by its path, parsed whole: a file that can't be read, or whose result,
+    binding, route, status and verdict don't agree, is kept as invalid evidence."""
     found = []
     for path in sorted(root.glob("*/*.json")):
         check, _, rest = path.stem.partition("-")
         cli, _, attempt = rest.partition("-")
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
-            result, binding = record["result"], record["binding"]
-            if (result["check"], result["cli"], result["attempt"]) != (check, cli, attempt) or \
-                    not isinstance(binding, dict) or result["verdict"] not in (PASS, FAIL, INCONCLUSIVE, "running"):
+            result, raw_binding, state = record["result"], record["binding"], record["status"]
+            binding = asdict(Binding(**raw_binding))  # every field, nothing else
+            if (result["check"], result["cli"], result["attempt"], result["route"]) != (check, cli, attempt,
+                                                                                       path.parent.name):
                 raise ValueError("the record doesn't match its name")
-            found.append(Record(path, check, path.parent.name, cli, attempt, record["status"], result["verdict"],
-                                binding, result.get("evidence") or {}))
+            if binding["route"] != path.parent.name:
+                raise ValueError("the binding names another route")
+            if result["verdict"] not in _LEGAL.get(state, ()):
+                raise ValueError(f"status {state!r} with verdict {result['verdict']!r}")
+            if not isinstance(result.get("evidence"), dict):
+                raise ValueError("the evidence is not a table")
+            found.append(Record(path, check, path.parent.name, cli, attempt, state, result["verdict"], binding,
+                                result["evidence"]))
         except (OSError, ValueError, KeyError, TypeError) as exc:
             found.append(Record(path, check, path.parent.name, cli, attempt, invalid=f"{type(exc).__name__}: {exc}"))
     return found

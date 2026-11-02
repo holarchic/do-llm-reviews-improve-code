@@ -12,7 +12,7 @@ from unittest import mock
 
 from eval.harness import admission, envelope, prices, providers, settlers
 from eval.harness.admission import FAIL, INCONCLUSIVE, PASS
-from eval.harness.envelope import Envelope
+from eval.harness.envelope import Envelope, ScopeAccount
 
 UTC = timezone.utc
 PRO = admission.RouteRef("deepseek--deepseek-v4-pro", "deepseek", "deepseek-v4-pro")
@@ -67,7 +67,7 @@ class FakeAccount:
         self.clock, self.rate, self.lag, self.metered = start, rate, lag, metered
         self.cached, self.reasoning, self.unresolved, self.outside = cached, reasoning, unresolved, outside
         self.funded, self.decimals, self.noise, self.accounted = funded, decimals, noise, accounted
-        self.charges, self.by_attempt, self.sessions = [], {}, 0
+        self.charges, self.by_attempt, self.sessions, self.earlier = [], {}, 0, ()
 
     def now(self):
         return self.clock
@@ -79,7 +79,7 @@ class FakeAccount:
         visible = sum(c for t, c in self.charges if (self.clock - t).total_seconds() >= self.lag)
         extra = self.noise(self.clock) if self.noise else 0.0
         balance = self.funded - visible - extra
-        return -balance, f"{balance:.{self.decimals}f}"
+        return admission.BalanceReading(-balance, f"{balance:.{self.decimals}f}")
 
     def session(self, attempt_dir):
         self.sessions += 1
@@ -90,14 +90,13 @@ class FakeAccount:
                                         served=["deepseek-v4-pro"])]
         self.charges.append((self.clock, self.rate * self.metered))
         self.clock += timedelta(minutes=2)
-        return SimpleNamespace(terminal="completed", reason="", usage={"reasoning_output_tokens": self.reasoning},
-                               transcript=Path("/nonexistent"))
+        return admission.SessionEvidence("completed", "", self.reasoning)
 
     def deps(self, **change):
         deps = admission.MeteringDeps(session=self.session, requests=lambda key: self.by_attempt.get(key, []),
                                       settle=lambda: None, sleep=self.sleep, balance=self.balance,
-                                      scope_unresolved=lambda: False,
-                                      scope_accounted=lambda: (-self.funded, self.accounted), now=self.now)
+                                      scope=lambda: ScopeAccount(-self.funded, self.accounted, 0, self.earlier),
+                                      now=self.now)
         return replace(deps, **change)
 
 
@@ -178,25 +177,35 @@ class MeteringTest(unittest.TestCase):
         with self.assertRaises(admission.Refused):
             self.check(saturday)
         self.assertEqual(saturday.sessions, 0)
+        account = FakeAccount()
         with self.assertRaises(admission.Refused):
-            self.check(FakeAccount(), scope_unresolved=lambda: True)
+            self.check(account, scope=lambda: ScopeAccount(-50.0, 0.0, 1, ()))
+
+    def test_it_refuses_a_scope_with_requests_admitted_off_peak(self):
+        """An off-peak request settled at peak above what DeepSeek billed: no baseline could match."""
+        account = FakeAccount(accounted=0.20)
+        sunday = at(8, 12).timestamp()
+        with self.assertRaises(admission.Refused):
+            self.check(account, scope=lambda: ScopeAccount(-50.0, 0.20, 0, (sunday,)))
+        self.assertEqual(account.sessions, 0)
 
     def test_the_window_closing_mid_workload_is_inconclusive(self):
         result = self.check(FakeAccount(start=at(2, 8, 50), metered=0.05))
         self.assertEqual(result.verdict, INCONCLUSIVE)
 
     def test_claude_reasoning_is_read_from_the_transcripts_thinking_text(self):
+        from eval.harness.admit_commands import _reasoning_tokens
         transcript = self.root / "t.jsonl"
         transcript.write_text(json.dumps({"type": "assistant", "message": {"content": [
             {"type": "thinking", "thinking": "x" * 600}, {"type": "text", "text": "y" * 600}]}}) + "\n")
-        self.assertEqual(admission.reasoning_tokens("claude", SimpleNamespace(transcript=transcript)), 100)
-        self.assertEqual(admission.reasoning_tokens("codex", SimpleNamespace(usage={"reasoning_output_tokens": 7})), 7)
-        self.assertEqual(admission.reasoning_tokens("codex", SimpleNamespace(usage={"reasoning_output_tokens": True})), 0)
+        self.assertEqual(_reasoning_tokens("claude", SimpleNamespace(transcript=transcript)), 100)
+        self.assertEqual(_reasoning_tokens("codex", SimpleNamespace(usage={"reasoning_output_tokens": 7})), 7)
+        self.assertEqual(_reasoning_tokens("codex", SimpleNamespace(usage={"reasoning_output_tokens": True})), 0)
 
 
 class CacheAndServedTest(unittest.TestCase):
     def run_check(self, requests, terminal="completed", route=GLM, price=GLM_PRICE):
-        deps = admission.SessionDeps(session=lambda d: SimpleNamespace(terminal=terminal, reason="x"),
+        deps = admission.SessionDeps(session=lambda d: admission.SessionEvidence(terminal, "x", 0),
                                      requests=lambda key: requests, settle=lambda: None, sleep=lambda s: None)
         return {r.check: r for r in admission.cache_and_served(route, "claude", price, "a1", Path("/tmp/x"), deps)}
 
@@ -271,16 +280,17 @@ class FakeDrain:
         self.clock += timedelta(seconds=seconds)
 
     def deps(self, **change):
-        deps = admission.ExhaustionDeps(send=self.send, remaining=lambda: self.balance, requests=lambda a: self.requests,
+        deps = admission.ExhaustionDeps(provider="deepseek", send=self.send, remaining=lambda: self.balance,
+                                        requests=lambda a: self.requests,
                                         settle=lambda: None, sleep=self.sleep, now=lambda: self.clock,
                                         may_continue=lambda t: True)
         return replace(deps, **change)
 
 
 class ExhaustionTest(unittest.TestCase):
-    def run_check(self, drain, bound=0.8, max_requests=300, **change):
+    def run_check(self, drain, bound=0.8, max_requests=300, deadline=timedelta(hours=2), **change):
         return admission.exhaustion(GLM, "x1", funding=2.0, overdraw_bound=bound, deps=drain.deps(**change),
-                                    max_requests=max_requests, deadline=MONDAY_PEAK + timedelta(hours=2))
+                                    max_requests=max_requests, deadline=MONDAY_PEAK + deadline)
 
     def test_the_provider_stopping_at_its_balance_within_the_reserve_passes(self):
         result = self.run_check(FakeDrain())
@@ -296,13 +306,52 @@ class ExhaustionTest(unittest.TestCase):
         cases = {
             "a refusal that clears": FakeDrain(clears=True),
             "a persistent rate limit": FakeDrain(refusal=(429, {"error": {"message": "rate limited"}})),
-            "a request-size refusal with credit left": FakeDrain(
-                refusal=(402, {"error": {"message": "x", "metadata": {"reason": "weight_exceeds_budget"}}})),
             "a 402 without a JSON error": FakeDrain(refusal=(402, None)),
         }
         for name, drain in cases.items():
             with self.subTest(name):
                 self.assertEqual(self.run_check(drain, max_requests=120).verdict, INCONCLUSIVE)
+
+    def test_openrouter_counts_only_a_refusal_attributed_to_the_accounts_credits(self):
+        """Key limits and in-flight budgets also answer 402: only `limit_source: openrouter_credits` shows
+        an empty account."""
+        def refusal(source):
+            return (402, {"error": {"message": "x", "metadata": {"limit_source": source}}})
+        self.assertEqual(self.run_check(FakeDrain(refusal=refusal("openrouter_credits")), provider="openrouter").verdict,
+                         PASS)
+        size = (402, {"error": {"message": "weight_exceeds_budget",
+                                "metadata": {"limit_source": "openrouter_credits"}}})  # one request too dear
+        self.assertEqual(self.run_check(FakeDrain(refusal=size), max_requests=120, provider="openrouter").verdict,
+                         INCONCLUSIVE)
+        for source in ("key", "in_flight_budget", None):
+            with self.subTest(source=source):
+                result = self.run_check(FakeDrain(refusal=refusal(source)), max_requests=120, provider="openrouter")
+                self.assertEqual(result.verdict, INCONCLUSIVE)
+
+    def test_an_account_that_isnt_funded_is_refused_before_any_spend(self):
+        drain = FakeDrain(funded=-0.01)
+        with self.assertRaises(admission.Refused):
+            self.run_check(drain)
+        self.assertEqual(drain.requests, [])
+
+    def test_nothing_billed_is_inconclusive(self):
+        drain = FakeDrain(always=True)
+        result = self.run_check(drain)
+        self.assertEqual(result.verdict, INCONCLUSIVE)
+        self.assertIn("drained nothing", result.reason)
+
+    def test_the_confirmation_honours_the_deadline_the_window_and_the_cap(self):
+        """The review's case: a drain that ends near the deadline must not send its confirmation after it."""
+        result = self.run_check(FakeDrain(funded=0.1), deadline=timedelta(seconds=60))
+        self.assertEqual(result.verdict, INCONCLUSIVE)
+        self.assertIn("no confirmation", result.reason)
+        drain = FakeDrain(funded=0.1)
+        window = iter([True, True, False])  # open for both batches, closed at the confirmation
+        result = self.run_check(drain, may_continue=lambda t: next(window, False))
+        self.assertIn("no confirmation", result.reason)
+        capped = FakeDrain(funded=0.05)
+        result = self.run_check(capped, max_requests=6)
+        self.assertLessEqual(len(result.evidence["statuses"]), 6)
 
     def test_a_request_still_unresolved_at_the_end_is_inconclusive(self):
         drain = FakeDrain()
@@ -319,15 +368,15 @@ class ExhaustionTest(unittest.TestCase):
         envelope_first = FakeDrain()
         envelope_first.send = lambda count: [admission.Reply(429, {"error": {"type": "proxy", "message": "refused"}})]
         self.assertIn("envelope refused", self.run_check(envelope_first).reason)
-        self.assertIn("without the provider", self.run_check(FakeDrain(funded=100.0), max_requests=40).reason)
+        self.assertIn("request cap", self.run_check(FakeDrain(funded=100.0), max_requests=40).reason)
         late = FakeDrain(funded=100.0)
         result = self.run_check(late, max_requests=100_000, now=lambda: MONDAY_PEAK + timedelta(hours=3))
         self.assertEqual((result.verdict, late.refusals), (INCONCLUSIVE, 0))  # the deadline, not the cap
-        self.assertIn("window closed", self.run_check(FakeDrain(), may_continue=lambda t: False).reason)
+        self.assertIn("window closing", self.run_check(FakeDrain(), may_continue=lambda t: False).reason)
 
     def test_a_balance_that_never_holds_still_is_inconclusive(self):
         readings = iter(range(10_000))
-        self.assertEqual(self.run_check(FakeDrain(), remaining=lambda: -0.001 * next(readings)).verdict,
+        self.assertEqual(self.run_check(FakeDrain(), remaining=lambda: 2.0 - 0.01 * next(readings)).verdict,
                          INCONCLUSIVE)
 
 
@@ -341,7 +390,7 @@ class RecordsTest(unittest.TestCase):
     def write(self, check="metering", attempt="20261102T060000-aaaaaa", verdict=PASS, state="done", binding=None,
               route=PRO.name, cli="codex", evidence=None):
         result = admission.Result(check, route, cli, attempt, verdict, "", evidence or {})
-        return admission.write(self.root, result, binding or self.binding, state)
+        return admission.write(self.root, result, replace(binding or self.binding, route=route, cli=cli), state)
 
     def rows(self, bindings, check="metering"):
         return [r for r in admission.status(self.root, bindings) if r["check"] == check]
@@ -352,6 +401,23 @@ class RecordsTest(unittest.TestCase):
         self.assertNotEqual(first, second)
         (row,) = self.rows([self.binding])
         self.assertEqual((row["attempt"], row["status"]), ("20261102T070000-bbbbbb", "running"))
+
+    def test_a_valid_json_record_that_doesnt_hold_together_is_invalid_too(self):
+        """The review's cases: an incomplete binding, a pass still marked running, another route."""
+        for name, change in (("incomplete binding", lambda r: r["binding"].pop("cli_version")),
+                             ("binding for another route", lambda r: r["binding"].update(route="deepseek--deepseek-flash")),
+                             ("running with a verdict", lambda r: r.update(status="running")),
+                             ("another route", lambda r: r["result"].update(route="deepseek--deepseek-flash"))):
+            with self.subTest(name):
+                shutil.rmtree(self.root)
+                self.root.mkdir()
+                self.write(attempt="20261102T060000-aaaaaa")
+                newer = self.write(attempt="20261102T070000-bbbbbb")
+                record = json.loads(newer.read_text())
+                change(record)
+                newer.write_text(json.dumps(record))
+                (row,) = self.rows([self.binding])
+                self.assertEqual((row["verdict"], row["stale"]), ("invalid", True))
 
     def test_a_damaged_latest_record_never_falls_back_to_an_earlier_pass(self):
         self.write(attempt="20261102T060000-aaaaaa")

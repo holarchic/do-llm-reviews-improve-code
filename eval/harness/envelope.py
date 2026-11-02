@@ -73,6 +73,16 @@ class PendingSettlement:
     protocol_complete: bool = False  # the response's protocol ended (not merely its forwarding)
 
 
+@dataclass(frozen=True)
+class ScopeAccount:
+    """What the ledger holds for a scope: its opening usage reading, the spend it has settled, its
+    unresolved requests, and when each request was admitted."""
+    opening_usage: float
+    settled: float
+    unresolved: int
+    admitted_at: tuple[float, ...]
+
+
 class Refused(Exception):
     """A request, job or funding entry the bound does not admit."""
 
@@ -405,6 +415,14 @@ class Envelope:
             entry["refused_by_provider"] = copy.deepcopy(evidence)
             return _settle(s, entry, None)
         return self._transition(change)
+
+    def scope_account(self, scope: str) -> ScopeAccount:
+        with self._mutex:
+            requests = [r for r in self._state["requests"].values() if r["scope"] == scope]
+            return ScopeAccount(self._state["scopes"][scope]["opening_usage"],
+                                sum(r["billed"] for r in requests if r["state"] != "unresolved"),
+                                sum(r["state"] == "unresolved" for r in requests),
+                                tuple(r["admitted_at"] for r in requests))
 
     def requests_of(self, attempt: str) -> list[dict]:
         """An attempt's requests, as recorded (copies): the admission checks' evidence."""

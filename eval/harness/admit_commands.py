@@ -109,19 +109,21 @@ def _cli_version(cli: str) -> str:
         return "?"
 
 
-def _endpoint(route: admission.RouteRef, cli: str) -> str:
+def _endpoint(route: admission.RouteRef, configured: envelope.Route, cli: str) -> str:
+    """Where the route's requests actually go: its configured upstream, plus the CLI's path."""
     provider = providers.get(route.provider)
     path = provider.codex_path + "/responses" if cli == "codex" else provider.claude_path + "/v1/messages"
-    return provider.upstream + path
+    return str(configured.upstream["base_url"]).rstrip("/") + path
 
 
 def _binding(state: dict, route: admission.RouteRef, cli: str, endpoint_cli: str) -> admission.Binding:
     configured = envelope.route_view(state, route.name)
-    if configured is None:
-        raise Usage(f"no route {route.name} in envelope {state['name']}")
+    if configured is None or not configured.upstream:
+        raise Usage(f"no route {route.name} with an upstream in envelope {state['name']}")
     return admission.Binding(route.name, configured.version, configured.key_fingerprint,
-                             _endpoint(route, endpoint_cli), cli, _cli_version(endpoint_cli if cli == "any" else cli),
-                             prices.TABLE_SHA256, state["scopes"][configured.scope]["account"])
+                             _endpoint(route, configured, endpoint_cli), cli,
+                             _cli_version(endpoint_cli if cli == "any" else cli), prices.TABLE_SHA256,
+                             state["scopes"][configured.scope]["account"])
 
 
 def _requests(env: envelope.Envelope):
@@ -148,47 +150,61 @@ def _session_check(action: str, route: admission.RouteRef, cli: str, out) -> int
             results = admission.cache_and_served(route, cli, price, attempt, root, admission.SessionDeps(**base))
         else:
             admission.write(ROOT, placeholder, binding, "running")
-            deps = admission.MeteringDeps(
-                **base, balance=lambda: _balance(env, route), now=lambda: _now(),
-                scope_unresolved=lambda: _scope_unresolved(env, route),
-                scope_accounted=lambda: _scope_accounted(env, route))
+            deps = admission.MeteringDeps(**base, balance=lambda: _balance(env, route), now=lambda: _now(),
+                                          scope=lambda: env.scope_account(env.route(route.name).scope))
             results = [admission.metering(route, cli, price, attempt, root, deps)]
     for result in results:
         out(f"{admission.write(ROOT, result, binding, 'done')}: {result.verdict} — {result.reason}")
     return 0
 
 
-def _session(route: admission.RouteRef, cli: str, attempt_dir: Path):
+def _session(route: admission.RouteRef, cli: str, attempt_dir: Path) -> admission.SessionEvidence:
+    """One routed session; everything it saved is scrubbed of provider keys before anything reads it."""
     import shutil
     workdir = audit.anonymous_workdir()
     for name, text in FILES.items():
         (workdir / name).write_text(text, encoding="utf-8")
     try:
-        return agents.run(agents.Agent(cli, route.model, route.provider), PROMPT, role=agents.REVIEWER, cwd=workdir,
-                          out_dir=attempt_dir, offline=True)
+        session = agents.run(agents.Agent(cli, route.model, route.provider), PROMPT, role=agents.REVIEWER,
+                             cwd=workdir, out_dir=attempt_dir, offline=True)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+        hits = providers.scrub(attempt_dir, required={route.provider}) if attempt_dir.exists() else []
+    if hits or providers.files_holding_keys(attempt_dir, required={route.provider}):
+        raise admission.Refused(f"the session's files held a provider key ({hits}): redacted; stopping")
+    return admission.SessionEvidence(session.terminal, session.reason, _reasoning_tokens(cli, session))
+
+
+def _reasoning_tokens(cli: str, session) -> int:
+    """Codex reports its reasoning tokens; Claude Code's transcript keeps the thinking text, counted
+    conservatively (REASONING_CHARS_PER_TOKEN)."""
+    if cli == "codex":
+        value = session.usage.get("reasoning_output_tokens") if isinstance(session.usage, dict) else None
+        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+    chars = 0
+    try:
+        lines = session.transcript.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return 0
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        message = event.get("message") if isinstance(event, dict) else None
+        for block in (message.get("content") or []) if isinstance(message, dict) else []:
+            if isinstance(block, dict) and block.get("type") == "thinking" and isinstance(block.get("thinking"), str):
+                chars += len(block["thinking"])
+    return chars // admission.REASONING_CHARS_PER_TOKEN
 
 
 def _upstream_base(env: envelope.Envelope, route: admission.RouteRef) -> str:
     return str(env.route(route.name).upstream["base_url"])
 
 
-def _balance(env: envelope.Envelope, route: admission.RouteRef) -> tuple[float, str]:
+def _balance(env: envelope.Envelope, route: admission.RouteRef) -> admission.BalanceReading:
     settler = settlers.DeepSeekSettler(_upstream_base(env, route), providers.api_key(route.provider))
-    return settler.balance_reading()
-
-
-def _scope_unresolved(env: envelope.Envelope, route: admission.RouteRef) -> bool:
-    scope = env.route(route.name).scope
-    return any(r["scope"] == scope and r["state"] == "unresolved" for r in env.state["requests"].values())
-
-
-def _scope_accounted(env: envelope.Envelope, route: admission.RouteRef) -> tuple[float, float]:
-    scope = env.route(route.name).scope
-    state = env.state
-    settled = sum(r["billed"] for r in state["requests"].values() if r["scope"] == scope and r["state"] != "unresolved")
-    return state["scopes"][scope]["opening_usage"], settled
+    return admission.BalanceReading(*settler.balance_reading())
 
 
 def _current_bindings() -> list[admission.Binding]:
@@ -244,7 +260,7 @@ def _exhaustion(args, route: admission.RouteRef, out) -> int:
 
         now = _now()
         deps = admission.ExhaustionDeps(
-            send=send, remaining=lambda: settlers.remaining_credit(route.provider, key, base_url),
+            provider=route.provider, send=send, remaining=lambda: settlers.remaining_credit(route.provider, key, base_url),
             requests=_requests(env), settle=served.settle_now, sleep=lambda s: _sleep(s), now=lambda: _now(),
             may_continue=admission.in_window if deepseek else (lambda t: True))
         admission.write(ROOT, admission.Result("exhaustion", route.name, "any", attempt, "running", "", dict(bought)),
