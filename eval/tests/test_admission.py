@@ -610,9 +610,48 @@ class AdmitCommandTest(unittest.TestCase):
         result = admission.Result("exhaustion", "deepseek--deepseek-flash", "any", "20261102T060000-aaaaaa", "running", "")
         binding = admission.Binding("deepseek--deepseek-flash", "v", "f", "https://x/anthropic/v1/messages", "any", "?",
                                     prices.TABLE_SHA256, "a")
-        with mock.patch.object(admission.os, "fsync", wraps=admission.os.fsync) as fsync:
+        synced = []
+        real_open = admission.os.open
+
+        def tracking_open(path, flags, *args):
+            descriptor = real_open(path, flags, *args)
+            if flags == admission.os.O_RDONLY:
+                synced.append(Path(path))
+            return descriptor
+        self.assertFalse(root.exists())  # the first record creates the admission root too
+        with mock.patch.object(admission.os, "open", tracking_open):
             admission.write(root, result, binding, "running")
-        self.assertGreaterEqual(fsync.call_count, 3)  # the file, its new directory and the root's entry for it
+        self.assertEqual(synced, [root / "deepseek--deepseek-flash", root, root.parent])
+
+    def test_a_directory_sync_that_fails_raises_before_any_spend(self):
+        root = self.root / "adm"
+        result = admission.Result("exhaustion", "deepseek--deepseek-flash", "any", "20261102T060000-aaaaaa", "running", "")
+        binding = admission.Binding("deepseek--deepseek-flash", "v", "f", "https://x/anthropic/v1/messages", "any", "?",
+                                    prices.TABLE_SHA256, "a")
+        calls = iter([None, None, OSError("dir")])
+
+        def fsync(descriptor):
+            outcome = next(calls)
+            if outcome:
+                raise outcome
+        with mock.patch.object(admission.os, "fsync", fsync), self.assertRaises(OSError):
+            admission.write(root, result, binding, "running")
+
+    def test_records_that_cant_be_listed_refuse_the_budget_and_the_status(self):
+        root = self.root / "adm"
+        (root / "deepseek--deepseek-flash").mkdir(parents=True)
+        self.assertEqual(admission.budget(self.root / "absent"), 150.0)  # no root: nothing spent
+        real = Path.iterdir
+        for failing in (root, root / "deepseek--deepseek-flash"):
+            def iterdir(path, failing=failing):
+                if path == failing:
+                    raise PermissionError("denied")
+                return real(path)
+            with self.subTest(failing=failing.name), mock.patch.object(Path, "iterdir", iterdir):
+                with self.assertRaises(admission.Refused):
+                    admission.budget(root)
+                with self.assertRaises(admission.Refused):
+                    admission.status(root, [])
 
     def test_the_drain_refuses_outside_a_deepseek_peak_window_before_any_spend(self):
         fake = self.fake()

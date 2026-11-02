@@ -497,7 +497,6 @@ def write(root: Path, result: Result, binding: Binding, status: str) -> Path:
     """An attempt's record: `running` before any spend, its verdict at the end; never overwritten
     by another attempt."""
     path = record_path(root, result)
-    created = not path.parent.exists()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.partial")
     with open(tmp, "w", encoding="utf-8") as handle:
@@ -506,8 +505,10 @@ def write(root: Path, result: Result, binding: Binding, status: str) -> Path:
         handle.flush()
         os.fsync(handle.fileno())
     tmp.replace(path)
-    # Durable before any spend: the rename, and a new route dir's own entry, survive a machine crash.
-    for directory in (path.parent, path.parent.parent) if created else (path.parent,):
+    # Durable before any spend: the rename, the route dir's entry and the admission root's entry all
+    # survive a machine crash. Every write syncs the whole chain, so a retry after a failed sync never
+    # takes a directory for durable.
+    for directory in (path.parent, root, root.parent):
         descriptor = os.open(directory, os.O_RDONLY)
         try:
             os.fsync(descriptor)
@@ -535,11 +536,31 @@ _EMPTY_BINDING = Binding("", "", "", "", "", "", "", None)
 _EMPTY_RESULT = Result("", "", "", "", "", "")
 
 
+def _record_paths(root: Path) -> list[Path]:
+    """Every record file, listed explicitly: an absent root has none; a root or route directory that
+    can't be listed refuses, so no record can be silently missed (`glob` swallows listing errors)."""
+    try:
+        routes = sorted(root.iterdir())
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise Refused(f"{root} can't be listed ({type(exc).__name__}): records could be missed") from None
+    paths = []
+    for route in routes:
+        if not route.is_dir():
+            continue
+        try:
+            paths += sorted(p for p in route.iterdir() if p.suffix == ".json")
+        except OSError as exc:
+            raise Refused(f"{route} can't be listed ({type(exc).__name__}): records could be missed") from None
+    return paths
+
+
 def _records(root: Path) -> list[Record]:
     """Every record, named by its path, parsed whole: a file that can't be read, or whose result,
     binding, route, status and verdict don't agree, is kept as invalid evidence."""
     found = []
-    for path in sorted(root.glob("*/*.json")):
+    for path in _record_paths(root):
         check, _, rest = path.stem.partition("-")
         cli, _, attempt = rest.partition("-")
         try:
