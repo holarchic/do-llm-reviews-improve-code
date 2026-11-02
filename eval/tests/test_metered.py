@@ -37,6 +37,7 @@ class FakeDeepSeek:
         self.funded, self.charges, self.rate, self.hidden, self.lag = funded, [], 1.0, 0, 0
         self.cached_share, self.output, self.cut, self.events_override = 0.5, 1000, None, None
         self.refuse_at_zero = False  # refuse (402, JSON, before generating) once the balance is spent
+        self.balance_reads, self.balance_fails_after = 0, None  # the balance endpoint failing after n reads
         self._lock = threading.Lock()
         fake = self
 
@@ -44,6 +45,9 @@ class FakeDeepSeek:
             def do_GET(self):
                 if self.path != "/user/balance":
                     return self.send_error(404)
+                fake.balance_reads += 1
+                if fake.balance_fails_after is not None and fake.balance_reads > fake.balance_fails_after:
+                    return self.send_error(500)
                 with fake._lock:
                     shown = fake.charges[:len(fake.charges) - fake.lag] if fake.lag else fake.charges
                     balance = fake.funded - sum(shown)

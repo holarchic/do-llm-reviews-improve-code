@@ -406,6 +406,10 @@ class RecordsTest(unittest.TestCase):
     def test_a_valid_json_record_that_doesnt_hold_together_is_invalid_too(self):
         """The review's cases: an incomplete binding, a pass still marked running, another route."""
         for name, change in (("incomplete binding", lambda r: r["binding"].pop("cli_version")),
+                             ("a binding for another CLI", lambda r: r["binding"].update(cli="claude")),
+                             ("no reason", lambda r: r["result"].pop("reason")),
+                             ("a reason that isn't text", lambda r: r["result"].update(reason=5)),
+                             ("an endpoint that isn't a URL", lambda r: r["binding"].update(endpoint="nowhere")),
                              ("binding for another route", lambda r: r["binding"].update(route="deepseek--deepseek-flash")),
                              ("running with a verdict", lambda r: r.update(status="running")),
                              ("another route", lambda r: r["result"].update(route="deepseek--deepseek-flash"))):
@@ -609,6 +613,15 @@ class AdmitCommandTest(unittest.TestCase):
             scope = env.state["scopes"]["ds"]
             self.assertEqual((scope["excess"], scope["fault"]), (0.0, None))
 
+    def test_a_failure_after_spending_began_is_a_stop_not_a_refusal(self):
+        fake = self.fake()
+        fake.balance_fails_after = fake.balance_reads + 3  # the envelope's start and the opening read succeed
+        code = self.admit("exhaustion", "--route", "deepseek--deepseek-flash", "--funding", "2", "--envelope", "X")
+        self.assertEqual(code, 4)
+        self.assertTrue(fake.charges)  # it had spent
+        (record,) = (self.root / "adm" / "deepseek--deepseek-flash").glob("exhaustion-any-*.json")
+        self.assertEqual(json.loads(record.read_text())["status"], "running")  # incomplete, purchases kept
+
     def test_status_reads_a_snapshot_while_another_process_owns_the_envelope(self):
         with Envelope.owned("B", root=self.root, create_usd=150.0):
             self.assertEqual(self.admit("status"), 0)
@@ -629,8 +642,9 @@ class LedgerEvidenceTest(unittest.TestCase):
             env.admit("q1", "r", job="job", attempt="a1")
         self.path = self.root / "B.json"
 
-    def test_a_ledger_written_before_the_evidence_fields_loads_with_them_unrecorded(self):
+    def test_a_schema_one_ledger_loads_upgraded_and_conservative(self):
         state = json.loads(self.path.read_text())
+        del state["schema"]
         for key in ("fault", "account"):
             del state["scopes"]["ds"][key]
         for key in ("metered", "metered_invalid", "protocol_complete", "served", "metered_tokens", "billed_tokens",
@@ -640,6 +654,28 @@ class LedgerEvidenceTest(unittest.TestCase):
         loaded = envelope.load(self.path)
         self.assertEqual((loaded["requests"]["q1"]["state"], loaded["requests"]["q1"]["bound"]), ("unresolved", 1.0))
         self.assertIsNone(loaded["scopes"]["ds"]["account"])
+        self.assertIsNotNone(loaded["requests"]["q1"]["metered_invalid"])  # never settles by metering
+
+    def test_a_current_ledger_missing_a_safety_field_is_refused_not_filled_in(self):
+        state = json.loads(self.path.read_text())
+        for damage in (lambda s: s["scopes"]["ds"].pop("fault"), lambda s: s["requests"]["q1"].pop("metered_invalid")):
+            broken = json.loads(json.dumps(state))
+            damage(broken)
+            self.path.write_text(json.dumps(broken))
+            with self.assertRaises(envelope.EnvelopeError):
+                envelope.load(self.path)
+
+    def test_malformed_containers_are_refused_as_envelope_errors(self):
+        state = json.loads(self.path.read_text())
+        for key in ("scopes", "requests", "reservations"):
+            for legacy in (True, False):
+                broken = json.loads(json.dumps(state))
+                broken[key] = []
+                if legacy:
+                    del broken["schema"]
+                self.path.write_text(json.dumps(broken))
+                with self.subTest(key=key, legacy=legacy), self.assertRaises(envelope.EnvelopeError):
+                    envelope.load(self.path)
 
     def test_malformed_token_evidence_is_refused_on_load(self):
         state = json.loads(self.path.read_text())

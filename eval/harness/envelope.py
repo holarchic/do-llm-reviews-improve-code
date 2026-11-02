@@ -497,28 +497,36 @@ def load(path: Path) -> dict:
     return state
 
 
-# Fields later phases added, and the value that says "not recorded" for a ledger written before them.
+# Fields schema 2 added, and their value for a schema-1 ledger: not recorded, and conservative where
+# it matters (a schema-1 request never settles by metering: its usage was never captured).
 _SCOPE_DEFAULTS = {"fault": None, "account": None}
-_REQUEST_DEFAULTS = {"metered": None, "metered_invalid": None, "protocol_complete": False, "served": [],
-                     "metered_tokens": None, "billed_tokens": None, "refused_by_provider": None}
+_REQUEST_DEFAULTS = {"metered": None, "metered_invalid": "recorded before metering existed",
+                     "protocol_complete": False, "served": [], "metered_tokens": None, "billed_tokens": None,
+                     "refused_by_provider": None}
 
 
 def _upgrade(state) -> None:
-    """A ledger written before a field existed reads it as not recorded; every charge and unresolved
-    liability stays as written."""
-    if not isinstance(state, dict):
+    """A schema-1 (unversioned) ledger is upgraded: every charge and unresolved liability stays as
+    written. A current ledger is never filled in: a field missing from it is damage, and `_check`
+    refuses it. Malformed containers are left for `_check` to refuse."""
+    if not isinstance(state, dict) or "schema" in state:
         return
-    for scope in (state.get("scopes") or {}).values():
+    tables = [state.get(k) for k in ("scopes", "requests", "reservations")]
+    if not all(isinstance(t, dict) for t in tables):
+        return
+    scopes, requests, reservations = tables
+    for scope in scopes.values():
         if isinstance(scope, dict):
             for key, value in _SCOPE_DEFAULTS.items():
                 scope.setdefault(key, value)
-    for request in (state.get("requests") or {}).values():
+    for request in requests.values():
         if isinstance(request, dict):
             for key, value in _REQUEST_DEFAULTS.items():
                 request.setdefault(key, copy.deepcopy(value))
-    for held in (state.get("reservations") or {}).values():
+    for held in reservations.values():
         if isinstance(held, dict):
             held.setdefault("baseline", 0.0)
+    state["schema"] = SCHEMA
 
 
 def route_view(state: dict, name: str) -> "Route | None":
@@ -547,8 +555,11 @@ def summary(state: dict, now: float) -> dict:
     }
 
 
+SCHEMA = 2  # 1 (unversioned): before the metering, refusal and account fields
+
+
 def _empty(name: str, envelope_usd: float) -> dict:
-    return {"name": name, "envelope_usd": envelope_usd, "funding": [], "scopes": {}, "routes": {},
+    return {"schema": SCHEMA, "name": name, "envelope_usd": envelope_usd, "funding": [], "scopes": {}, "routes": {},
             "requests": {}, "reservations": {}, "refusals": {}}
 
 
@@ -591,8 +602,9 @@ def _check(s: dict) -> None:
         if not ok:
             raise EnvelopeError(f"envelope state does not check out: {what}")
     try:
-        ensure(isinstance(s, dict) and set(s) == {"name", "envelope_usd", "funding", "scopes", "routes", "requests",
-                                                  "reservations", "refusals"}, "top-level fields")
+        ensure(isinstance(s, dict) and set(s) == {"schema", "name", "envelope_usd", "funding", "scopes", "routes",
+                                                  "requests", "reservations", "refusals"}, "top-level fields")
+        ensure(s["schema"] == SCHEMA, f"schema {s['schema']!r}")
         ensure(_money(s["envelope_usd"]) and s["envelope_usd"] > 0, "envelope amount")
         ensure(all(all(_money(f[k]) for k in ("credit", "fees", "taxes")) for f in s["funding"]), "funding")
         for name, scope in s["scopes"].items():

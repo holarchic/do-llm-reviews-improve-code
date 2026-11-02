@@ -7,6 +7,7 @@ routing context (B's envelope, its probe reservation); exhaustion runs in its ow
 `status` and `budget` only read: status from a snapshot of B's envelope, with no proxy.
 """
 
+import contextlib
 import json
 import math
 import secrets
@@ -129,6 +130,17 @@ def _binding(state: dict, route: admission.RouteRef, cli: str, endpoint_cli: str
                              _account(state, configured.scope))
 
 
+@contextlib.contextmanager
+def _after_spend():
+    """Inside a check that may have spent: an operational failure is a stop after spending began, not a
+    refusal before it (the check's own `Refused`, raised before its first request, stays a refusal)."""
+    try:
+        yield
+    except (settlers.UsageUnavailable, settlers.NoSettler, envelope.EnvelopeError, envelope.Refused,
+            routing.RoutingRequired) as exc:
+        raise admission.Stopped(f"{type(exc).__name__}: {exc}") from None
+
+
 def _account(state: dict, scope: str) -> str | None:
     return state["scopes"][scope]["account"]
 
@@ -154,12 +166,14 @@ def _session_check(action: str, route: admission.RouteRef, cli: str, out) -> int
         if action == "cache":
             for name in ("cache", "served"):
                 admission.write(ROOT, replace(placeholder, check=name), binding, "running")
-            results = admission.cache_and_served(route, cli, price, attempt, root, admission.SessionDeps(**base))
+            with _after_spend():
+                results = admission.cache_and_served(route, cli, price, attempt, root, admission.SessionDeps(**base))
         else:
             admission.write(ROOT, placeholder, binding, "running")
             deps = admission.MeteringDeps(**base, balance=lambda: _balance(env, route), now=lambda: _now(),
                                           scope=lambda: env.scope_account(env.route(route.name).scope))
-            results = [admission.metering(route, cli, price, attempt, root, deps)]
+            with _after_spend():
+                results = [admission.metering(route, cli, price, attempt, root, deps)]
     for result in results:
         out(f"{admission.write(ROOT, result, binding, 'done')}: {result.verdict} — {result.reason}")
     return 0
@@ -272,9 +286,10 @@ def _exhaustion(args, route: admission.RouteRef, out) -> int:
             may_continue=admission.in_window if deepseek else (lambda t: True))
         admission.write(ROOT, admission.Result("exhaustion", route.name, "any", attempt, "running", "", dict(bought)),
                         binding, "running")
-        result = admission.exhaustion(route, attempt, funding=args.funding, overdraw_bound=overdraw, deps=deps,
-                                      max_requests=max_requests, deadline=now + DRAIN_DEADLINE,
-                                      batch=max(1, min(4, configured.slots)))
+        with _after_spend():
+            result = admission.exhaustion(route, attempt, funding=args.funding, overdraw_bound=overdraw, deps=deps,
+                                          max_requests=max_requests, deadline=now + DRAIN_DEADLINE,
+                                          batch=max(1, min(4, configured.slots)))
         result = replace(result, evidence={**result.evidence, **bought, "words": words, "max_requests": max_requests})
     out(f"{admission.write(ROOT, result, binding, 'done')}: {result.verdict} — {result.reason}")
     return 0

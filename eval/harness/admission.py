@@ -519,6 +519,7 @@ class Record:
 
 _LEGAL = {"running": {"running"}, "done": {PASS, FAIL, INCONCLUSIVE}}
 _EMPTY_BINDING = Binding("", "", "", "", "", "", "", None)
+_EMPTY_RESULT = Result("", "", "", "", "", "")
 
 
 def _records(root: Path) -> list[Record]:
@@ -530,7 +531,12 @@ def _records(root: Path) -> list[Record]:
         cli, _, attempt = rest.partition("-")
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(record, dict) or set(record) != {"status", "result", "binding"}:
+                raise ValueError("a record is exactly its status, result and binding")
             result, raw_binding, state = record["result"], record["binding"], record["status"]
+            if not isinstance(result, dict) or set(result) != set(asdict(_EMPTY_RESULT)) or \
+                    not all(isinstance(result[k], str) for k in ("check", "route", "cli", "attempt", "verdict", "reason")):
+                raise ValueError("the result doesn't carry exactly its fields")
             if not isinstance(raw_binding, dict) or set(raw_binding) != set(asdict(_EMPTY_BINDING)):
                 raise ValueError("the binding doesn't carry exactly its fields")
             binding = asdict(Binding(**raw_binding))
@@ -542,6 +548,11 @@ def _records(root: Path) -> list[Record]:
                 raise ValueError("the record doesn't match its name")
             if binding["route"] != path.parent.name:
                 raise ValueError("the binding names another route")
+            if binding["cli"] != cli or (cli == "any") != (check == "exhaustion") or cli not in ("claude", "codex", "any"):
+                raise ValueError(f"check {check} with CLI {cli!r} and a binding for {binding['cli']!r}")
+            if check not in CHECKS:
+                raise ValueError(f"no check {check!r}")
+            _origin(binding["endpoint"])  # parses, or raises here rather than later
             if result["verdict"] not in _LEGAL.get(state, ()):
                 raise ValueError(f"status {state!r} with verdict {result['verdict']!r}")
             if not isinstance(result.get("evidence"), dict):
@@ -581,8 +592,11 @@ def status(root: Path, bindings: list[Binding]) -> list[dict]:
 
 
 def _origin(endpoint: str) -> str:
+    """An endpoint's scheme and host; raises ValueError for anything that isn't an http(s) URL."""
     from urllib.parse import urlsplit
     parts = urlsplit(endpoint)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise ValueError(f"endpoint {endpoint!r} is not an http(s) URL")
     return f"{parts.scheme}://{parts.netloc}"
 
 
