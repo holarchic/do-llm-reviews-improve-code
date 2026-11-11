@@ -3,6 +3,7 @@ import dataclasses
 import hashlib
 import io
 import json
+import shutil
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -177,7 +178,11 @@ class ExecuteCellTest(CellCase):
     def test_what_a_cell_refuses(self):
         build_exec = self.build()
         dev = tasks.Task(tasks.TASKS_ROOT / "dev-intervals")
+        shutil.copytree(self.task.root, self.tmp / "tasks" / "another")
+        another = tasks.Task(self.tmp / "tasks" / "another")
         refusals = {
+            "is of fixture, not another": lambda: loop.execute_cell(another, build_exec, SAME, self.runs, rep=1,
+                                                                    manifest_hash="d", offline=True),
             "not a review cell": lambda: loop.execute_cell(self.task, build_exec, NONE, self.runs, rep=1,
                                                            manifest_hash="d", offline=True),
             "offline": lambda: loop.execute_cell(self.task, build_exec, SAME, self.runs, rep=1, manifest_hash="d"),

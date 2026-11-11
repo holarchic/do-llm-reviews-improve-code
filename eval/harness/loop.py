@@ -252,6 +252,9 @@ def execute_cell(task: Task, build_exec_dir: Path, arm: Arm, runs_root: Path, *,
     build = records.build(build_exec_dir / "record.json", manifest_hash)
     if build is None:
         raise ValueError(f"no complete build record under this manifest in {build_exec_dir}")
+    if build["task"] != task.id:
+        # The cell is scored on its own task's tests: another task's build would be no comparator.
+        raise ValueError(f"the build in {build_exec_dir} is of {build['task']}, not {task.id}")
     scored = artifact_digest(build_exec_dir / "artifact")
     if _head_digest(build_exec_dir / "repo") != scored:
         raise ValueError(f"{build_exec_dir}: the stored repo's HEAD is not the tree that was scored")
