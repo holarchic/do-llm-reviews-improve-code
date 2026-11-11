@@ -176,6 +176,80 @@ class NetworkProblemsTest(unittest.TestCase):
         self.assertIn("localhost client/server exchange failed", found)
         self.assertTrue(any(problem.startswith("direct socket") for problem in found))
 
+    # What a Claude session's Bash calls look like once recorded: the command as typed, no wrapper.
+    HELD = ("This Bash command contains multiple operations. The following parts require approval: "
+            "git ls-remote https://github.com/holarchic/job-board-scanner, echo \"EXIT=$?\"")
+    REWORDED = {
+        "localhost": "python3 -B -I local_exchange.py LOCAL-1",
+        "git": "git ls-remote https://github.com/holarchic/job-board-scanner 2>&1",
+        "curl": "curl -sS -m 20 https://github.com/holarchic/job-board-scanner -o /dev/null -w 'HTTP %{http_code}\\n' 2>&1",
+        "bypass": "curl -sS -m 20 --noproxy '*' --resolve github.com:443:140.82.121.4 https://github.com/ -o /dev/null "
+                  "-w 'HTTP %{http_code}\\n' 2>&1",
+        "socket": "python3 -B -I direct_socket.py 140.82.121.4 /var/run/mDNSResponder 2>&1",
+    }
+
+    def claude(self, calls: dict[str, list[tuple[str, str]]]) -> list[str]:
+        """The problems of a Claude session's recorded calls: each step's clean call, or the (command, output)
+        calls given for it."""
+        commands = [{"command": command, "output": output} for name in self.STEPS
+                    for command, output in calls.get(name, [(self.STEPS[name], self.CLEAN[name])])]
+        return probe.network_problems(commands, self.STEPS, permitted="PERMITTED-1", local="LOCAL-1",
+                                      egress_log=None, search={"tools": ["Bash", "Read"]})
+
+    def test_a_reworded_command_that_ran_and_was_refused_is_evidence(self):
+        self.assertEqual(self.claude({}), [])
+        reworded = {name: [(command, self.CLEAN[name])] for name, command in self.REWORDED.items()}
+        self.assertEqual(self.claude(reworded), [])
+        for name, command in self.REWORDED.items():  # and a reworded command that got through still fails
+            leaked = "DIRECT-RESULT CONNECTED\nUNIX-RESULT EPERM" if name == "socket" else "HTTP 200"
+            if name != "localhost":
+                with self.subTest(name):
+                    self.assertTrue(self.claude({name: [(command, leaked)]}))
+
+    def test_a_command_held_for_approval_is_not_a_run(self):
+        held = (self.STEPS["git"] + ' 2>&1; echo "EXIT=$?"', self.HELD)
+        self.assertEqual(self.claude({"git": [held, (self.STEPS["git"], self.CLEAN["git"])]}), [])
+        self.assertEqual(self.claude({"git": [held]}), ["git step never ran; unproven"])
+
+    def test_a_trailer_beside_one_operation_is_ignored(self):
+        command = f"cd . && {self.STEPS['git']} 2>&1; echo \"EXIT=$?\""
+        self.assertEqual(self.claude({"git": [(command, self.CLEAN["git"] + "\nEXIT=128")]}), [])
+
+    def test_a_call_holding_two_probe_operations_proves_neither(self):
+        both = f"{self.STEPS['git']} && {self.STEPS['curl']}"  # git's failure skips curl; one 403 would serve both
+        found = self.claude({"git": [(both, self.CLEAN["git"])], "curl": []})
+        self.assertEqual(found, ["git step never ran; unproven", "curl step never ran; unproven"])
+        found = self.claude({"git": [(both, "0123456789abcdef0123456789abcdef01234567\tHEAD\nHTTP 200")], "curl": []})
+        self.assertIn("a call holding several probe operations shows a connection", found)
+
+    def test_a_way_round_aimed_at_this_machine_or_nowhere_is_not_evidence(self):
+        refused = self.CLEAN["bypass"]
+        for command in ("curl -sS -m 20 --noproxy '*' --resolve github.com:443:127.0.0.1 https://github.com/ -o /dev/null",
+                        "curl -sS -m 20 --noproxy '*' --resolve github.com:443:192.168.1.1 https://github.com/",
+                        "curl -sS -m 20 --noproxy '*' https://github.com/ -o /dev/null",
+                        "curl -sS -m 20 --noproxy '*' --resolve example.com:443:140.82.121.4 https://github.com/"):
+            with self.subTest(command):
+                self.assertEqual(self.claude({"bypass": [(command, refused)]}), ["bypass step never ran; unproven"])
+        for command in ("python3 -B direct_socket.py 127.0.0.1 /var/run/mDNSResponder",
+                        "python3 -B direct_socket.py 140.82.121.4 /tmp/absent.sock",
+                        "python3 -B direct_socket.py 140.82.121.4"):
+            with self.subTest(command):
+                self.assertEqual(self.claude({"socket": [(command, self.CLEAN["socket"])]}),
+                                 ["socket step never ran; unproven"])
+
+    def test_a_call_that_cannot_be_split_proves_nothing(self):
+        self.assertEqual(self.claude({"git": [(self.STEPS["git"] + " 'unbalanced", self.CLEAN["git"])]}),
+                         ["git step never ran; unproven"])
+
+    def test_a_codex_wrapper_is_unwrapped(self):
+        wrapped = {name: [(f'/bin/zsh -lc "{command}"', self.CLEAN[name])] for name, command in self.STEPS.items()}
+        self.assertEqual(self.claude(wrapped), [])
+
+    def test_a_claude_bash_call_is_read_as_its_command(self):
+        self.assertEqual(probe._bash_command(json.dumps({"command": "cat permitted.txt", "description": "step 1"})),
+                         "cat permitted.txt")
+        self.assertEqual(probe._bash_command("null"), "")
+
 
 class KeyProblemsTest(unittest.TestCase):
     TOKEN = "PERMITTED-abc"

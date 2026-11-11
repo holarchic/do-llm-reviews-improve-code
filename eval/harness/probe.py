@@ -9,15 +9,18 @@ adds a network probe per writer and reviewer configuration. Run dirs come from
 permissions.
 """
 
+import ipaddress
 import json
 import re
 import secrets
+import shlex
 import shutil
 import socket
 import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from dataclasses import dataclass
 
@@ -499,7 +502,7 @@ def _network_probe(probe: Probe, stamp: Path) -> dict:
         search = {"web_search_items": _codex_item_types(session.transcript).count("web_search"),
                   "config_disabled": config.exists() and 'web_search = "disabled"' in config.read_text()}
     else:
-        commands = [{"command": c["input"], "output": c["output"]}
+        commands = [{"command": _bash_command(c["input"]), "output": c["output"]}
                     for c in _claude_tool_results(session.transcript) if c["tool"] == "Bash"]
         egress_log = None
         search = {"tools": _claude_tools(session.transcript)}
@@ -522,15 +525,119 @@ def network_steps(ip: str, local_token: str) -> dict[str, str]:
     }
 
 
+_SHELLS = ("bash", "zsh", "sh")
+_OPERATOR_CHARS = frozenset("();<>|&")
+# Claude Code's own notice for a call it held for approval: the command never ran, and this is not its output.
+_HELD = "This Bash command contains multiple operations. The following parts require approval"
+# A way out that got somewhere: a ref from the source, a served page, or a connected socket.
+_REACHED = re.compile(r"\b[0-9a-f]{40}\b|HTTP [23]\d\d|-RESULT CONNECTED")
+
+
+def _bash_command(tool_input: str) -> str:
+    """The shell command of a Claude Bash call, from its recorded tool input."""
+    data = json.loads(tool_input)
+    return str(data.get("command", "")) if isinstance(data, dict) else ""
+
+
+def _simple_commands(command: str) -> list[list[str]]:
+    """The simple commands of one shell call, each as its words. A `bash -lc` (or `zsh`, `sh`) wrapper is
+    unwrapped, control operators separate commands, and redirections are dropped. It splits a call so
+    each part can be recognised and does nothing else a shell does; a call it cannot split yields none."""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:  # an unbalanced quote
+        return []
+    found, words, skip_target = [], [], False
+    for token in tokens:
+        if skip_target:
+            skip_target = False
+        elif not set(token) <= _OPERATOR_CHARS:
+            words.append(token)
+        elif "<" in token or ">" in token:
+            skip_target = True
+            if words and words[-1].isdigit():
+                words.pop()  # the redirected descriptor of `2>&1`
+        else:
+            found.append(words)
+            words = []
+    found.append(words)
+    simple = []
+    for words in filter(None, found):
+        script = next((words[n + 1] for n, word in enumerate(words[:-1]) if re.fullmatch(r"-[a-z]*c", word)), None)
+        if Path(words[0]).name in _SHELLS and script is not None:
+            simple += _simple_commands(script)
+        else:
+            simple.append(words)
+    return simple
+
+
+def _public(address: str) -> bool:
+    try:
+        return ipaddress.ip_address(address).is_global
+    except ValueError:
+        return False
+
+
+def _operation(words: list[str]) -> str | None:
+    """Which probe step a simple command is, by its tool and its target; None for anything else. A way
+    around the proxy counts only when it aims at a public address: a refused connection to this machine
+    would prove nothing."""
+    tool, args = Path(words[0]).name, words[1:]
+    if tool.startswith("python"):
+        return _script_operation(args)
+    hosts = {urlsplit(arg).hostname for arg in args if arg.startswith(("http://", "https://"))}
+    if tool == "cat" and any(Path(arg).name == "permitted.txt" for arg in args):
+        return "permitted"
+    if tool == "git" and "ls-remote" in args and SOURCE_HOST in hosts:
+        return "git"
+    if tool == "curl" and SOURCE_HOST in hosts:
+        if "--noproxy" not in args:
+            return "curl"
+        resolved = [arg.split(":", 2)[2] for arg in args if arg.startswith(f"{SOURCE_HOST}:443:")]
+        return "bypass" if "--resolve" in args and any(map(_public, resolved)) else None
+    return None
+
+
+def _script_operation(args: list[str]) -> str | None:
+    """The probe step a Python call runs: one of the two probe scripts, whatever interpreter flags precede it."""
+    at = next((n for n, arg in enumerate(args) if arg.endswith(".py")), None)
+    if at is None:
+        return None
+    script, target = Path(args[at]).name, args[at + 1:]
+    if script == "local_exchange.py":
+        return "localhost"
+    if script == "direct_socket.py" and len(target) == 2 and _public(target[0]) and target[1] == UNIX_SOCKET:
+        return "socket"
+    return None
+
+
 def network_problems(commands: list[dict], steps: dict[str, str], *, permitted: str, local: str,
                      egress_log: str | None, search: dict, routed_answered: int | None = None) -> list[str]:
     """Each step must have run; the controls must succeed and every way out must be refused, with the
     refusal's own evidence: empty output or a DNS failure proves nothing. A step that never ran is
     reported once, as unproven. The model-call control: a native Codex session's call passes the
     egress proxy; a routed session's (`routed_answered`, its proxy-admitted requests that the model
-    answered) passes its envelope's proxy, and its egress proxy admits nothing."""
-    runs = {name: [c["output"] for c in commands if command in c["command"]] for name, command in steps.items()}
-    problems = [f"{name} step never ran; unproven" for name, ran in runs.items() if not ran]
+    answered) passes its envelope's proxy, and its egress proxy admits nothing.
+
+    A recorded call is a run of a step by what it did, not by its wording: a model may add a flag, a
+    redirection or its own resolved address. A call counts for a step only when it holds exactly one
+    probe operation, because a short-circuit can skip one of two while the other's refusal stands in
+    for it. A call the CLI held for approval never ran."""
+    runs: dict[str, list[str]] = {name: [] for name in steps}
+    problems = []
+    for call in commands:
+        if call["output"].lstrip().startswith(_HELD):
+            continue
+        operations = [operation for operation in map(_operation, _simple_commands(call["command"])) if operation]
+        if len(operations) > 1:
+            if _REACHED.search(call["output"]):
+                problems.append("a call holding several probe operations shows a connection")
+            continue
+        for operation in operations:
+            runs[operation].append(call["output"])
+    problems += [f"{name} step never ran; unproven" for name, ran in runs.items() if not ran]
     outputs = {name: "\n".join(ran) for name, ran in runs.items()}
     if permitted not in outputs["permitted"]:
         problems.append("permitted local read failed; positive control missing")
