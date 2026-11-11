@@ -221,13 +221,13 @@ def _freeze(args) -> int:
 
 
 def _report(args) -> int:
-    from .harness import replay, replicated, report
+    from .harness import paired, replay, replicated, report
 
     experiment = args.experiment
     data_root = _data_root(experiment)
 
     def write() -> int:
-        module = {"judged": report, "replicated": replicated, "replay": replay}[experiment.report]
+        module = {"judged": report, "replicated": replicated, "replay": replay, "paired": paired}[experiment.report]
         results = module.collect(data_root, experiment)
         decision = module.decide(results, experiment)
         text = module.render(results, decision, experiment)

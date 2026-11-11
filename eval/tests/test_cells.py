@@ -29,6 +29,7 @@ class CellCase(FixtureCase):
         super().setUp()
         self.assertEqual(tasks.validate(self.task), [])
         self.runs = self.tmp / "runs"
+        self.experiment = dataclasses.replace(PLAIN_REVIEW, tasks=("fixture",))
         self.calls: list[dict] = []
         self.build_calc, self.fix_calc = PRE_REVIEW_CALC, REFERENCE_CALC
         self.review_text, self.fix_text = REVIEW_TEXT, FIX_TEXT
@@ -70,6 +71,40 @@ class CellCase(FixtureCase):
     def replay(self, record: dict) -> tuple:
         scores = record["scores"]["replay"]
         return scores["review"], scores["feature"], scores["regressions"]
+
+    def schedule_patches(self) -> tuple:
+        """The fixture task as the experiment's one task, stub sessions, and the schedule's log kept quiet."""
+        return (self.sessions(), mock.patch.object(pilot, "scored_tasks", lambda experiment: [self.task]),
+                contextlib.redirect_stdout(io.StringIO()))
+
+    def frozen(self) -> contextlib.ExitStack:
+        """`schedule_patches` with the freeze taken as verified, under manifest digest "d"."""
+        stack = contextlib.ExitStack()
+        for patch in (*self.schedule_patches(), mock.patch.object(manifest, "verify", return_value="d")):
+            stack.enter_context(patch)
+        return stack
+
+    def run_cells(self, only_arm=None, experiment=None) -> int:
+        with self.frozen():
+            return cells.run(self.tmp, experiment or self.experiment, only_arm=only_arm)
+
+    def run_with_one_failed_review(self) -> str:
+        """A whole run in which the first review session cannot start and is not retried: that cell's first
+        execution is invalid and the run fails. Returns the cell's run id."""
+        failing = iter([True])
+
+        def flaky(model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE, offline=False):
+            if role == agents.REVIEWER and next(failing, False):
+                raise OSError("spawn failed")
+            return self.agent(model, prompt, role=role, cwd=cwd, out_dir=out_dir, provider=provider, offline=offline)
+
+        with self.frozen(), mock.patch.object(loop, "MAX_ATTEMPTS", 1), \
+             mock.patch.multiple(agents, run_claude=flaky, run_codex=flaky):
+            self.assertEqual(cells.run(self.tmp, self.experiment), 1)
+        invalid = [path.parent.parent.name for path in self.runs.glob("fixture--*--r*/exec-1/record.json")
+                   if json.loads(path.read_text())["status"] == "invalid"]
+        self.assertEqual(len(invalid), 1)
+        return invalid[0]
 
 
 class ExecuteCellTest(CellCase):
@@ -215,20 +250,6 @@ class ScheduleTest(unittest.TestCase):
 class RunTest(CellCase):
     """The paired schedule over the fixture task, with stub sessions and the freeze taken as verified."""
 
-    def setUp(self):
-        super().setUp()
-        self.experiment = dataclasses.replace(PLAIN_REVIEW, tasks=("fixture",))
-
-    def schedule_patches(self):
-        return (self.sessions(), mock.patch.object(pilot, "scored_tasks", lambda experiment: [self.task]),
-                contextlib.redirect_stdout(io.StringIO()))
-
-    def run_cells(self, only_arm=None, experiment=None) -> int:
-        with contextlib.ExitStack() as stack:
-            for patch in (*self.schedule_patches(), mock.patch.object(manifest, "verify", return_value="d")):
-                stack.enter_context(patch)
-            return cells.run(self.tmp, experiment or self.experiment, only_arm=only_arm)
-
     def run_dirs(self) -> list[str]:
         return sorted(path.name for path in self.runs.iterdir())
 
@@ -266,23 +287,9 @@ class RunTest(CellCase):
         self.assertEqual({call["model"] for call in self.calls if call["role"] == agents.REVIEWER}, {SOL.model})
 
     def test_a_failed_cell_fails_the_run_and_is_run_again(self):
-        failing = iter([True])
-
-        def flaky(model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE, offline=False):
-            if role == agents.REVIEWER and next(failing, False):
-                raise OSError("spawn failed")
-            return self.agent(model, prompt, role=role, cwd=cwd, out_dir=out_dir, provider=provider, offline=offline)
-
-        with mock.patch.object(loop, "MAX_ATTEMPTS", 1), contextlib.ExitStack() as stack:
-            for patch in (*self.schedule_patches(), mock.patch.object(manifest, "verify", return_value="d")):
-                stack.enter_context(patch)
-            stack.enter_context(mock.patch.multiple(agents, run_claude=flaky, run_codex=flaky))
-            self.assertEqual(cells.run(self.tmp, self.experiment), 1)
-        invalid = [path for path in self.runs.glob("fixture--*--r*/exec-1/record.json")
-                   if json.loads(path.read_text())["status"] == "invalid"]
-        self.assertEqual(len(invalid), 1)
+        failed = self.run_with_one_failed_review()
         self.assertEqual(self.run_cells(), 0)
-        self.assertTrue((invalid[0].parent.parent / "exec-2" / "record.json").exists())
+        self.assertTrue((self.runs / failed / "exec-2" / "record.json").exists())
 
     def test_a_routed_experiment_is_refused_before_anything_runs(self):
         routed = dataclasses.replace(self.experiment, arms=(
