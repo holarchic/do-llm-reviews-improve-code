@@ -61,6 +61,15 @@ class ProbePlanTest(unittest.TestCase):
                                    (experiments.SOL, agents.REVIEWER)})
         self.assertFalse(any(p.offline or p.kind == "network" for p in probe.probe_plan(experiments.PILOT)))
 
+    def test_plain_review_probes_its_cells_reviewers_offline_and_no_judge(self):
+        plan = {p.name: p for p in probe.probe_plan(experiments.PLAIN_REVIEW)}
+        self.assertEqual(set(plan), {"claude_instructions", "codex_instructions", "claude_canary", "codex_canary",
+                                     "claude_reviewer_read_only", "claude_network_writer", "claude_network_reviewer",
+                                     "codex_network_reviewer"})
+        self.assertTrue(all(p.offline for p in plan.values()))
+        self.assertEqual((plan["codex_network_reviewer"].agent, plan["claude_network_reviewer"].agent),
+                         (experiments.SOL, experiments.OPUS))
+
 
 class NetworkProblemsTest(unittest.TestCase):
     STEPS = probe.network_steps("20.26.156.215", "LOCAL-1")

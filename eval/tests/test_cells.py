@@ -1,15 +1,20 @@
+import contextlib
+import dataclasses
+import hashlib
+import io
 import json
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from eval.harness import agents, experiments, loop, prompts, records, tasks
+from eval.__main__ import main
+from eval.harness import agents, cells, experiments, loop, manifest, pilot, prompts, records, tasks
+from eval.harness.pilot import BuildJob
 from eval.tests.test_source import PRE_REVIEW_CALC, REFERENCE_CALC, FixtureCase, git
 
 OPUS, SOL = experiments.OPUS, experiments.SOL
-NONE = loop.Arm("none", OPUS)
-SAME = loop.Arm("same", OPUS, OPUS, review=loop.PLAIN)
-OTHER = loop.Arm("other", OPUS, SOL, review=loop.PLAIN)
+PLAIN_REVIEW = experiments.PLAIN_REVIEW
+NONE, SAME, OTHER = (PLAIN_REVIEW.arm(name) for name in ("none", "same", "other"))
 REVIEW_TEXT = "1. calc.py:5: div(1, 0) raises ZeroDivisionError where TASK.md asks for a ValueError.\n"
 FIX_TEXT = "Guarded the divisor.\n\n1: fixed, a zero divisor now raises ValueError\n"
 BUILD_PROMPT = "Implement TASK.md"
@@ -173,7 +178,238 @@ class ExecuteCellTest(CellCase):
                 self.assertIsNone(records.cell(broken, "d"))
 
 
+class ScheduleTest(unittest.TestCase):
+    def test_one_build_per_task_then_every_cell_of_every_reviewer(self):
+        plan = cells.schedule(PLAIN_REVIEW)
+        task_ids = PLAIN_REVIEW.tasks
+        self.assertEqual(sorted(plan.builds), sorted(BuildJob(task, "none", None) for task in task_ids))
+        self.assertEqual(sorted(plan.cells), sorted(BuildJob(task, arm, rep) for task in task_ids
+                                                    for arm in ("same", "other") for rep in (1, 2)))
+
+    def test_the_order_of_a_three_task_experiment(self):
+        three = dataclasses.replace(PLAIN_REVIEW, tasks=PLAIN_REVIEW.tasks[:3])
+        plan = cells.schedule(three)
+        self.assertEqual([job.task for job in plan.builds],
+                         ["jobscan-email-v2", "jobscan-workable-gem-v2", "jobscan-greenhouse-v2"])
+        short = {"jobscan-email-v2": "email", "jobscan-greenhouse-v2": "greenhouse", "jobscan-workable-gem-v2": "gem"}
+        self.assertEqual([(short[job.task], job.arm, job.rep) for job in plan.cells], [
+            ("email", "other", 1), ("greenhouse", "same", 2), ("gem", "other", 1), ("greenhouse", "other", 2),
+            ("email", "same", 2), ("email", "same", 1), ("greenhouse", "same", 1), ("gem", "same", 2),
+            ("greenhouse", "other", 1), ("gem", "other", 2), ("gem", "same", 1), ("email", "other", 2)])
+
+    def test_the_orders_depend_only_on_the_seed(self):
+        self.assertEqual(cells.schedule(PLAIN_REVIEW), cells.schedule(PLAIN_REVIEW))
+        reseeded = cells.schedule(dataclasses.replace(PLAIN_REVIEW, seed=PLAIN_REVIEW.seed + 7))
+        self.assertNotEqual(reseeded.cells, cells.schedule(PLAIN_REVIEW).cells)
+
+    def test_cell_runs_are_numbered_from_one_even_when_there_is_one(self):
+        single = dataclasses.replace(PLAIN_REVIEW, reps=1)
+        self.assertEqual({job.rep for job in cells.schedule(single).cells}, {1})
+
+    def test_the_replay_keeps_its_schedule(self):
+        jobs = [[job.task, job.arm, job.rep] for job in pilot.build_schedule(experiments.REPLAY)]
+        self.assertEqual(hashlib.sha256(json.dumps(jobs).encode()).hexdigest(),
+                         "f8fd051472ceb25854c44b041a6556a3a99f42b74f27d2f9b29957e52bed6be6")
+
+
+class RunTest(CellCase):
+    """The paired schedule over the fixture task, with stub sessions and the freeze taken as verified."""
+
+    def setUp(self):
+        super().setUp()
+        self.experiment = dataclasses.replace(PLAIN_REVIEW, tasks=("fixture",))
+
+    def schedule_patches(self):
+        return (self.sessions(), mock.patch.object(pilot, "scored_tasks", lambda experiment: [self.task]),
+                contextlib.redirect_stdout(io.StringIO()))
+
+    def run_cells(self, only_arm=None, experiment=None) -> int:
+        with contextlib.ExitStack() as stack:
+            for patch in (*self.schedule_patches(), mock.patch.object(manifest, "verify", return_value="d")):
+                stack.enter_context(patch)
+            return cells.run(self.tmp, experiment or self.experiment, only_arm=only_arm)
+
+    def run_dirs(self) -> list[str]:
+        return sorted(path.name for path in self.runs.iterdir())
+
+    def test_a_run_builds_once_then_runs_every_cell_and_a_rerun_calls_no_model(self):
+        self.assertEqual(self.run_cells(), 0)
+        self.assertEqual([call["building"] for call in self.calls], [True] + [False] * 8)
+        self.assertEqual(self.run_dirs(), ["fixture--none", "fixture--other--r1", "fixture--other--r2",
+                                           "fixture--same--r1", "fixture--same--r2"])
+        build = cells.pairing(self.runs / "fixture--none" / "exec-1")
+        for name in self.run_dirs()[1:]:
+            record = records.cell(self.runs / name / "exec-1" / "record.json", "d")
+            self.assertEqual(cells.pairing_of(record), build, name)
+        reviewers = [call["model"] for call in self.calls if call["role"] == agents.REVIEWER]
+        self.assertEqual(sorted(reviewers), sorted([OPUS.model] * 2 + [SOL.model] * 2))
+        self.calls.clear()
+        self.assertEqual(self.run_cells(), 0)
+        self.assertEqual(self.calls, [])
+
+    def test_a_task_whose_build_changed_is_refused_even_after_every_cell_finished(self):
+        self.assertEqual(self.run_cells(), 0)
+        self.build_calc = REFERENCE_CALC
+        self.build()  # a newer complete build of the task, with another artifact
+        self.calls.clear()
+        self.assertEqual(self.run_cells(), 1)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.run_cells(only_arm="same"), 1)
+
+    def test_only_arm_runs_that_arms_jobs(self):
+        self.assertEqual(self.run_cells(only_arm="same"), 1)  # no build yet, and none is made for it
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.run_cells(only_arm="none"), 0)
+        self.assertEqual([call["building"] for call in self.calls], [True])
+        self.assertEqual(self.run_cells(only_arm="other"), 0)
+        self.assertEqual(self.run_dirs(), ["fixture--none", "fixture--other--r1", "fixture--other--r2"])
+        self.assertEqual({call["model"] for call in self.calls if call["role"] == agents.REVIEWER}, {SOL.model})
+
+    def test_a_failed_cell_fails_the_run_and_is_run_again(self):
+        failing = iter([True])
+
+        def flaky(model, prompt, *, role, cwd, out_dir, provider=agents.NATIVE, offline=False):
+            if role == agents.REVIEWER and next(failing, False):
+                raise OSError("spawn failed")
+            return self.agent(model, prompt, role=role, cwd=cwd, out_dir=out_dir, provider=provider, offline=offline)
+
+        with mock.patch.object(loop, "MAX_ATTEMPTS", 1), contextlib.ExitStack() as stack:
+            for patch in (*self.schedule_patches(), mock.patch.object(manifest, "verify", return_value="d")):
+                stack.enter_context(patch)
+            stack.enter_context(mock.patch.multiple(agents, run_claude=flaky, run_codex=flaky))
+            self.assertEqual(cells.run(self.tmp, self.experiment), 1)
+        invalid = [path for path in self.runs.glob("fixture--*--r*/exec-1/record.json")
+                   if json.loads(path.read_text())["status"] == "invalid"]
+        self.assertEqual(len(invalid), 1)
+        self.assertEqual(self.run_cells(), 0)
+        self.assertTrue((invalid[0].parent.parent / "exec-2" / "record.json").exists())
+
+    def test_a_routed_experiment_is_refused_before_anything_runs(self):
+        routed = dataclasses.replace(self.experiment, arms=(
+            NONE, loop.Arm("same", OPUS, experiments.GLM_REVIEWER, review=loop.PLAIN)))
+        with self.assertRaisesRegex(ValueError, "native sessions only"):
+            self.run_cells(experiment=routed)
+        self.assertEqual(self.calls, [])
+
+    def test_an_unfrozen_experiment_runs_nothing(self):
+        with contextlib.ExitStack() as stack:
+            for patch in self.schedule_patches():
+                stack.enter_context(patch)
+            stack.enter_context(mock.patch.object(manifest, "MANIFESTS", self.tmp / "no-manifests"))
+            with self.assertRaises(manifest.ManifestMismatch):
+                cells.run(self.tmp, self.experiment)
+        self.assertEqual(self.calls, [])
+
+    def test_finished_means_the_review_and_the_fix_both_ran_to_the_end(self):
+        build_exec = self.build()
+        self.assertTrue(cells.finished(self.cell(build_exec, rep=1)))
+        self.times_out = agents.REVIEWER
+        self.assertFalse(cells.finished(self.cell(build_exec, rep=2)))
+        self.times_out = agents.WRITER
+        self.assertFalse(cells.finished(self.cell(build_exec, rep=3)))
+        self.times_out, self.fix_text = None, " \n"
+        silent = self.cell(build_exec, rep=4)
+        self.assertEqual(silent["status"], "complete")
+        self.assertFalse(cells.finished(silent))
+
+    def test_calibration_builds_afresh_and_runs_its_cells_unscored(self):
+        with contextlib.ExitStack() as stack:
+            for patch in self.schedule_patches():
+                stack.enter_context(patch)
+            built = cells.calibrate(self.tmp, self.experiment, ["fixture"], "other", reps=2)
+        self.assertEqual([record["run_id"] for record in built], ["fixture--other--r1", "fixture--other--r2"])
+        self.assertTrue(all(record["manifest"] is None and cells.finished(record) for record in built))
+        self.assertTrue((self.tmp / "calibration" / "runs" / "fixture--none" / "exec-1" / "artifact").is_dir())
+        self.assertFalse(self.runs.exists())
+
+
+def cell_record(**changes) -> dict:
+    step = {"attempts": [{"terminal": agents.COMPLETED, "seconds": 1.0, "usage": {}}]}
+    return {"run_id": "t--same--r1", "exec": "exec-1", "status": "complete", "flags": [], "scores": {},
+            "steps": [{"name": "review", **step}, {"name": "fix", **step}], "review_text": "1. x", "fix_text": "1: fixed",
+            **changes}
+
+
+class FinishedTest(unittest.TestCase):
+    """`finished` on records as they are read back: each condition on its own."""
+
+    def attempt(self, terminal: str) -> dict:
+        return {"terminal": terminal, "seconds": 1.0, "usage": {}}
+
+    def steps(self, review: list[str], fix: list[str]) -> list[dict]:
+        return [{"name": "review", "attempts": [self.attempt(t) for t in review]},
+                {"name": "fix", "attempts": [self.attempt(t) for t in fix]}]
+
+    def test_a_cell_whose_two_steps_completed_and_spoke_is_finished(self):
+        self.assertTrue(cells.finished(cell_record()))
+        retried = cell_record(steps=self.steps([agents.INFRA, agents.COMPLETED], [agents.COMPLETED]))
+        self.assertTrue(cells.finished(retried))  # the last attempt of a step is the one that counts
+
+    def test_each_way_of_not_finishing(self):
+        unfinished = {
+            "a fix whose last session timed out": cell_record(steps=self.steps([agents.COMPLETED], [agents.TIMEOUT])),
+            "a review whose last session timed out": cell_record(steps=self.steps([agents.TIMEOUT], [agents.COMPLETED])),
+            "no fix step": cell_record(steps=self.steps([agents.COMPLETED], [agents.COMPLETED])[:1]),
+            "an invalid record": cell_record(status="invalid"),
+            "a reviewer that said nothing": cell_record(review_text="\n"),
+            "a fixer that said nothing": cell_record(fix_text=""),
+        }
+        for name, record in unfinished.items():
+            with self.subTest(name):
+                self.assertFalse(cells.finished(record))
+
+
+class CliTest(unittest.TestCase):
+    def cli(self, *argv) -> int:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return main(list(argv))
+
+    def test_run_sends_a_paired_experiment_to_its_own_schedule(self):
+        with mock.patch.object(cells, "run", return_value=0) as run, \
+             mock.patch.object(pilot, "run_builds", side_effect=AssertionError("the pilot's schedule")):
+            self.assertEqual(self.cli("run", "--experiment", "plain-review", "--arm", "same"), 0)
+        self.assertEqual((run.call_args.args[1], run.call_args.kwargs), (PLAIN_REVIEW, {"only_arm": "same"}))
+
+    def test_other_experiments_keep_the_pilots_schedule(self):
+        with mock.patch.object(pilot, "run_builds", return_value=0) as run_builds, \
+             mock.patch.object(cells, "run", side_effect=AssertionError("the paired schedule")):
+            self.assertEqual(self.cli("run", "--experiment", "replay", "--arm", "A1"), 0)
+        self.assertEqual(run_builds.call_args.kwargs, {"only_arm": "A1"})
+
+    def test_a_paired_experiment_has_no_dev_build_and_no_cost_command(self):
+        with mock.patch.object(cells, "run", side_effect=AssertionError("must not run")):
+            self.assertEqual(self.cli("run", "--experiment", "plain-review", "--task", "dev-intervals", "--arm",
+                                      "same"), 2)
+            self.assertEqual(self.cli("run", "--experiment", "plain-review", "--arm", "A3"), 2)
+        self.assertEqual(self.cli("cost", "--experiment", "plain-review"), 2)
+
+    def test_calibrate_sends_a_cell_arm_to_cells_and_succeeds_only_on_finished_cells(self):
+        argv = ("calibrate", "--experiment", "plain-review", "--task", "jobscan-watchlist-v2", "--arm", "other",
+                "--reps", "1")
+        timed_out = cell_record(flags=["timeout:review"], steps=cell_record()["steps"][:1], review_text="")
+        for record, code in ((cell_record(), 0), (timed_out, 1)):
+            with self.subTest(code=code), mock.patch.object(cells, "calibrate", return_value=[record]) as calibrate, \
+                 mock.patch.object(pilot, "run_calibration", side_effect=AssertionError("a build calibration")):
+                self.assertEqual(self.cli(*argv), code)
+                self.assertEqual(calibrate.call_args.args[2:], (["jobscan-watchlist-v2"], "other", 1))
+
+    def test_calibrating_the_baseline_stays_a_build_calibration(self):
+        with mock.patch.object(pilot, "run_calibration", return_value=[]) as run_calibration, \
+             mock.patch.object(cells, "calibrate", side_effect=AssertionError("a cell calibration")):
+            self.assertEqual(self.cli("calibrate", "--experiment", "plain-review", "--task", "jobscan-watchlist-v2",
+                                      "--reps", "1"), 1)
+        self.assertEqual(run_calibration.call_args.args[2:], (["jobscan-watchlist-v2"], "none", 1))
+
+
 class ArmTest(unittest.TestCase):
+    def test_the_plain_review_experiment_declares_two_cells_on_one_baseline(self):
+        self.assertEqual((PLAIN_REVIEW.baseline, PLAIN_REVIEW.cell_arms, PLAIN_REVIEW.reps, PLAIN_REVIEW.report),
+                         ("none", ("same", "other"), 2, "paired"))
+        self.assertEqual((NONE.reviewer, SAME.reviewer, OTHER.reviewer), (None, OPUS, SOL))
+        self.assertTrue(PLAIN_REVIEW.offline and not PLAIN_REVIEW.routed)
+        self.assertTrue(all(not experiment.cell_arms for name, experiment in experiments.EXPERIMENTS.items()
+                            if name != "plain-review"))
+
     def test_an_arm_is_a_loop_arm_unless_it_says_plain(self):
         self.assertEqual(loop.Arm("A3", OPUS, SOL).review, loop.LOOP)
         self.assertEqual(loop.Arm("A3", OPUS, SOL), loop.Arm("A3", OPUS, SOL, review=loop.LOOP))

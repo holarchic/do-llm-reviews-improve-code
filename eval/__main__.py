@@ -33,7 +33,8 @@ def main(argv: list[str]) -> int:
     parsers["run"].add_argument("--arm", help="one of the experiment's arms; without --task, that arm's builds only")
     parsers["calibrate"].add_argument("--task", action="append", help="one of the experiment's tasks, repeatable "
                                       "(default: all); one process, so one writer of the spend ledger")
-    parsers["calibrate"].add_argument("--arm", help="default: the baseline arm; a loop arm gives a cost sample")
+    parsers["calibrate"].add_argument("--arm", help="default: the baseline arm; a loop arm gives a cost sample; "
+                                      "a review-cell arm runs --reps cells on a fresh build per task")
     parsers["calibrate"].add_argument("--reps", type=int, default=2)
     parsers["judge"].add_argument("--task", help="dev task: calibrate, or judge --pair, on one task")
     parsers["judge"].add_argument("--judge", choices=["fable", "astra"], required=False)
@@ -116,14 +117,19 @@ def _probe(args) -> int:
 
 
 def _run(args) -> int:
-    from .harness import pilot, tasks
+    from .harness import cells, pilot, tasks
 
     experiment = args.experiment
+    paired = experiment.report == "paired"
+    if paired and args.task:
+        print(f"run: {experiment.name} is paired and has no development build; --task is not for it", file=sys.stderr)
+        return 2
     if not args.task:
         if args.arm is not None and args.arm not in experiment.arm_names:
             print(f"run: --arm must be one of {', '.join(experiment.arm_names)}", file=sys.stderr)
             return 2
-        return _guarded(lambda: pilot.run_builds(_data_root(experiment), experiment, only_arm=args.arm))
+        scheduled = cells.run if paired else pilot.run_builds
+        return _guarded(lambda: scheduled(_data_root(experiment), experiment, only_arm=args.arm))
     if args.arm not in experiment.arm_names:
         print(f"run: --task needs --arm, one of {', '.join(experiment.arm_names)}", file=sys.stderr)
         return 2
@@ -135,7 +141,7 @@ def _run(args) -> int:
 
 
 def _calibrate(args) -> int:
-    from .harness import pilot, spend
+    from .harness import cells, pilot, spend
 
     experiment = args.experiment
     task_ids = args.task or list(experiment.tasks)
@@ -147,17 +153,20 @@ def _calibrate(args) -> int:
         print("calibrate: each task once, and --reps at least 1", file=sys.stderr)
         return 2
     data_root = _data_root(experiment)
-    built = pilot.run_calibration(data_root, experiment, task_ids, arm, args.reps)
+    cell = arm in experiment.cell_arms
+    built = (cells.calibrate if cell else pilot.run_calibration)(data_root, experiment, task_ids, arm, args.reps)
+    # A cell that timed out is complete, and has not shown that a review and its fix run end to end.
+    done = cells.finished if cell else (lambda record: record["status"] == "complete")
     for record in built:
         # Priced by the ledger: an unpriced model raises rather than counting as $0.
         priced = spend.execution_cost(data_root / "calibration" / "runs" / record["run_id"] / record["exec"],
                                       experiment.arm(arm)).totals()
         cost = f" list=${priced.cost.low:.3f}–{priced.cost.high:.3f} unknown={priced.unknown}"
         print(f"{record['run_id']} {record['exec']}: {record['status']} {_score_line(record.get('scores') or {})}"
-              f"{cost} flags={record.get('flags')}")
-    # A job that crashed or wasn't admitted leaves no record, so success needs every requested build.
-    complete = sum(record["status"] == "complete" for record in built)
-    return 0 if complete == len(task_ids) * args.reps else 1
+              f"{cost} minutes={priced.seconds / 60:.1f} flags={record.get('flags')}"
+              + ("" if done(record) or not cell else " (not finished)"))
+    # A job that crashed or wasn't admitted leaves no record, so success needs every requested run.
+    return 0 if sum(done(record) for record in built) == len(task_ids) * args.reps else 1
 
 
 def _percent(value) -> str:
@@ -269,6 +278,10 @@ def _guarded(action) -> int:
 def _cost(args) -> int:
     from .harness import cost_report
 
+    if args.experiment.report == "paired":
+        # cost_report walks task × arm × replicate, and a paired baseline has no replicate.
+        print(f"cost: {args.experiment.name} is paired; its report carries the accounting (`report`)", file=sys.stderr)
+        return 2
     unknown = sorted(set(args.arm or ()) - set(args.experiment.arm_names))
     if unknown:
         print(f"cost: no arm {', '.join(unknown)}; one of {', '.join(args.experiment.arm_names)}", file=sys.stderr)

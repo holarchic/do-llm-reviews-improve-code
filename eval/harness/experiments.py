@@ -3,10 +3,13 @@
 Tier and reverse-direction experiments reuse the pilot's arm roles — A1 solo,
 A1r its replicate, A2 reviewed by the writer's own family, A3 by the other
 family — so their reports read the same way. Ablations compare the full loop
-with one switch off at a time. The pilot, pilot2 and the replay carry
-pre-registered decision rules; every other experiment needs its own
+with one switch off at a time. The pilot, pilot2, the replay and plain-review
+carry pre-registered decision rules; every other experiment needs its own
 `eval/prereg/<name>.md`, frozen, before it can run, and is descriptive until it
 defines one.
+
+plain-review is paired (`report="paired"`): its baseline is built once per task,
+and every other arm is a review cell run on copies of that build.
 
 pilot2 is judge-free: open-weight models through OpenRouter, three replicates per
 cell, scored by hidden tests and planted bugs (`report="replicated"`), under its
@@ -19,7 +22,7 @@ Sonnet↔Terra, Haiku↔Luna.
 from dataclasses import dataclass
 
 from .agents import DEEPSEEK, OPENROUTER, Agent
-from .loop import Arm
+from .loop import PLAIN, Arm
 
 HAIKU = Agent("claude", "claude-haiku-5-5")
 SONNET = Agent("claude", "claude-sonnet-5-5")
@@ -38,6 +41,10 @@ PILOT2_TASKS = ("calc-expr", "cron-next", "ignore-match", "json-patch", "semver-
 # Filled as each task is authored, audited and validated.
 REPLAY_TASKS: tuple[str, ...] = ("jobscan-email", "jobscan-greenhouse", "jobscan-workable-gem", "jobscan-setup-commands",
                                  "jobscan-watchlist", "jobscan-company-notes")
+# The audited task versions; grows as each new task is authored and validated, and is fixed at the freeze.
+PLAIN_REVIEW_TASKS: tuple[str, ...] = ("jobscan-email-v2", "jobscan-greenhouse-v2", "jobscan-workable-gem-v2",
+                                       "jobscan-setup-commands-v2", "jobscan-watchlist-v2",
+                                       "jobscan-company-notes-v2")
 
 
 @dataclass(frozen=True)
@@ -52,13 +59,17 @@ class Experiment:
     seed: int
     data_dir: str  # under eval/data; the pilot's data sits at the root
     prereg: str  # relative to eval/
-    decision_rule: str | None  # whose pre-registered rule applies: "pilot", "pilot2", "replay" or none (descriptive)
+    # Whose pre-registered rule applies: "pilot", "pilot2", "replay", "plain-review" or none (descriptive).
+    decision_rule: str | None
     tasks: tuple[str, ...] = PILOT_TASKS
-    reps: int = 1  # replicates per task × arm; above 1, run ids end in --r<n>
+    # Replicates per task × arm; above 1, run ids end in --r<n>. In a paired experiment: runs per review
+    # cell, numbered from 1, while the baseline is built once per task with no replicate number.
+    reps: int = 1
     parallel: int = 3
     budget_usd: float | None = None  # pilot 2's OpenRouter spend cap (history; new routed runs use `envelope`)
     envelope: str | None = None  # the spend envelope a routed experiment draws on (envelope.py)
-    report: str = "judged"  # "judged" (report.py) | "replicated" (replicated.py) | "replay" (replay.py)
+    # "judged" (report.py) | "replicated" (replicated.py) | "replay" (replay.py) | "paired" (cells.py, paired.py)
+    report: str = "judged"
     offline: bool = False  # tool commands reach no network beyond localhost (agents.py); a source task requires it
 
     def arm(self, name: str) -> Arm:
@@ -67,6 +78,11 @@ class Experiment:
     @property
     def arm_names(self) -> tuple[str, ...]:
         return tuple(arm.name for arm in self.arms)
+
+    @property
+    def cell_arms(self) -> tuple[str, ...]:
+        """The review cells: arms whose reviewer reviews a stored build of the baseline once."""
+        return tuple(arm.name for arm in self.arms if arm.review == PLAIN)
 
     @property
     def treatments(self) -> tuple[str, ...]:
@@ -179,6 +195,27 @@ REPLAY = Experiment(
     offline=True,
 )
 
+# Plain review, the base experiment. The writer builds each task alone, once (`none`); each review cell then
+# runs on copies of that build: the same model in a fresh session (`same`) and the other family's (`other`).
+# Paired: a cell is compared with the build it started from.
+PLAIN_REVIEW = Experiment(
+    name="plain-review",
+    title="Eval plain-review report",
+    arms=(Arm("none", OPUS), Arm("same", OPUS, OPUS, review=PLAIN), Arm("other", OPUS, SOL, review=PLAIN)),
+    baseline="none",
+    replicate=None,
+    followup_arms=(),
+    pairs=(),
+    seed=20261111,
+    data_dir="plain-review",
+    prereg="prereg/plain-review.md",
+    decision_rule="plain-review",
+    tasks=PLAIN_REVIEW_TASKS,
+    reps=2,
+    report="paired",
+    offline=True,
+)
+
 # B's candidate routes, as A3b admits them: every route under Claude Code (a writer) and Codex (a
 # reviewer). Never scheduled, frozen or scored (no tasks): its probes and the admission checks run on it.
 _ADMISSION_MODELS = ((OPENROUTER, "z-ai/glm-5.3"), (OPENROUTER, "z-ai/glm-5.3-flash"),
@@ -206,6 +243,7 @@ EXPERIMENTS = {experiment.name: experiment for experiment in (
     PILOT,
     PILOT2,
     REPLAY,
+    PLAIN_REVIEW,
     tier("sonnet", SONNET, TERRA, seed=20261101),
     tier("opus", OPUS, SOL, seed=20261102),
     reverse("reverse-sonnet", TERRA, SONNET, seed=20261103),
