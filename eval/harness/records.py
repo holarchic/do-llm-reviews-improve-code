@@ -17,6 +17,7 @@ _IDENTITY = ("run_id", "task", "arm")
 _TOKEN_KEYS = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens",
                "cached_input_tokens")
 _OWN_TEST_KEYS = ("collected", "pass_on_reference", "fail_on_reference", "load_errors")
+_CELL_STRINGS = ("build_run", "build_exec", "build_artifact", "review_text", "fix_text")
 
 
 def build(path: Path, digest: str) -> dict | None:
@@ -34,6 +35,16 @@ def build(path: Path, digest: str) -> dict | None:
         and isinstance(record.get("rounds"), dict) and all(isinstance(v, int) for v in record["rounds"].values())
         and (record.get("rep") is None or (_count(record["rep"]) and isinstance(record["rep"], int)))
     )
+    return record if valid else None
+
+
+def cell(path: Path, digest: str | None) -> dict | None:
+    """A complete review-cell record under this manifest, or None: a build record that also names the build
+    the cell started from, numbers its run, and keeps the reviewer's report and the fixer's reply."""
+    record = build(path, digest)
+    if record is None:
+        return None
+    valid = all(isinstance(record.get(key), str) for key in _CELL_STRINGS) and isinstance(record.get("rep"), int)
     return record if valid else None
 
 

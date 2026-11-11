@@ -5,6 +5,9 @@ The harness, not the model, sequences the loop. Each step is one fresh
 headless session; after every writer step the harness commits, so HEAD always
 holds the latest attempt and an infrastructure retry restarts from it.
 Terminal rules are the pre-registered ones in PREREG.md.
+
+A review cell is the other kind of run: one review and one fix on a copy of a
+stored solo build, scored like a build and compared with that build.
 """
 
 import hashlib
@@ -15,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -26,6 +30,10 @@ from .tasks import Task
 MAX_ATTEMPTS = 3
 MAX_ROUNDS = 5
 REVIEW_PASSES = ("correctness", "architecture")
+# What an arm's reviewer does: the build loop's rounds, or one plain review of a stored build (a review cell).
+LOOP, PLAIN = "loop", "plain"
+# A review cell's two steps.
+REVIEW_STEP, FIX_STEP = "review", "fix"
 # The operator's git config (signing, hooks, templates) stays out of run repos.
 _GIT_ENV = {"GIT_AUTHOR_NAME": "eval", "GIT_AUTHOR_EMAIL": "eval@localhost",
             "GIT_COMMITTER_NAME": "eval", "GIT_COMMITTER_EMAIL": "eval@localhost",
@@ -37,13 +45,23 @@ _REPO_GITIGNORE = "__pycache__/\n*.pyc\n"
 class Arm:
     """One treatment. Without a reviewer the writer works alone from TASK.md. The switches are the
     ablations: `writer_rules` (the writer gets the Code rules and rubric — reviewers always keep the
-    rubric), `plan_review`, and which review `passes` run after the build."""
+    rubric), `plan_review`, and which review `passes` run after the build.
+
+    `review` says what the reviewer does. LOOP is the build loop, which the switches shape. PLAIN is a
+    review cell (`execute_cell`): one review and one fix on a stored build, where no switch applies."""
     name: str
     writer: agents.Agent
     reviewer: agents.Agent | None = None
     writer_rules: bool = True
     plan_review: bool = True
     passes: tuple[str, ...] = REVIEW_PASSES
+    review: str = LOOP
+
+    def __post_init__(self):
+        if self.review not in (LOOP, PLAIN):
+            raise ValueError(f"{self.name}: unknown review kind {self.review!r}")
+        if self.review == PLAIN and self.reviewer is None:
+            raise ValueError(f"{self.name}: a plain arm needs a reviewer")
 
 
 
@@ -151,6 +169,9 @@ def execute_run(task: Task, arm: Arm, runs_root: Path, *, rep: int | None = None
     if brownfield and not offline:
         # The source's history is public: a networked session could read the landed phase.
         raise ValueError(f"{task.id} replays a source repository and runs only offline")
+    if arm.review == PLAIN:
+        # It has a reviewer, so the loop would otherwise take it for one of its own arms.
+        raise ValueError(f"{arm.name} is a review cell: it runs on a stored build, through execute_cell")
     run_id_ = run_id(task.id, arm.name, rep)
     exec_dir = _next_exec_dir(runs_root.resolve() / run_id_)
     run = _Run(repo=audit.anonymous_workdir() / "repo", exec_dir=exec_dir, arm=arm,
@@ -211,6 +232,51 @@ def execute_followup(task: Task, build_exec_dir: Path, arm: Arm, *, manifest_has
 
     _execute(run, record, work, scores)
     _write_record(out_dir, record, arm)
+    return record
+
+
+def execute_cell(task: Task, build_exec_dir: Path, arm: Arm, runs_root: Path, *, rep: int,
+                 manifest_hash: str | None, offline: bool = False) -> dict:
+    """A review cell: in a copy of a finished solo build, the arm's reviewer reviews the change once and a
+    fresh session of its writer fixes what it finds real. Scored like a build.
+
+    The build's record is the cell's comparator, so the cell starts from the tree that record scored: a
+    stored repo whose HEAD is any other tree is refused before a session runs. The record names the build
+    and keeps the reviewer's report and the fixer's reply, each empty when its step did not finish.
+    """
+    if arm.review != PLAIN:
+        raise ValueError(f"{arm.name} is not a review cell")
+    if task.source is None or not offline:
+        raise ValueError(f"{task.id}: a review cell runs on a replayed source repository, offline")
+    build_exec_dir = build_exec_dir.resolve()
+    build = records.build(build_exec_dir / "record.json", manifest_hash)
+    if build is None:
+        raise ValueError(f"no complete build record under this manifest in {build_exec_dir}")
+    scored = artifact_digest(build_exec_dir / "artifact")
+    if _head_digest(build_exec_dir / "repo") != scored:
+        raise ValueError(f"{build_exec_dir}: the stored repo's HEAD is not the tree that was scored")
+    run_id_ = run_id(task.id, arm.name, rep)
+    exec_dir = _next_exec_dir(runs_root.resolve() / run_id_)
+    run = _Run(repo=audit.anonymous_workdir() / "repo", exec_dir=exec_dir, arm=arm, brownfield=True,
+               suite_seconds=source.SUITE_SECONDS, offline=offline)
+    record = {"run_id": run_id_, "task": task.id, "arm": arm.name, "rep": rep, "exec": exec_dir.name,
+              "manifest": manifest_hash, "cli_versions": _cli_versions(), "started": _now(),
+              "build_run": build["run_id"], "build_exec": build_exec_dir.name, "build_artifact": scored}
+    texts = {"review_text": "", "fix_text": ""}
+
+    def work():
+        shutil.copytree(build_exec_dir / "repo", run.repo, symlinks=True)
+        # From the build's final commit, not from files its session left untracked.
+        _reset(run.repo, "HEAD")
+        run.last_commit = _git(run.repo, "rev-parse", "HEAD").strip()
+        # The repo's first commit is the seeded starting tree, so this range is the build's whole change.
+        base = _git(run.repo, "rev-list", "--max-parents=0", "HEAD").strip()
+        texts["review_text"] = _review_session(run, REVIEW_STEP, prompts.plain_review(base)).final_text
+        texts["fix_text"] = _writer(run, FIX_STEP, prompts.plain_fix(texts["review_text"])).final_text
+
+    _execute(run, record, work, lambda artifact: source.score_build(artifact, task, exec_dir / "scoring"))
+    record.update(rounds=run.rounds, **texts)
+    _write_record(exec_dir, record, arm)
     return record
 
 
@@ -282,6 +348,13 @@ def artifact_digest(artifact: Path) -> str:
     return digest.hexdigest()
 
 
+def _head_digest(repo: Path) -> str:
+    """The artifact digest of a repo's HEAD: the hash of what `materialize_head` writes for it."""
+    with tempfile.TemporaryDirectory(prefix="eval-head-") as tmp:
+        materialize_head(repo, Path(tmp) / "artifact")
+        return artifact_digest(Path(tmp) / "artifact")
+
+
 def _followup_scores(task: Task, before: dict[str, str], artifact: Path, out_dir: Path) -> dict:
     expected = task.expected()
     base = score.run_suite(artifact, task.path("hidden"), out_dir / "scoring" / "hidden")
@@ -349,16 +422,18 @@ def _loop(run: _Run) -> None:
             rules=rules, brownfield=brownfield))
 
 
-def _writer(run: _Run, name: str, prompt: str) -> None:
+def _writer(run: _Run, name: str, prompt: str) -> agents.Session:
     session = _step(run, name, run.arm.writer, lambda out: agents.run(
         run.arm.writer, prompt, role=agents.WRITER, cwd=run.repo, out_dir=out, offline=run.offline))
     run.last_commit = _commit(run.repo, name)
     if session.terminal == agents.TIMEOUT:
         run.flags.append(f"timeout:{name}")
         raise ModelTimeout(name)
+    return session
 
 
-def _review(run: _Run, name: str, prompt: str) -> Verdict:
+def _review_session(run: _Run, name: str, prompt: str) -> agents.Session:
+    """One reviewer session. Whatever it wrote is discarded and flagged; a timeout ends the run."""
     session = _step(run, name, run.arm.reviewer, lambda out: agents.run(
         run.arm.reviewer, prompt, role=agents.REVIEWER, cwd=run.repo, out_dir=out, offline=run.offline))
     if _git(run.repo, "status", "--porcelain"):
@@ -367,6 +442,12 @@ def _review(run: _Run, name: str, prompt: str) -> Verdict:
     if session.terminal == agents.TIMEOUT:
         run.flags.append(f"timeout:{name}")
         raise ModelTimeout(name)
+    return session
+
+
+def _review(run: _Run, name: str, prompt: str) -> Verdict:
+    """A loop review: the session, then the verdict its final text carries."""
+    session = _review_session(run, name, prompt)
     verdict = parse_verdict(session.final_text, basis_rule=run.basis_rule)
     if verdict.malformed:
         run.flags.append(f"malformed_verdict:{name}")

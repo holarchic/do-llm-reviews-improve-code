@@ -171,6 +171,36 @@ change. Run the tests.
     )
 
 
+def plain_review(base: str) -> str:
+    """A plain review of the change `base..HEAD`: no rule list, no severity scheme and no verdict line.
+    Nothing in it comes from the skill files."""
+    return (
+        "You are reviewing a change to this repository. TASK.md describes the change that was asked for; "
+        f"`git diff {base}..HEAD` shows what was built. Find the defects in the change: places where it does the "
+        "wrong thing, fails on input it should handle, or breaks behaviour that worked before. Number your findings. "
+        "For each, give the file and line, what goes wrong, and an input or situation that shows it. You may read "
+        "any file and run commands. Do not modify anything. If you find no defect, say so.\n"
+    )
+
+
+def plain_fix(review: str) -> str:
+    """The writer's one fix step after a plain review. The closing lines it asks for are the fixer's own
+    account of each finding; the paired report shows them as that."""
+    return (
+        _BROWNFIELD_PREAMBLE
+        + f"""
+A reviewer read your change and reported the findings below. Check each one against the code. Fix the ones that are
+real. Where a finding is wrong, leave the code and say why. Run the tests. End your reply with one line for each of
+the reviewer's findings: its number, then `fixed` or `left`, then why in a few words. If the reviewer reported none,
+end with the line `no findings`.
+
+<review>
+{review.strip()}
+</review>
+"""
+    )
+
+
 def followup_writer() -> str:
     return (
         _WRITER_PREAMBLE.replace("TASK.md describes the task.", "TASK.md describes what the code does today.")
