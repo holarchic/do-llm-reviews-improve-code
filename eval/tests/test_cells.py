@@ -334,6 +334,13 @@ class RunTest(CellCase):
         self.assertTrue((self.tmp / "calibration" / "runs" / "fixture--none" / "exec-1" / "artifact").is_dir())
         self.assertFalse(self.runs.exists())
 
+    def test_a_calibration_job_that_raises_yields_no_record(self):
+        with contextlib.ExitStack() as stack:
+            for patch in self.schedule_patches():
+                stack.enter_context(patch)
+            stack.enter_context(mock.patch.object(loop, "execute_run", side_effect=RuntimeError("no build")))
+            self.assertEqual(cells.calibrate(self.tmp, self.experiment, ["fixture"], "same", reps=1), [])
+
 
 def cell_record(**changes) -> dict:
     step = {"attempts": [{"terminal": agents.COMPLETED, "seconds": 1.0, "usage": {}}]}
@@ -362,6 +369,7 @@ class FinishedTest(unittest.TestCase):
             "a fix whose last session timed out": cell_record(steps=self.steps([agents.COMPLETED], [agents.TIMEOUT])),
             "a review whose last session timed out": cell_record(steps=self.steps([agents.TIMEOUT], [agents.COMPLETED])),
             "no fix step": cell_record(steps=self.steps([agents.COMPLETED], [agents.COMPLETED])[:1]),
+            "a step with no attempt on record": cell_record(steps=self.steps([agents.COMPLETED], [])),
             "an invalid record": cell_record(status="invalid"),
             "a reviewer that said nothing": cell_record(review_text="\n"),
             "a fixer that said nothing": cell_record(fix_text=""),

@@ -229,6 +229,8 @@ class FixReportTest(unittest.TestCase):
             "Done.\n\n- **1.** Fixed: the divisor\n- 2) left (not a defect)\n3 - FIXED\n": paired.FixReport(2, 1),
             "1: left, unsure\nLooked again.\n1: fixed, it was real\n": paired.FixReport(1, 0),
             "Finding 4: fixed\n": paired.FixReport(1, 0),
+            "Finding #1: fixed\nFinding #2 — left, intended\n": paired.FixReport(1, 1),
+            "1 fixed — punctuation now has to match too.\n": paired.FixReport(1, 0),
         }
         for text, expected in cases.items():
             with self.subTest(text):

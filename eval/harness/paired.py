@@ -28,7 +28,7 @@ ENDPOINTS = (REVIEW, REMOVED, BROUGHT_BACK, FEATURE, REGRESSIONS)
 INCOMPLETE, UNINFORMATIVE, DECIDED = "INCOMPLETE", "UNINFORMATIVE", "DECIDED"
 UNAVAILABLE = "unavailable"
 
-_DISPOSITION = re.compile(r"^\W*(?:finding\s+)?(\d+)\W+(fixed|left)\b", re.IGNORECASE | re.MULTILINE)
+_DISPOSITION = re.compile(r"^\W*(?:finding\W+)?(\d+)\W+(fixed|left)\b", re.IGNORECASE | re.MULTILINE)
 _NO_FINDINGS = re.compile(r"^\W*no findings\W*$", re.IGNORECASE | re.MULTILINE)
 
 
@@ -129,16 +129,15 @@ def collect(data_root: Path, experiment: Experiment) -> Results:
         for arm in experiment.cell_arms:
             for rep in cells.cell_runs(experiment):
                 run_id = loop.run_id(task.id, arm, rep)
-                exec_dir = cells.complete_cell(runs_root, task.id, arm, digest, rep)
-                _add_cost(results, experiment, arm, runs_root / run_id, exec_dir)
-                if exec_dir is None:
+                done = cells.complete_cell(runs_root, task.id, arm, digest, rep)
+                _add_cost(results, experiment, arm, runs_root / run_id, None if done is None else done.exec_dir)
+                if done is None:
                     results.missing.append(run_id)
                 elif build is not None:  # without its build a cell has no comparator; the build is listed missing
-                    record = records.cell(exec_dir / "record.json", digest)
-                    if cells.pairing_of(record) != build:
+                    if cells.pairing_of(done.record) != build:
                         results.invalid.append(run_id)
                     else:
-                        results.cells.setdefault(arm, {}).setdefault(task.id, []).append(record)
+                        results.cells.setdefault(arm, {}).setdefault(task.id, []).append(done.record)
     return results
 
 

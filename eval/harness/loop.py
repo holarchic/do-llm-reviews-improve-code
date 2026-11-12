@@ -32,8 +32,7 @@ MAX_ROUNDS = 5
 REVIEW_PASSES = ("correctness", "architecture")
 # What an arm's reviewer does: the build loop's rounds, or one plain review of a stored build (a review cell).
 LOOP, PLAIN = "loop", "plain"
-# A review cell's two steps.
-REVIEW_STEP, FIX_STEP = "review", "fix"
+REVIEW_STEP, FIX_STEP = "review", "fix"  # the step names in a review cell's record
 # The operator's git config (signing, hooks, templates) stays out of run repos.
 _GIT_ENV = {"GIT_AUTHOR_NAME": "eval", "GIT_AUTHOR_EMAIL": "eval@localhost",
             "GIT_COMMITTER_NAME": "eval", "GIT_COMMITTER_EMAIL": "eval@localhost",

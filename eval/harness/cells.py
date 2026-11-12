@@ -42,21 +42,34 @@ def schedule(experiment: Experiment) -> Schedule:
     return Schedule(builds, cells)
 
 
-def pairing(build_exec: Path) -> tuple[str, str, str]:
-    """What a cell record names when it started from this build: the build's run, exec and artifact digest."""
-    return build_exec.parent.name, build_exec.name, loop.artifact_digest(build_exec / "artifact")
+class Pairing(NamedTuple):
+    """The build a cell started from."""
+    run: str
+    exec: str
+    artifact: str  # the digest of the tree that was scored
 
 
-def pairing_of(cell: dict) -> tuple[str, str, str]:
-    return cell["build_run"], cell["build_exec"], cell["build_artifact"]
+class CompleteCell(NamedTuple):
+    exec_dir: Path
+    record: dict
 
 
-def complete_cell(runs_root: Path, task_id: str, arm: str, digest: str | None, rep: int) -> Path | None:
+def pairing(build_exec: Path) -> Pairing:
+    """What a cell record names when it started from this build."""
+    return Pairing(build_exec.parent.name, build_exec.name, loop.artifact_digest(build_exec / "artifact"))
+
+
+def pairing_of(cell: dict) -> Pairing:
+    return Pairing(cell["build_run"], cell["build_exec"], cell["build_artifact"])
+
+
+def complete_cell(runs_root: Path, task_id: str, arm: str, digest: str | None, rep: int) -> CompleteCell | None:
     """The newest exec of a cell whose record is a complete cell record under this manifest, if any."""
     run_root = runs_root / loop.run_id(task_id, arm, rep)
     for exec_dir in sorted(run_root.glob("exec-*"), key=lambda p: int(p.name.split("-")[1]), reverse=True):
-        if records.cell(exec_dir / "record.json", digest) is not None:
-            return exec_dir
+        record = records.cell(exec_dir / "record.json", digest)
+        if record is not None:
+            return CompleteCell(exec_dir, record)
     return None
 
 
@@ -66,7 +79,7 @@ def finished(record: dict) -> bool:
     steps = record["steps"]
     return (record["status"] == "complete"
             and [step["name"] for step in steps] == [loop.REVIEW_STEP, loop.FIX_STEP]
-            and all(step["attempts"][-1].get("terminal") == agents.COMPLETED for step in steps)
+            and all(step["attempts"] and step["attempts"][-1].get("terminal") == agents.COMPLETED for step in steps)
             and bool(record["review_text"].strip()) and bool(record["fix_text"].strip()))
 
 
@@ -139,17 +152,17 @@ def calibrate(data_root: Path, experiment: Experiment, task_ids: list[str], arm:
 
     # One worker per task: a task's cells run one after another, on its one build.
     with ThreadPoolExecutor(max(1, len(task_ids))) as pool:
-        return [record for built in pool.map(_contained(job), task_ids) for record in built or []]
+        return [record for built in pool.map(_contained(job, failed=[]), task_ids) for record in built]
 
 
 def _paired_elsewhere(runs_root: Path, experiment: Experiment, task_id: str, digest: str,
-                      build: tuple[str, str, str]) -> list[str]:
+                      build: Pairing) -> list[str]:
     """The task's complete cells that started from another build than `build`."""
     strays = []
     for arm in experiment.cell_arms:
         for rep in cell_runs(experiment):
-            exec_dir = complete_cell(runs_root, task_id, arm, digest, rep)
-            if exec_dir is not None and pairing_of(records.cell(exec_dir / "record.json", digest)) != build:
+            done = complete_cell(runs_root, task_id, arm, digest, rep)
+            if done is not None and pairing_of(done.record) != build:
                 strays.append(loop.run_id(task_id, arm, rep))
     return strays
 
@@ -165,17 +178,18 @@ def _one_per_task(job, locks: dict[str, threading.Lock]):
     def locked(item: pilot.BuildJob):
         with locks[item.task]:
             return job(item)
-    return _contained(locked)
+    return _contained(locked, failed=False)
 
 
-def _contained(job):
-    """A job that raises fails alone instead of stopping the pool."""
+def _contained(job, *, failed):
+    """A job that raises fails alone instead of stopping the pool: it returns `failed`, the value of the
+    job's own type that says nothing was done."""
     def wrapped(item):
         try:
             return job(item)
         except Exception:
             _log(f"job {item} raised:\n{traceback.format_exc()}")
-            return False
+            return failed
     return wrapped
 
 
