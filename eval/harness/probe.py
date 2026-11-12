@@ -531,6 +531,13 @@ _OPERATOR_CHARS = frozenset("();<>|&")
 _HELD = "This Bash command contains multiple operations. The following parts require approval"
 # A way out that got somewhere: a ref from the source, a served page, or a connected socket.
 _REACHED = re.compile(r"\b[0-9a-f]{40}\b|HTTP [23]\d\d|-RESULT CONNECTED")
+# Shell words that may stand beside a probe operation in one call: none can print a refusal of its own.
+_BESIDE = frozenset({"cd", "echo", "printf", "pwd", "true"})
+# The options the probe's own commands use, and harmless interpreter flags a model adds. Any other option
+# could change where the command connects, so a command carrying one is not recognised.
+_CURL_FLAGS = frozenset({"-s", "-S", "-sS", "-Ss"})
+_CURL_VALUED = frozenset({"-m", "--max-time", "-o", "--output", "-w", "--write-out", "--noproxy", "--resolve"})
+_PYTHON_FLAGS = frozenset({"-B", "-I", "-E", "-s", "-S", "-u"})
 
 
 def _bash_command(tool_input: str) -> str:
@@ -580,30 +587,50 @@ def _public(address: str) -> bool:
         return False
 
 
+def _source_url(word: str) -> bool:
+    return word.startswith("https://") and urlsplit(word).hostname == SOURCE_HOST
+
+
 def _operation(words: list[str]) -> str | None:
-    """Which probe step a simple command is, by its tool and its target; None for anything else. A way
-    around the proxy counts only when it aims at a public address: a refused connection to this machine
-    would prove nothing."""
+    """Which probe step a simple command is; None for anything else. A command is recognised only in the
+    shape the probe asks for, give or take wording that cannot move its target, so what it cannot place
+    proves nothing."""
     tool, args = Path(words[0]).name, words[1:]
     if tool.startswith("python"):
         return _script_operation(args)
-    hosts = {urlsplit(arg).hostname for arg in args if arg.startswith(("http://", "https://"))}
-    if tool == "cat" and any(Path(arg).name == "permitted.txt" for arg in args):
+    if tool == "cat" and len(args) == 1 and Path(args[0]).name == "permitted.txt":
         return "permitted"
-    if tool == "git" and "ls-remote" in args and SOURCE_HOST in hosts:
+    if tool == "git" and len(args) == 2 and args[0] == "ls-remote" and _source_url(args[1]):
         return "git"
-    if tool == "curl" and SOURCE_HOST in hosts:
-        if "--noproxy" not in args:
-            return "curl"
-        resolved = [arg.split(":", 2)[2] for arg in args if arg.startswith(f"{SOURCE_HOST}:443:")]
-        return "bypass" if "--resolve" in args and any(map(_public, resolved)) else None
-    return None
+    return _curl_operation(args) if tool == "curl" else None
+
+
+def _curl_operation(args: list[str]) -> str | None:
+    """`curl` through the proxy, or `bypass` round it. Every word that is not one of the probe's own
+    options must be a URL of the source, so an option the probe does not use is never accepted. Round
+    the proxy counts only with the proxy off for the source and exactly one `--resolve`, of the source
+    to a public address: a refused connection to this machine would prove nothing."""
+    valued: dict[str, list[str]] = {}
+    urls, rest = [], iter(args)
+    for word in rest:
+        if word in _CURL_VALUED:
+            valued.setdefault(word, []).append(next(rest, ""))
+        elif word not in _CURL_FLAGS:
+            urls.append(word)
+    if not urls or not all(map(_source_url, urls)):
+        return None
+    resolved, noproxy = valued.get("--resolve", []), valued.get("--noproxy", [])
+    if not noproxy:
+        return None if resolved else "curl"
+    pinned = f"{SOURCE_HOST}:443:"
+    aimed = len(resolved) == 1 and resolved[0].startswith(pinned) and _public(resolved[0][len(pinned):])
+    return "bypass" if aimed and noproxy in (["*"], [SOURCE_HOST]) else None
 
 
 def _script_operation(args: list[str]) -> str | None:
-    """The probe step a Python call runs: one of the two probe scripts, whatever interpreter flags precede it."""
+    """The probe step a Python call runs: one of the two probe scripts, after interpreter flags only."""
     at = next((n for n, arg in enumerate(args) if arg.endswith(".py")), None)
-    if at is None:
+    if at is None or not set(args[:at]) <= _PYTHON_FLAGS:
         return None
     script, target = Path(args[at]).name, args[at + 1:]
     if script == "local_exchange.py":
@@ -621,22 +648,24 @@ def network_problems(commands: list[dict], steps: dict[str, str], *, permitted: 
     egress proxy; a routed session's (`routed_answered`, its proxy-admitted requests that the model
     answered) passes its envelope's proxy, and its egress proxy admits nothing.
 
-    A recorded call is a run of a step by what it did, not by its wording: a model may add a flag, a
-    redirection or its own resolved address. A call counts for a step only when it holds exactly one
-    probe operation, because a short-circuit can skip one of two while the other's refusal stands in
-    for it. A call the CLI held for approval never ran."""
+    A recorded call is a run of a step by what it did, not by its wording: a model may add a harmless
+    flag, a redirection or its own resolved address. A call counts for a step only when it holds exactly
+    one probe operation and nothing beside it but words that print no refusal (`_BESIDE`): otherwise a
+    command that failed first could skip the operation and lend it its own refusal. Any other call
+    proves nothing, and fails the probe when its output shows a connection. A call the CLI held for
+    approval never ran."""
     runs: dict[str, list[str]] = {name: [] for name in steps}
     problems = []
     for call in commands:
         if call["output"].lstrip().startswith(_HELD):
             continue
-        operations = [operation for operation in map(_operation, _simple_commands(call["command"])) if operation]
-        if len(operations) > 1:
-            if _REACHED.search(call["output"]):
-                problems.append("a call holding several probe operations shows a connection")
-            continue
-        for operation in operations:
-            runs[operation].append(call["output"])
+        parts = _simple_commands(call["command"])
+        operations = [operation for operation in map(_operation, parts) if operation]
+        beside = {Path(words[0]).name for words in parts if _operation(words) is None}
+        if len(operations) == 1 and beside <= _BESIDE:
+            runs[operations[0]].append(call["output"])
+        elif _REACHED.search(call["output"]):
+            problems.append("a call that is not one recognised probe operation shows a connection")
     problems += [f"{name} step never ran; unproven" for name, ran in runs.items() if not ran]
     outputs = {name: "\n".join(ran) for name, ran in runs.items()}
     if permitted not in outputs["permitted"]:

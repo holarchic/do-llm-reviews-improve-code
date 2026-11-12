@@ -220,14 +220,54 @@ class NetworkProblemsTest(unittest.TestCase):
         found = self.claude({"git": [(both, self.CLEAN["git"])], "curl": []})
         self.assertEqual(found, ["git step never ran; unproven", "curl step never ran; unproven"])
         found = self.claude({"git": [(both, "0123456789abcdef0123456789abcdef01234567\tHEAD\nHTTP 200")], "curl": []})
-        self.assertIn("a call holding several probe operations shows a connection", found)
+        self.assertIn("a call that is not one recognised probe operation shows a connection", found)
+
+    def test_a_command_the_probe_does_not_know_beside_an_operation_proves_nothing(self):
+        # The first curl is refused and `&&` skips the probe's own command, whose refusal this is not.
+        elsewhere, refused = "curl -sS -m 20 https://example.com/ && ", "curl: (56) CONNECT tunnel failed, response 403"
+        for step in ("git", "curl"):
+            with self.subTest(step):
+                self.assertEqual(self.claude({step: [(elsewhere + self.STEPS[step], refused)]}),
+                                 [f"{step} step never ran; unproven"])
+        piped = self.claude({"git": [(self.STEPS["git"] + " 2>&1 | tail -1", self.CLEAN["git"])]})
+        self.assertEqual(piped, ["git step never ran; unproven"])
+
+    def test_a_call_the_probe_cannot_place_still_fails_when_it_shows_a_connection(self):
+        followed = ("curl -sS -L https://github.com/holarchic/job-board-scanner -o /dev/null -w 'HTTP %{http_code}'",
+                    "HTTP 200")
+        found = self.claude({"curl": [followed, (self.STEPS["curl"], self.CLEAN["curl"])]})
+        self.assertEqual(found, ["a call that is not one recognised probe operation shows a connection"])
+
+    def test_an_option_that_could_move_the_target_makes_a_command_unrecognised(self):
+        source = "https://github.com/holarchic/job-board-scanner"
+        cases = {
+            "curl": [f"curl -sS -m 20 -x http://127.0.0.1:9 {source} -o /dev/null",
+                     f"curl -sS -m 20 --connect-to github.com:443:example.com:443 {source}",
+                     f"curl -sS -m 20 {source} https://example.com/",
+                     f"curl -sS -m 20 --resolve github.com:443:127.0.0.1 {source}",
+                     "curl -sS -m 20 http://github.com/holarchic/job-board-scanner"],
+            "git": [f"git -c http.proxy=http://127.0.0.1:9 ls-remote {source}",
+                    f"git ls-remote --upload-pack=/bin/true {source}",
+                    "git ls-remote https://example.com/x"],
+            "socket": ["python3 -c 'print(1)' direct_socket.py 140.82.121.4 /var/run/mDNSResponder",
+                       "python3 -X dev direct_socket.py 140.82.121.4 /var/run/mDNSResponder"],
+        }
+        for step, commands in cases.items():
+            for command in commands:
+                with self.subTest(command):
+                    self.assertEqual(self.claude({step: [(command, self.CLEAN[step])]}),
+                                     [f"{step} step never ran; unproven"])
 
     def test_a_way_round_aimed_at_this_machine_or_nowhere_is_not_evidence(self):
         refused = self.CLEAN["bypass"]
+        public = "--resolve github.com:443:140.82.121.4"
         for command in ("curl -sS -m 20 --noproxy '*' --resolve github.com:443:127.0.0.1 https://github.com/ -o /dev/null",
                         "curl -sS -m 20 --noproxy '*' --resolve github.com:443:192.168.1.1 https://github.com/",
                         "curl -sS -m 20 --noproxy '*' https://github.com/ -o /dev/null",
-                        "curl -sS -m 20 --noproxy '*' --resolve example.com:443:140.82.121.4 https://github.com/"):
+                        "curl -sS -m 20 --noproxy '*' --resolve example.com:443:140.82.121.4 https://github.com/",
+                        f"curl -sS -m 20 --noproxy '*' {public} --connect-to github.com:443:127.0.0.1:1 https://github.com/",
+                        f"curl -sS -m 20 --noproxy '*' {public} --resolve github.com:443:127.0.0.1 https://github.com/",
+                        f"curl -sS -m 20 --noproxy example.com {public} https://github.com/"):
             with self.subTest(command):
                 self.assertEqual(self.claude({"bypass": [(command, refused)]}), ["bypass step never ran; unproven"])
         for command in ("python3 -B direct_socket.py 127.0.0.1 /var/run/mDNSResponder",
