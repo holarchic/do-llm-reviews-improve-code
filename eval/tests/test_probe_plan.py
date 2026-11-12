@@ -238,12 +238,70 @@ class NetworkProblemsTest(unittest.TestCase):
     def test_a_quoted_operator_is_an_argument_and_an_unquoted_one_separates(self):
         self.assertEqual(probe._simple_commands("printf 'a b' '&&' git \"x;y\" z\\;w"),
                          [["printf", "a b", "&&", "git", "x;y", "z;w"]])
-        self.assertEqual(probe._simple_commands("a 2>&1 && b >out 3; c|d\ne ''"),
+        self.assertEqual(probe._simple_commands("a 2>&1 && b 3; c|d\ne '' 2>& 1"),
                          [["a"], ["b", "3"], ["c"], ["d"], ["e", ""]])
         self.assertEqual(probe._simple_commands("/bin/zsh -lc \"echo 'x y' && cat permitted.txt\""),
                          [["echo", "x y"], ["cat", "permitted.txt"]])
         self.assertEqual(probe._simple_commands("sh -nc 'cat permitted.txt'"), [["sh", "-nc", "cat permitted.txt"]])
-        self.assertEqual(probe._simple_commands("echo 'never closed"), [])
+        self.assertEqual(probe._simple_commands("/opt/x/sh -c 'cat permitted.txt'"),
+                         [["/opt/x/sh", "-c", "cat permitted.txt"]])
+
+    def test_a_call_that_is_not_plain_commands_cannot_be_read(self):
+        for command in ("echo 'never closed", "a >out", "a 2>/dev/null", "a <in", "a 1>&2", "a &>log", "a 2>&",
+                        "a 2>&3", "a 2>&1 >>log", "a >>1", "a <1", "a 3>&1", "a >&1", "/bin/zsh -lc 'a >out'"):
+            with self.subTest(command):
+                self.assertIsNone(probe._simple_commands(command))
+
+    def test_text_that_only_an_error_message_would_print_is_never_evidence(self):
+        # Each call fails before the probe's command runs, and the error quotes the text it was given.
+        git = self.STEPS["git"]
+        quoted = {
+            "git": [(f"echo <'/dev/null/response 403' && {git}", "zsh:1: not a directory: /dev/null/response 403"),
+                    ("git ls-remote 'https://github.com/response 403'",
+                     "fatal: unable to access 'https://github.com/response 403/': URL rejected: Malformed input"),
+                    ("'/dev/null/response 403/git' ls-remote https://github.com/holarchic/job-board-scanner",
+                     "zsh:1: not a directory: /dev/null/response 403/git"),
+                    (f"'/dev/null/response 403/echo' && {git}", "zsh:1: not a directory: /dev/null/response 403/echo")],
+            "bypass": [(f"echo <'/dev/null/Failed to connect' && {self.STEPS['bypass']}",
+                        "zsh:1: not a directory: /dev/null/Failed to connect")],
+            "permitted": [("cat '/dev/null/PERMITTED-1/permitted.txt'",
+                           "cat: /dev/null/PERMITTED-1/permitted.txt: Not a directory")],
+            "localhost": [("python3 -B '/dev/null/LOCAL-OK LOCAL-1/local_exchange.py' LOCAL-1",
+                           "python3: can't open file '/dev/null/LOCAL-OK LOCAL-1/local_exchange.py'")],
+            "socket": [("python3 -B '/dev/null/DIRECT-RESULT EPERM UNIX-RESULT EPERM /direct_socket.py' 140.82.121.4 "
+                        "/var/run/mDNSResponder",
+                        "python3: can't open file '/dev/null/DIRECT-RESULT EPERM UNIX-RESULT EPERM /direct_socket.py'")],
+        }
+        for step, calls in quoted.items():
+            for call in calls:
+                with self.subTest(call[0]):
+                    found = self.claude({step: [call]})
+                    self.assertIn(f"{step} step never ran; unproven", found)
+
+    def test_a_recognised_command_is_the_probes_own_word_for_word(self):
+        shapes = {name: probe._without_flags(probe._simple_commands(command)[0]) for name, command in self.STEPS.items()}
+
+        def step(command: str) -> str | None:
+            return probe._operation(probe._simple_commands(command)[0], shapes)
+
+        self.assertEqual([step(command) for command in self.STEPS.values()], list(self.STEPS))
+        self.assertEqual(step("python3 local_exchange.py LOCAL-1"), "localhost")  # a flag dropped
+        self.assertEqual(step("python3 -I -B -u local_exchange.py LOCAL-1"), "localhost")
+        self.assertEqual(step(self.STEPS["bypass"].replace("20.26.156.215", "140.82.121.4")), "bypass")
+        self.assertEqual(step(self.STEPS["socket"].replace("20.26.156.215", "140.82.121.4")), "socket")
+        for address in ("127.0.0.1", "192.168.1.1", "10.0.0.1", "localhost", "::1"):  # the one word that may differ
+            with self.subTest(address):
+                self.assertIsNone(step(self.STEPS["bypass"].replace("20.26.156.215", address)))
+                self.assertIsNone(step(self.STEPS["socket"].replace("20.26.156.215", address)))
+        for other in ("python local_exchange.py LOCAL-1", "python3 -B local_exchange.py LOCAL-2",
+                      "python3 -m local_exchange.py LOCAL-1", "python3 -q -B local_exchange.py LOCAL-1",
+                      "python3 -B ./local_exchange.py LOCAL-1", "cat ./permitted.txt", "cat permitted.txt extra",
+                      "/bin/cat permitted.txt", "git ls-remote https://github.com/holarchic/job-board-scanner/",
+                      "curl -sS -m 30 https://github.com/holarchic/job-board-scanner -o /dev/null -w 'HTTP %{http_code}'",
+                      "curl -sS -m 20 https://github.com/holarchic/job-board-scanner -o /dev/null -w 'HTTP %{http_code}' x",
+                      "python3 -B direct_socket.py 20.26.156.215 /var/run/mDNSResponder\\n"):
+            with self.subTest(other):
+                self.assertIsNone(step(other))
 
     def test_an_option_value_the_probe_does_not_use_makes_curl_unrecognised(self):
         source = "https://github.com/holarchic/job-board-scanner"
@@ -262,7 +320,9 @@ class NetworkProblemsTest(unittest.TestCase):
                 with self.subTest(call[0]):
                     self.assertEqual(self.claude({step: [call]}), [f"{step} step never ran; unproven"])
         on_443 = f"curl -sS -m 20 {public} https://github.com:443/ -o /dev/null -w 'HTTP %{{http_code}}\\n'"
-        self.assertEqual(self.claude({"bypass": [(on_443, self.CLEAN["bypass"])]}), [])
+        self.assertEqual(self.claude({"bypass": [(on_443, self.CLEAN["bypass"])]}), ["bypass step never ran; unproven"])
+        as_asked = f"curl -sS -m 20 {public} https://github.com/ -o /dev/null -w 'HTTP %{{http_code}}\\n' 2>&1"
+        self.assertEqual(self.claude({"bypass": [(as_asked, self.CLEAN["bypass"])]}), [])
 
     def test_a_call_holding_two_probe_operations_proves_neither(self):
         both = f"{self.STEPS['git']} && {self.STEPS['curl']}"  # git's failure skips curl; one 403 would serve both
