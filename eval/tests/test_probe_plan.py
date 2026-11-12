@@ -85,7 +85,7 @@ class NetworkProblemsTest(unittest.TestCase):
 
     def problems(self, outputs=None, *, egress_log=EGRESS, search=None, drop=(), routed_answered=None):
         outputs = {**self.CLEAN, **(outputs or {})}
-        commands = [{"command": f"bash -lc '{self.STEPS[name]}'", "output": outputs[name]}
+        commands = [{"command": f'/bin/zsh -lc "{self.STEPS[name]}"', "output": outputs[name]}
                     for name in self.STEPS if name not in drop]
         search = {"config_disabled": True, "web_search_items": 0} if search is None else search
         return probe.network_problems(commands, self.STEPS, permitted="PERMITTED-1", local="LOCAL-1",
@@ -134,7 +134,7 @@ class NetworkProblemsTest(unittest.TestCase):
         self.assertTrue(any(p.startswith("curl: no proxy refusal") for p in found), found)
 
     def test_a_later_run_of_the_socket_step_that_connects_is_caught(self):
-        commands = [{"command": f"bash -lc '{self.STEPS[name]}'", "output": self.CLEAN[name]} for name in self.STEPS]
+        commands = [{"command": f'/bin/zsh -lc "{self.STEPS[name]}"', "output": self.CLEAN[name]} for name in self.STEPS]
         commands.append({"command": self.STEPS["socket"], "output": "DIRECT-RESULT CONNECTED\nUNIX-RESULT CONNECTED"})
         found = probe.network_problems(commands, self.STEPS, permitted="PERMITTED-1", local="LOCAL-1",
                                        egress_log=self.EGRESS, search={"config_disabled": True, "web_search_items": 0})
@@ -142,7 +142,7 @@ class NetworkProblemsTest(unittest.TestCase):
         self.assertTrue(any(p.startswith("unix socket not denied") for p in found), found)
 
     def test_every_run_of_a_way_out_needs_its_own_evidence(self):
-        commands = [{"command": f"bash -lc '{self.STEPS[name]}'", "output": self.CLEAN[name]} for name in self.STEPS]
+        commands = [{"command": f'/bin/zsh -lc "{self.STEPS[name]}"', "output": self.CLEAN[name]} for name in self.STEPS]
         commands += [{"command": self.STEPS["socket"], "output": "Traceback: killed"},
                      {"command": self.STEPS["git"], "output": ""}]
         found = probe.network_problems(commands, self.STEPS, permitted="PERMITTED-1", local="LOCAL-1",
@@ -211,9 +211,58 @@ class NetworkProblemsTest(unittest.TestCase):
         self.assertEqual(self.claude({"git": [held, (self.STEPS["git"], self.CLEAN["git"])]}), [])
         self.assertEqual(self.claude({"git": [held]}), ["git step never ran; unproven"])
 
-    def test_a_trailer_beside_one_operation_is_ignored(self):
-        command = f"cd . && {self.STEPS['git']} 2>&1; echo \"EXIT=$?\""
-        self.assertEqual(self.claude({"git": [(command, self.CLEAN["git"] + "\nEXIT=128")]}), [])
+    def test_an_echo_trailer_beside_one_operation_is_ignored(self):
+        git, refused = self.STEPS["git"], self.CLEAN["git"]
+        for command in (f'{git} 2>&1; echo "EXIT=$?"', f'{git}; echo " EXIT=$?"', f'echo "---"; {git}; echo done',
+                        f"{git} || echo"):
+            with self.subTest(command):
+                self.assertEqual(self.claude({"git": [(command, refused + "\nEXIT=128")]}), [])
+
+    def test_a_companion_that_could_print_a_refusal_proves_nothing(self):
+        git, bypass = self.STEPS["git"], self.STEPS["bypass"]
+        skipped = {  # each prints the refusal itself and never runs the probe's command
+            "git": [(f'echo "403 Forbidden" || {git}', "403 Forbidden"),
+                    (f'cd "response 403" && {git}', "cd: no such file or directory: response 403"),
+                    (f"cd tmp && {git}", self.CLEAN["git"]),  # only an echo trailer may stand beside
+                    (f"printf 'response 403\\n' '&&' {git}", "response 403"),
+                    (f"printf 'response 403\\n' && {git}", "response 403"),
+                    (f"sh -nc '{git}'; echo response 403", "response 403"),
+                    (f'echo response 403 >&2; {git}', "response 403")],
+            "bypass": [(f'echo "Failed to connect" || {bypass}', "Failed to connect")],
+        }
+        for step, calls in skipped.items():
+            for call in calls:
+                with self.subTest(call[0]):
+                    self.assertEqual(self.claude({step: [call]}), [f"{step} step never ran; unproven"])
+
+    def test_a_quoted_operator_is_an_argument_and_an_unquoted_one_separates(self):
+        self.assertEqual(probe._simple_commands("printf 'a b' '&&' git \"x;y\" z\\;w"),
+                         [["printf", "a b", "&&", "git", "x;y", "z;w"]])
+        self.assertEqual(probe._simple_commands("a 2>&1 && b >out 3; c|d\ne ''"),
+                         [["a"], ["b", "3"], ["c"], ["d"], ["e", ""]])
+        self.assertEqual(probe._simple_commands("/bin/zsh -lc \"echo 'x y' && cat permitted.txt\""),
+                         [["echo", "x y"], ["cat", "permitted.txt"]])
+        self.assertEqual(probe._simple_commands("sh -nc 'cat permitted.txt'"), [["sh", "-nc", "cat permitted.txt"]])
+        self.assertEqual(probe._simple_commands("echo 'never closed"), [])
+
+    def test_an_option_value_the_probe_does_not_use_makes_curl_unrecognised(self):
+        source = "https://github.com/holarchic/job-board-scanner"
+        public = "--noproxy '*' --resolve github.com:443:140.82.121.4"
+        cases = {
+            "curl": [(f"curl -sS -m 20 {source} -o /dev/null -w 'response 403'", "response 403"),
+                     (f"curl -sS -m 20 {source} -o page.html -w 'HTTP %{{http_code}}'", self.CLEAN["curl"]),
+                     (f"curl -sS -m 20 https://github.com:8443/x -o /dev/null", self.CLEAN["curl"]),
+                     (f"curl -sS -m 20 https://github.com:x/ -o /dev/null", self.CLEAN["curl"])],
+            "bypass": [(f"curl -sS -m 20 {public} https://github.com/ -o /dev/null -w 'Failed to connect'",
+                        "Failed to connect"),
+                       (f"curl -sS -m 20 {public} https://github.com:1/ -o /dev/null", self.CLEAN["bypass"])],
+        }
+        for step, calls in cases.items():
+            for call in calls:
+                with self.subTest(call[0]):
+                    self.assertEqual(self.claude({step: [call]}), [f"{step} step never ran; unproven"])
+        on_443 = f"curl -sS -m 20 {public} https://github.com:443/ -o /dev/null -w 'HTTP %{{http_code}}\\n'"
+        self.assertEqual(self.claude({"bypass": [(on_443, self.CLEAN["bypass"])]}), [])
 
     def test_a_call_holding_two_probe_operations_proves_neither(self):
         both = f"{self.STEPS['git']} && {self.STEPS['curl']}"  # git's failure skips curl; one 403 would serve both

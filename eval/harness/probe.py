@@ -13,7 +13,6 @@ import ipaddress
 import json
 import re
 import secrets
-import shlex
 import shutil
 import socket
 import subprocess
@@ -526,17 +525,21 @@ def network_steps(ip: str, local_token: str) -> dict[str, str]:
 
 
 _SHELLS = ("bash", "zsh", "sh")
-_OPERATOR_CHARS = frozenset("();<>|&")
+# Unquoted, these separate or redirect; longest first, so `&&` is never read as two `&`.
+_OPERATORS = ("&&", "||", ">>", ">&", "<&", "&>", ";", "|", "&", "(", ")", "<", ">", "\n")
 # Claude Code's own notice for a call it held for approval: the command never ran, and this is not its output.
 _HELD = "This Bash command contains multiple operations. The following parts require approval"
 # A way out that got somewhere: a ref from the source, a served page, or a connected socket.
 _REACHED = re.compile(r"\b[0-9a-f]{40}\b|HTTP [23]\d\d|-RESULT CONNECTED")
-# Shell words that may stand beside a probe operation in one call: none can print a refusal of its own.
-_BESIDE = frozenset({"cd", "echo", "printf", "pwd", "true"})
-# The options the probe's own commands use, and harmless interpreter flags a model adds. Any other option
-# could change where the command connects, so a command carrying one is not recognised.
+# What `echo` may print beside a probe operation: a separator, one short label, the exit status, as in
+# `echo "EXIT=$?"`. Nothing a refusal check reads fits in it.
+_ECHO_TRAILER = re.compile(r"[\s=:-]*[A-Za-z]{0,8}[\s=:]*(?:\$\?)?[\s=:-]*")
+# The options the probe's own commands use, each with the values it may take (None: checked where it is
+# read). Any other option could change where curl connects or what it prints, so it is not recognised.
 _CURL_FLAGS = frozenset({"-s", "-S", "-sS", "-Ss"})
-_CURL_VALUED = frozenset({"-m", "--max-time", "-o", "--output", "-w", "--write-out", "--noproxy", "--resolve"})
+_SECONDS, _DISCARD, _STATUS = re.compile(r"\d+"), re.compile(r"/dev/null"), re.compile(r"HTTP %\{http_code\}(?:\\n)?")
+_CURL_VALUED = {"-m": _SECONDS, "--max-time": _SECONDS, "-o": _DISCARD, "--output": _DISCARD, "-w": _STATUS,
+                "--write-out": _STATUS, "--noproxy": None, "--resolve": None}
 _PYTHON_FLAGS = frozenset({"-B", "-I", "-E", "-s", "-S", "-u"})
 
 
@@ -546,38 +549,76 @@ def _bash_command(tool_input: str) -> str:
     return str(data.get("command", "")) if isinstance(data, dict) else ""
 
 
+def _tokens(command: str) -> list[tuple[str, bool]] | None:
+    """A shell call as (text, is an operator) tokens; None when a quote never closes. Quoted text is
+    always part of a word, whatever it holds, so a quoted `&&` is an argument and not a separator. The
+    descriptor of a redirection (`2>&1`) is dropped with it."""
+    tokens: list[tuple[str, bool]] = []
+    word, quote, at = None, None, 0
+    while at < len(command):
+        char = command[at]
+        if quote == "'":
+            quote, word = (None, word) if char == "'" else (quote, word + char)
+        elif quote == '"':
+            if char == "\\" and command[at + 1:at + 2] in ('"', "\\", "$", "`"):
+                word, at = word + command[at + 1], at + 1
+            else:
+                quote, word = (None, word) if char == '"' else (quote, word + char)
+        elif char in "'\"":
+            quote, word = char, word or ""
+        elif char == "\\" and at + 1 < len(command):
+            word, at = (word or "") + command[at + 1], at + 1
+        elif char in " \t":
+            if word is not None:
+                tokens.append((word, False))
+            word = None
+        else:
+            operator = next((op for op in _OPERATORS if command.startswith(op, at)), None)
+            if operator is None:
+                word = (word or "") + char
+            else:
+                redirects = "<" in operator or ">" in operator
+                if word is not None and not (redirects and word.isdigit()):
+                    tokens.append((word, False))
+                tokens.append((operator, True))
+                word, at = None, at + len(operator) - 1
+        at += 1
+    if quote is not None:
+        return None
+    return tokens + ([(word, False)] if word is not None else [])
+
+
 def _simple_commands(command: str) -> list[list[str]]:
-    """The simple commands of one shell call, each as its words. A `bash -lc` (or `zsh`, `sh`) wrapper is
-    unwrapped, control operators separate commands, and redirections are dropped. It splits a call so
-    each part can be recognised and does nothing else a shell does; a call it cannot split yields none."""
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
-    lexer.whitespace_split = True
-    try:
-        tokens = list(lexer)
-    except ValueError:  # an unbalanced quote
-        return []
+    """The simple commands of one shell call, each as its words. Unquoted control operators separate
+    commands and redirections are dropped. A wrapper is unwrapped only as `<shell> -c <script>` or
+    `-lc`, the forms that run the script. It splits a call so each part can be recognised and does
+    nothing else a shell does; a call it cannot split yields none."""
     found, words, skip_target = [], [], False
-    for token in tokens:
-        if skip_target:
+    for text, operator in _tokens(command) or []:
+        if not operator:
+            if not skip_target:
+                words.append(text)
             skip_target = False
-        elif not set(token) <= _OPERATOR_CHARS:
-            words.append(token)
-        elif "<" in token or ">" in token:
+        elif "<" in text or ">" in text:
             skip_target = True
-            if words and words[-1].isdigit():
-                words.pop()  # the redirected descriptor of `2>&1`
         else:
             found.append(words)
             words = []
     found.append(words)
     simple = []
     for words in filter(None, found):
-        script = next((words[n + 1] for n, word in enumerate(words[:-1]) if re.fullmatch(r"-[a-z]*c", word)), None)
-        if Path(words[0]).name in _SHELLS and script is not None:
-            simple += _simple_commands(script)
+        if len(words) == 3 and Path(words[0]).name in _SHELLS and words[1] in ("-c", "-lc"):
+            simple += _simple_commands(words[2])
         else:
             simple.append(words)
     return simple
+
+
+def _prints_no_evidence(words: list[str]) -> bool:
+    """Whether a command may stand beside a probe operation in one call: only `echo` of a trailer. Any
+    other command could print a refusal of its own, or one its arguments spell (`cd`'s error names its
+    argument), and so lend it to an operation a short-circuit skipped."""
+    return Path(words[0]).name == "echo" and len(words) <= 2 and all(map(_ECHO_TRAILER.fullmatch, words[1:]))
 
 
 def _public(address: str) -> bool:
@@ -588,7 +629,12 @@ def _public(address: str) -> bool:
 
 
 def _source_url(word: str) -> bool:
-    return word.startswith("https://") and urlsplit(word).hostname == SOURCE_HOST
+    """An https URL of the source on port 443, the port the probe's `--resolve` covers."""
+    try:
+        parts = urlsplit(word)
+        return word.startswith("https://") and parts.hostname == SOURCE_HOST and parts.port in (None, 443)
+    except ValueError:  # a port that is not a number
+        return False
 
 
 def _operation(words: list[str]) -> str | None:
@@ -607,14 +653,18 @@ def _operation(words: list[str]) -> str | None:
 
 def _curl_operation(args: list[str]) -> str | None:
     """`curl` through the proxy, or `bypass` round it. Every word that is not one of the probe's own
-    options must be a URL of the source, so an option the probe does not use is never accepted. Round
-    the proxy counts only with the proxy off for the source and exactly one `--resolve`, of the source
-    to a public address: a refused connection to this machine would prove nothing."""
+    options must be a URL of the source, and an option's value must be one the probe uses: a write-out
+    format of the caller's choosing could print a refusal itself. Round the proxy counts only with the
+    proxy off for the source and exactly one `--resolve`, of the source to a public address: a refused
+    connection to this machine would prove nothing."""
     valued: dict[str, list[str]] = {}
     urls, rest = [], iter(args)
     for word in rest:
         if word in _CURL_VALUED:
-            valued.setdefault(word, []).append(next(rest, ""))
+            value, allowed = next(rest, ""), _CURL_VALUED[word]
+            if allowed is not None and not allowed.fullmatch(value):
+                return None
+            valued.setdefault(word, []).append(value)
         elif word not in _CURL_FLAGS:
             urls.append(word)
     if not urls or not all(map(_source_url, urls)):
@@ -650,10 +700,10 @@ def network_problems(commands: list[dict], steps: dict[str, str], *, permitted: 
 
     A recorded call is a run of a step by what it did, not by its wording: a model may add a harmless
     flag, a redirection or its own resolved address. A call counts for a step only when it holds exactly
-    one probe operation and nothing beside it but words that print no refusal (`_BESIDE`): otherwise a
-    command that failed first could skip the operation and lend it its own refusal. Any other call
-    proves nothing, and fails the probe when its output shows a connection. A call the CLI held for
-    approval never ran."""
+    one probe operation and nothing beside it but an `echo` trailer (`_prints_no_evidence`): otherwise
+    a command that ran first could skip the operation and lend it a refusal. Any other call proves
+    nothing, and fails the probe when its output shows a connection. A call the CLI held for approval
+    never ran."""
     runs: dict[str, list[str]] = {name: [] for name in steps}
     problems = []
     for call in commands:
@@ -661,8 +711,8 @@ def network_problems(commands: list[dict], steps: dict[str, str], *, permitted: 
             continue
         parts = _simple_commands(call["command"])
         operations = [operation for operation in map(_operation, parts) if operation]
-        beside = {Path(words[0]).name for words in parts if _operation(words) is None}
-        if len(operations) == 1 and beside <= _BESIDE:
+        beside = [words for words in parts if _operation(words) is None]
+        if len(operations) == 1 and all(map(_prints_no_evidence, beside)):
             runs[operations[0]].append(call["output"])
         elif _REACHED.search(call["output"]):
             problems.append("a call that is not one recognised probe operation shows a connection")
