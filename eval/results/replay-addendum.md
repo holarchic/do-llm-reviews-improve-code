@@ -29,6 +29,19 @@ HIGH and MEDIUM findings citing a basis, per review: median [lowest–highest].
 | correctness | 0 [0–3] | 0 [0–1] | 0 [0–2] | 0.5 [0–2] | 0 [0–2] |
 | architecture | 8 [4–13] | 8 [1–13] | 7.5 [2–16] | 7.5 [1–13] | 7 [1–16] |
 
+## Whose lines the architecture review cited
+
+Each HIGH or MEDIUM architecture finding cites a file and line. `git blame`, at the commit that review read, says whether the build wrote the line or it was in the tree the run started from. A line the build moved or reformatted counts as the build's, so the first row is a floor. The second row counts findings in files the `build` step itself left alone, which later fixes brought in front of the review. Each cell is such findings over findings raised.
+
+| Finding | Round 1 | Round 2 | Round 3 | Round 4 | Round 5 | All |
+|---|---|---|---|---|---|---|
+| On a line the build never wrote | 40/84 (48%) | 52/74 (70%) | 49/79 (62%) | 52/73 (71%) | 50/74 (68%) | 243/384 (63%) |
+| In a file `build` did not change | 2/84 (2%) | 9/74 (12%) | 30/79 (38%) | 38/73 (52%) | 36/74 (49%) | 115/384 (30%) |
+
+- By phase: 82/194 (42%) for builds of the caught tasks and 161/190 (85%) for the control builds.
+- In round 1, before any fix: 12/52 (23%) for builds of the caught tasks and 28/32 (88%) for the control builds.
+- `git blame` found every cited line in the tree its review read.
+
 ## What each fix changed
 
 Lines added plus deleted by a fix, per build, as median [lowest–highest]; `plans/` and markdown are left out. A build's scores moved when its defects avoided, feature tests passed or existing tests broken differ from the round before.
@@ -99,5 +112,6 @@ The report's gain is +27.5 points. A sign-flip test asks how often differences o
 ## Reading
 
 - The loop under test ends a review on GREEN, on the user's ruling over a disagreement, or at the round cap, and its re-review prompt carries the previous round's findings with what was done about each (`skills/codex-review/SKILL.md`). The harness has no user and its re-review prompts carry no previous round, so a reviewed build ends on GREEN or at the cap. The cost and the round caps in `replay-report.md` describe that unattended loop.
+- The architecture review is told to read every module the change touches in full and to flag standing debt (`skills/codex-review/SKILL.md`, Profile B). The harness's fix prompt tells the builder to fix every HIGH and MEDIUM finding, and lets it leave only one it shows to be wrong (`eval/harness/prompts.py`, `loop_fix_writer`). So the builder was told to fix the architecture findings on lines it never wrote, 243/384 (63%) of them, and each fix put more files in front of the next review.
 - A fix raised a build's defects avoided 4 times. 2 of them followed a round in which the correctness review did not block, so the fix answered the architecture review alone.
 - Lines changed are a count, not a judgment: these tests cannot see whether the later fixes improved the design.

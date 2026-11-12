@@ -1,9 +1,9 @@
 """The v1 replay's addendum, from its raw run records.
 
 Post hoc: nothing here was pre-registered and none of it enters a verdict. It reads what the replay's
-frozen reports leave out: which review blocked in each round, how many findings each review raised, how
-much code each fix changed, where the reviewed arm stood before any code review, and every defect's
-outcome by build. `collect` reads records into plain values and refuses any that don't reproduce the
+frozen reports leave out: which review blocked in each round, how many findings each review raised,
+whether the lines the architecture review cited were the build's own, how much code each fix changed,
+where the reviewed arm stood before any code review, and every defect's outcome by build. `collect` reads records into plain values and refuses any that don't reproduce the
 frozen report, the functions under it derive each table, and `render` is the only place numbers
 become text.
 
@@ -34,6 +34,12 @@ REPORTED_REVIEW = {SOLO: 44.6, REVIEWED: 72.1}
 REPORTED_CAPS, REPORTED_TIMEOUTS = 14, 2
 BASES = {"TASK.md": "a TASK.md statement", "norm": "a norm", "existing behaviour": "existing behaviour"}
 _REVIEW_STEP = re.compile(r"(plan|correctness|architecture)-review-(\d+)")
+# An issue's first line, as the verdict format gives it, and the `file:line` it cites.
+_ISSUE_HEAD = re.compile(r"^\s*\d+\.\s*\[(?:HIGH|MEDIUM|LOW)\]\s*(.*)$", re.MULTILINE)
+_CITATION = re.compile(r"([\w./-]+\.[A-Za-z]+):(\d+)")
+# Where a cited line came from: the tree the run started from, the build's own commits, or nowhere `git blame`
+# can find in the tree the review read.
+STARTING, WRITTEN, UNPLACED = "starting tree", "the build", "unplaced"
 _GIT_ENV = {"PATH": "/usr/bin:/bin:/opt/homebrew/bin", "HOME": "/nonexistent", "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_CONFIG_NOSYSTEM": "1"}
 
@@ -43,18 +49,33 @@ class Review:
     stage: str
     round: int
     blocking: bool
-    findings: int  # HIGH or MEDIUM, as the loop counted them: one without a basis is LOW
+    # The `file:line` each HIGH or MEDIUM finding cites, None where its first line cites none. HIGH or MEDIUM
+    # as the loop counted them: a finding without a basis is LOW.
+    cited: tuple[tuple[str, int] | None, ...]
+
+    @property
+    def findings(self) -> int:
+        return len(self.cited)
 
 
 @dataclass(frozen=True)
 class Round:
     """A reviewed build after `build` (round 0) or after `fix-k` (round k), as `rounds` re-scored it."""
     number: int
+    commit: str
     review: float | None
     feature: float
     regressions: float
     source_lines: int  # added plus deleted by the fix that made this round; 0 at round 0
     test_lines: int
+
+
+@dataclass(frozen=True)
+class Placed:
+    """One HIGH or MEDIUM architecture finding, placed by the line it cites in the tree its review read."""
+    round: int
+    origin: str  # STARTING | WRITTEN | UNPLACED
+    untouched: bool  # its file is one the `build` step did not change
 
 
 @dataclass(frozen=True)
@@ -67,6 +88,7 @@ class Build:
     avoided: dict[str, bool]  # defect id -> avoided
     reviews: tuple[Review, ...]
     rounds: tuple[Round, ...]
+    placed: tuple[Placed, ...]  # its architecture findings; none for a solo build
 
 
 @dataclass(frozen=True)
@@ -88,9 +110,10 @@ def collect() -> list[Build]:
             raise SystemExit(f"no complete build of {task} {arm} r{rep} under manifest {digest[:12]}")
         record = records.build(exec_dir / "record.json", digest)
         replay = record["scores"]["replay"]
+        reviews, rounds = _reviews(record, exec_dir, basis_rule), _rounds(record, exec_dir)
         builds.append(Build(task=task, arm=arm, rep=rep, flags=tuple(record["flags"]), review=replay["review"],
-                            avoided={d["id"]: d["avoided"] for d in replay["defects"]},
-                            reviews=_reviews(record, exec_dir, basis_rule), rounds=_rounds(record, exec_dir)))
+                            avoided={d["id"]: d["avoided"] for d in replay["defects"]}, reviews=reviews,
+                            rounds=rounds, placed=_placed(reviews, rounds, exec_dir / "repo")))
     _check(builds)
     return builds
 
@@ -101,14 +124,49 @@ def _reviews(record: dict, exec_dir: Path, basis_rule: bool) -> tuple[Review, ..
         match = _REVIEW_STEP.fullmatch(step["name"])
         if match is None or "verdict" not in step:  # a review that timed out left no verdict
             continue
-        final = loop.attempt_dir(exec_dir, index, step["name"], len(step["attempts"])) / "final.txt"
-        verdict = loop.parse_verdict(final.read_text(encoding="utf-8"), basis_rule=basis_rule)
+        text = (loop.attempt_dir(exec_dir, index, step["name"], len(step["attempts"])) / "final.txt").read_text(
+            encoding="utf-8")
+        verdict = loop.parse_verdict(text, basis_rule=basis_rule)
         if (verdict.label, verdict.blocking) != (step["verdict"]["label"], step["verdict"]["blocking"]):
             raise SystemExit(f"{record['run_id']} {step['name']}: this parser reads the verdict differently "
                              "from the run, so its finding counts are not the run's")
-        reviews.append(Review(match.group(1), int(match.group(2)), verdict.blocking,
-                              sum(issue.effective != "LOW" for issue in verdict.issues)))
+        heads = _ISSUE_HEAD.findall(text)  # one per issue the verdict parser found, in its order
+        cited = tuple(_citation(head) for head, issue in zip(heads, verdict.issues, strict=True)
+                      if issue.effective != "LOW")
+        reviews.append(Review(match.group(1), int(match.group(2)), verdict.blocking, cited))
     return tuple(reviews)
+
+
+def _citation(head: str) -> tuple[str, int] | None:
+    found = _CITATION.search(head)
+    return None if found is None else (found.group(1), int(found.group(2)))
+
+
+def _placed(reviews: tuple[Review, ...], rounds: tuple[Round, ...], repo: Path) -> tuple[Placed, ...]:
+    """Each HIGH or MEDIUM architecture finding with where its cited line came from. Review round n read
+    the tree `fix-(n-1)` left, and round 1 the `build` commit: `git blame` there names the commit that
+    last wrote the line. A line the build moved or reformatted is the build's, so the starting tree's
+    share is a floor."""
+    findings = [(review.round, cite) for review in reviews if review.stage == "architecture" for cite in review.cited]
+    if not findings:
+        return ()
+    start = _git(repo, "rev-list", "--max-parents=0", rounds[0].commit).strip()
+    built = set(_git(repo, "diff", "--name-only", start, rounds[0].commit).splitlines())
+    placed = []
+    for number, cite in findings:
+        origin = UNPLACED
+        if cite is not None:
+            blamed = subprocess.run(["git", "blame", "--porcelain", "-L", f"{cite[1]},{cite[1]}",
+                                     rounds[number - 1].commit, "--", cite[0]], cwd=repo, env=_GIT_ENV,
+                                    capture_output=True, text=True)
+            if blamed.returncode == 0:
+                origin = STARTING if blamed.stdout.split(" ", 1)[0] == start else WRITTEN
+        placed.append(Placed(number, origin, cite is None or cite[0] not in built))
+    return tuple(placed)
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(["git", *args], cwd=repo, env=_GIT_ENV, capture_output=True, text=True, check=True).stdout
 
 
 def _rounds(record: dict, exec_dir: Path) -> tuple[Round, ...]:
@@ -121,7 +179,8 @@ def _rounds(record: dict, exec_dir: Path) -> tuple[Round, ...]:
             break
         replay = stored["scores"]["replay"]
         source, tests = (0, 0) if previous is None else _lines_changed(exec_dir / "repo", previous, stored["commit"])
-        rounds.append(Round(number, replay["review"], replay["feature"], replay["regressions"], source, tests))
+        rounds.append(Round(number, stored["commit"], replay["review"], replay["feature"], replay["regressions"],
+                            source, tests))
         previous = stored["commit"]
     return tuple(rounds)
 
@@ -129,10 +188,8 @@ def _rounds(record: dict, exec_dir: Path) -> tuple[Round, ...]:
 def _lines_changed(repo: Path, before: str, after: str) -> tuple[int, int]:
     """Lines added plus deleted between two commits, as (source, tests). Documents and the plan are
     left out: a fix round rewrites them whether or not it touches code."""
-    numstat = subprocess.run(["git", "diff", "--numstat", before, after], cwd=repo, env=_GIT_ENV,
-                             capture_output=True, text=True, check=True).stdout
     source = tests = 0
-    for line in numstat.splitlines():
+    for line in _git(repo, "diff", "--numstat", before, after).splitlines():
         added, deleted, path = line.split("\t", 2)
         if added == "-" or path.endswith(".md") or path.startswith("plans/"):
             continue
@@ -222,9 +279,16 @@ def sign_flip_p(differences: list[float]) -> float:
     return sum(total >= sum(differences) - 1e-9 for total in totals) / 2 ** len(sizes)
 
 
+def placed_at(builds: list[Build], number: int | None = None, *, control: bool | None = None) -> list[Placed]:
+    """The reviewed arm's architecture findings: of one round or all, of control builds, caught ones or both."""
+    return [p for b in of(builds, REVIEWED) if control in (None, b.review is None)
+            for p in b.placed if number in (None, p.round)]
+
+
 def render(builds: list[Build]) -> str:
-    return "\n".join(_head(builds) + _verdict_lines(builds) + _finding_lines(builds) + _fix_lines(builds)
-                     + _stage_lines(builds) + _defect_lines(builds) + _firmness_lines(builds) + _reading(builds))
+    return "\n".join(_head(builds) + _verdict_lines(builds) + _finding_lines(builds) + _origin_lines(builds)
+                     + _fix_lines(builds) + _stage_lines(builds) + _defect_lines(builds) + _firmness_lines(builds)
+                     + _reading(builds))
 
 
 def _head(builds: list[Build]) -> list[str]:
@@ -269,6 +333,42 @@ def _finding_lines(builds: list[Build]) -> list[str]:
     return ["## Findings per review", "",
             "HIGH and MEDIUM findings citing a basis, per review: median [lowest–highest].", "",
             *_table(["Review", *[f"Round {n}" for n in range(1, last + 1)]], rows), ""]
+
+
+def _origin_lines(builds: list[Build]) -> list[str]:
+    last = max(p.round for p in placed_at(builds))
+    columns = [*range(1, last + 1), None]
+    rows = [["On a line the build never wrote", *[_part(placed_at(builds, n), _from_start) for n in columns]],
+            ["In a file `build` did not change", *[_part(placed_at(builds, n), _untouched) for n in columns]]]
+    caught_builds, controls = placed_at(builds, control=False), placed_at(builds, control=True)
+    unplaced = sum(p.origin == UNPLACED for p in placed_at(builds))
+    return ["## Whose lines the architecture review cited", "",
+            "Each HIGH or MEDIUM architecture finding cites a file and line. `git blame`, at the commit that review "
+            "read, says whether the build wrote the line or it was in the tree the run started from. A line the "
+            "build moved or reformatted counts as the build's, so the first row is a floor. The second row counts "
+            "findings in files the `build` step itself left alone, which later fixes brought in front of the "
+            "review. Each cell is such findings over findings raised.", "",
+            *_table(["Finding", *[f"Round {n}" for n in range(1, last + 1)], "All"], rows), "",
+            f"- By phase: {_part(caught_builds, _from_start)} for builds of the caught tasks and "
+            f"{_part(controls, _from_start)} for the control builds.",
+            f"- In round 1, before any fix: {_part(placed_at(builds, 1, control=False), _from_start)} for builds of "
+            f"the caught tasks and {_part(placed_at(builds, 1, control=True), _from_start)} for the control builds.",
+            "- `git blame` found every cited line in the tree its review read." if not unplaced else
+            f"- {unplaced} findings cite a line `git blame` cannot find in the tree the review read; they count as "
+            "raised and in neither row.", ""]
+
+
+def _from_start(finding: Placed) -> bool:
+    return finding.origin == STARTING
+
+
+def _untouched(finding: Placed) -> bool:
+    return finding.untouched
+
+
+def _part(findings: list[Placed], holds) -> str:
+    count = sum(map(holds, findings))
+    return f"{count}/{len(findings)} ({100 * count / len(findings):.0f}%)" if findings else "—"
 
 
 def _fix_lines(builds: list[Build]) -> list[str]:
@@ -346,6 +446,12 @@ def _reading(builds: list[Build]) -> list[str]:
             "each (`skills/codex-review/SKILL.md`). The harness has no user and its re-review prompts carry no "
             "previous round, so a reviewed build ends on GREEN or at the cap. The cost and the round caps in "
             "`replay-report.md` describe that unattended loop.",
+            "- The architecture review is told to read every module the change touches in full and to flag standing "
+            "debt (`skills/codex-review/SKILL.md`, Profile B). The harness's fix prompt tells the builder to fix "
+            "every HIGH and MEDIUM finding, and lets it leave only one it shows to be wrong "
+            "(`eval/harness/prompts.py`, `loop_fix_writer`). So the builder was told to fix the architecture "
+            f"findings on lines it never wrote, {_part(placed_at(builds), _from_start)} of them, and each fix put "
+            "more files in front of the next review.",
             f"- A fix raised a build's defects avoided {len(raised)} times. {unprompted} of them followed a round "
             "in which the correctness review did not block, so the fix answered the architecture review alone.",
             "- Lines changed are a count, not a judgment: these tests cannot see whether the later fixes improved "
