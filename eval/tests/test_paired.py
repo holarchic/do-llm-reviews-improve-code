@@ -239,9 +239,18 @@ class FixReportTest(unittest.TestCase):
     def test_no_findings_is_said_and_silence_is_unavailable(self):
         self.assertEqual(paired.fix_report("Nothing to change.\n\nno findings\n"), paired.FixReport(0, 0))
         self.assertEqual(paired.fix_report("**No findings.**"), paired.FixReport(0, 0))
-        for silent in ("", "I fixed everything the reviewer raised.\n", "There were 3 tests fixed by this.\n"):
+        for silent in ("", "I fixed everything the reviewer raised.\n", "There were 3 tests fixed by this.\n",
+                       "1: fixed, guarded\n\nThanks for the careful review.\n"):
             with self.subTest(silent):
                 self.assertIsNone(paired.fix_report(silent))
+
+    def test_only_the_lines_that_close_the_reply_are_read(self):
+        narrated = "1. Fixed-point arithmetic is intentional.\n\nno findings\n"
+        self.assertEqual(paired.fix_report(narrated), paired.FixReport(0, 0))
+        self.assertIsNone(paired.fix_report("1. Fixed-point arithmetic is intentional.\n"))
+        earlier = "2. Left the cache alone at first.\nThen reconsidered.\n\n1: fixed, guarded\n2: fixed, cache cleared\n"
+        self.assertEqual(paired.fix_report(earlier), paired.FixReport(2, 0))
+        self.assertEqual(paired.fix_report("no findings\n\n1: fixed, after all\n"), paired.FixReport(1, 0))
 
 
 class RenderTest(unittest.TestCase):

@@ -28,8 +28,9 @@ ENDPOINTS = (REVIEW, REMOVED, BROUGHT_BACK, FEATURE, REGRESSIONS)
 INCOMPLETE, UNINFORMATIVE, DECIDED = "INCOMPLETE", "UNINFORMATIVE", "DECIDED"
 UNAVAILABLE = "unavailable"
 
-_DISPOSITION = re.compile(r"^\W*(?:finding\W+)?(\d+)\W+(fixed|left)\b", re.IGNORECASE | re.MULTILINE)
-_NO_FINDINGS = re.compile(r"^\W*no findings\W*$", re.IGNORECASE | re.MULTILINE)
+# One closing line of a fix reply: a finding's number, then `fixed` or `left` as a word of its own.
+_DISPOSITION = re.compile(r"\W*(?:finding\W+)?(\d+)\W+(fixed|left)(?![\w-])", re.IGNORECASE)
+_NO_FINDINGS = re.compile(r"\W*no findings\W*", re.IGNORECASE)
 
 
 @dataclass
@@ -240,12 +241,21 @@ def estimate(results: Results, first: str, second: str, endpoint: str, seed: int
 
 
 def fix_report(fix_text: str) -> FixReport | None:
-    """The fixer's own account of each finding, from its closing lines; None when it gave none (no reply, or
-    neither a `fixed`/`left` line nor `no findings`). A later line for the same finding replaces an earlier."""
-    said = {int(number): word.lower() for number, word in _DISPOSITION.findall(fix_text)}
-    if said:
-        return FixReport(sum(word == "fixed" for word in said.values()), sum(word == "left" for word in said.values()))
-    return FixReport(0, 0) if _NO_FINDINGS.search(fix_text) else None
+    """The fixer's own account of each finding, from the lines that close its reply: a last line of
+    `no findings`, or the closing run of `fixed`/`left` lines. None when the reply ends in neither. Only
+    the closing lines are read, so a numbered sentence earlier in the reply is never taken for one."""
+    lines = [line for line in fix_text.splitlines() if line.strip()]
+    if lines and _NO_FINDINGS.fullmatch(lines[-1]):
+        return FixReport(0, 0)
+    said: dict[int, str] = {}
+    for line in reversed(lines):
+        closing = _DISPOSITION.match(line)
+        if closing is None:
+            break
+        said.setdefault(int(closing.group(1)), closing.group(2).lower())  # the last line for a finding stands
+    if not said:
+        return None
+    return FixReport(sum(word == "fixed" for word in said.values()), sum(word == "left" for word in said.values()))
 
 
 def render(results: Results, decision: Decision, experiment: Experiment) -> str:
